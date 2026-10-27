@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>织忆 MemWeave · 本地工作台</title>
+  <style>
+    :root{color-scheme:light;--paper:#f5f4ef;--card:#fffefa;--ink:#242b38;--muted:#646b74;--line:#dedfd8;--indigo:#414c88;--indigo-soft:#ebeef8;--teal:#276c62;--teal-soft:#eaf3ee;--danger:#a33737;--radius:16px}
+    *{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.65 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}button,input,textarea,select{font:inherit}button,a,input,textarea,select{-webkit-tap-highlight-color:transparent}button{cursor:pointer}button:disabled{cursor:wait;opacity:.55}button,input,textarea,select{border-radius:9px}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:3px solid #6a78b6;outline-offset:3px}a{color:var(--indigo)}h1,h2,h3,p{margin:0}h1{font-size:29px;line-height:1.4;letter-spacing:-.8px}h2{font-size:18px}h3{font-size:15px}small,.muted{color:var(--muted)}small{font-size:12px}svg{flex-shrink:0}button{transition:background .16s,color .16s,border-color .16s}button:hover{filter:brightness(.97)}.app{display:grid;grid-template-columns:228px minmax(0,1fr);min-height:100vh}.sidebar{border-right:1px solid var(--line);padding:32px 22px;display:flex;flex-direction:column;gap:35px;background:#eeefe9}.brand{display:flex;gap:12px;align-items:center}.brand-mark{width:39px;height:39px;background:var(--indigo);color:white;border-radius:12px;display:grid;place-items:center}.brand-title{font-size:22px;font-weight:700;letter-spacing:3px;line-height:1.2}.brand-sub{font-size:10px;letter-spacing:2.8px;color:var(--muted)}.side-label{font-size:10px;font-weight:600;letter-spacing:1.8px;color:var(--muted);padding:0 13px;margin-bottom:12px}.nav{display:flex;flex-direction:column;gap:7px}.nav button{border:0;background:transparent;text-align:left;display:flex;gap:12px;align-items:center;padding:12px 14px;color:#5b626e}.nav button[aria-current=page]{background:var(--indigo);color:#fff}.nav svg{width:18px;height:18px}.side-note{border-top:1px solid var(--line);padding:20px 9px 0;margin-top:auto;font-size:12px;color:var(--muted)}.local-dot{display:inline-block;width:7px;height:7px;border-radius:100%;background:var(--teal);margin-right:7px}.side-note strong{color:var(--ink);font-weight:600;display:block;margin-bottom:6px}.main{min-width:0;padding:0 44px 40px;max-width:1600px;width:100%;margin:auto}.topbar{min-height:91px;display:flex;justify-content:space-between;align-items:center;gap:18px;border-bottom:1px solid var(--line)}.project-control{display:flex;align-items:center;gap:12px;min-width:0}.project-control label{color:var(--muted);white-space:nowrap}.project-control select{max-width:270px;min-width:150px;background:transparent;border:1px solid var(--line);padding:8px 28px 8px 12px;color:var(--ink)}.actions{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.btn{padding:9px 15px;border:1px solid var(--line);background:var(--card);color:var(--ink);display:inline-flex;align-items:center;justify-content:center;gap:7px;font-weight:500;line-height:1.6}.btn.primary{background:var(--indigo);color:white;border-color:var(--indigo)}.btn.teal{background:var(--teal);color:white;border-color:var(--teal)}.btn.danger{color:var(--danger);border-color:#e4c7c3}.btn.small{font-size:12px;padding:6px 11px}.btn.quiet{background:transparent}.page-head{display:flex;justify-content:space-between;align-items:center;gap:20px;margin:32px 0 25px}.eyebrow{font-size:10px;letter-spacing:2px;color:var(--teal);font-weight:700;margin-bottom:6px}.page-head p{color:var(--muted);margin-top:6px}.project-path{font:12px/1.6 Consolas,monospace;overflow-wrap:anywhere;color:var(--muted)}.hero{display:grid;grid-template-columns:1fr auto;gap:24px;align-items:center;border:1px solid #d9dece;background:#eef1e8;border-radius:var(--radius);padding:25px 28px;margin-bottom:25px;position:relative;overflow:hidden}.hero h2{font-size:22px;margin-bottom:8px}.hero p{color:#586653;max-width:650px}.hero-art{width:110px;height:90px;color:#819176;opacity:.7}.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:17px;margin-bottom:28px}.stat{border:1px solid var(--line);border-radius:var(--radius);padding:19px 22px;background:var(--card)}.stat-label{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}.stat-value{font-size:32px;font-weight:600;line-height:1.5;letter-spacing:-1px;margin:7px 0 2px;font-variant-numeric:tabular-nums}.stat-note{font-size:11px;color:var(--muted)}.grid-two{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:22px}.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);min-width:0}.panel-head{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:21px 23px;border-bottom:1px solid var(--line)}.panel-body{padding:22px}.panel-head h2{font-size:16px}.list{display:flex;flex-direction:column}.list-item{padding:18px 23px;border-bottom:1px solid #eeeee7}.list-item:last-child{border-bottom:0}.list-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:7px}.list-title h3{overflow-wrap:anywhere}.list-item p{color:var(--muted);font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere}.link-button{border:0;background:transparent;padding:0;text-align:left;color:var(--ink);font-weight:600;line-height:1.6}.link-button:hover{color:var(--indigo);text-decoration:underline}.badge{display:inline-flex;align-items:center;padding:3px 9px;border-radius:5px;font-size:11px;line-height:1.6;background:var(--indigo-soft);color:var(--indigo);white-space:nowrap;font-weight:500}.badge.done{background:var(--teal-soft);color:var(--teal)}.badge.grey{background:#eeeee9;color:#626862}.meta-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px}.empty{padding:42px 25px;text-align:center;color:var(--muted)}.empty strong{display:block;font-size:15px;color:var(--ink);margin:8px 0}.empty p{font-size:13px;max-width:420px;margin:0 auto 16px}.empty-symbol{font-size:27px;color:#949c8a}.section-toolbar{display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap;margin-bottom:20px}.search-form{display:flex;gap:9px;flex:1;max-width:680px}.search-form input{flex:1;min-width:80px}.field,select,input,textarea{width:100%;border:1px solid #d1d5ce;background:#fffefa;padding:10px 12px;color:var(--ink)}textarea{resize:vertical;min-height:105px;line-height:1.7}label{display:block;font-size:13px;font-weight:500}label .hint{display:block;font-size:12px;font-weight:400;color:var(--muted);margin:3px 0 7px}.form-grid{display:grid;gap:17px}.field-row{display:grid;grid-template-columns:1fr 1fr;gap:16px}.form-footer{border-top:1px solid var(--line);padding-top:18px;display:flex;justify-content:flex-end;gap:10px;margin-top:6px}.search-form select{width:135px}.flow{display:grid;gap:17px}.flow-step{display:flex;gap:13px;align-items:flex-start}.step-number{border:1px solid #cbd4c2;border-radius:50%;font:12px/28px Consolas,monospace;width:29px;height:29px;text-align:center;color:var(--teal);flex-shrink:0}.flow-step p{font-size:12px;color:var(--muted);margin-top:4px}.footnote{margin-top:22px;color:var(--muted);font-size:11px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}.notice{padding:13px 17px;margin-top:18px;border-radius:10px;display:flex;gap:12px;justify-content:space-between;align-items:center;font-size:13px;overflow-wrap:anywhere}.notice.error{background:#f9eeeb;border:1px solid #e9d1ca;color:#8a3330}.notice.success{background:var(--teal-soft);border:1px solid #cbded2;color:#255d4c}.notice.info{background:var(--indigo-soft);border:1px solid #d6ddef;color:var(--indigo)}.notice button{background:transparent;border:0;color:inherit;font-size:18px;padding:0 5px;min-width:28px;min-height:28px}.loading{color:var(--muted);padding:35px;text-align:center}.loading::before{content:"";display:inline-block;width:13px;height:13px;border:2px solid #d5d9d1;border-top-color:var(--indigo);border-radius:50%;margin-right:10px;animation:spin 1s linear infinite;vertical-align:-2px}@keyframes spin{to{transform:rotate(360deg)}}dialog{border:1px solid var(--line);border-radius:18px;padding:0;width:640px;max-width:calc(100% - 32px);max-height:90vh;background:var(--card);color:var(--ink);box-shadow:0 20px 80px #1e26312b}dialog::backdrop{background:#242c3b66}.dialog-head{display:flex;justify-content:space-between;align-items:center;padding:22px 25px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--card);z-index:1}.dialog-body{padding:24px 25px}.close-dialog{background:transparent;border:0;font-size:24px;line-height:1;padding:3px 8px;color:var(--muted)}.prose{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;color:#515964;line-height:1.85}.detail-section{margin-bottom:20px}.detail-section h3{margin-bottom:7px}.criteria{margin:7px 0;padding-left:22px;color:#515964;font-size:13px}.graph-layout{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:20px}.node-list{max-height:580px;overflow:auto}.node-button{display:block;width:100%;text-align:left;padding:13px 18px;border:0;border-bottom:1px solid #eeeee7;border-radius:0;background:transparent}.node-button[aria-pressed=true]{background:var(--indigo-soft);box-shadow:inset 3px 0 var(--indigo)}.node-button strong{display:block;font-size:13px;overflow-wrap:anywhere}.node-button small{display:block;overflow-wrap:anywhere}.adjacency{display:flex;gap:9px;align-items:center;border:1px solid var(--line);padding:10px 12px;border-radius:9px;margin-top:10px;font-size:12px;overflow-wrap:anywhere}.adjacency span{min-width:0}.adjacency .relation{color:var(--teal);font:11px Consolas,monospace}.coverage{padding:15px 20px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--line)}.scope-note{font-size:12px;color:var(--muted);margin-bottom:16px}.onboarding{padding:60px 30px;text-align:center;background:var(--card);border:1px dashed #b8c3ae;border-radius:var(--radius)}.onboarding h2{font-size:24px;margin:14px 0 8px}.onboarding p{max-width:470px;margin:0 auto 24px;color:var(--muted)}[hidden]{display:none!important}.skip-link{position:absolute;top:-60px;left:15px;background:var(--indigo);color:#fff;padding:10px 16px;z-index:10}.skip-link:focus{top:10px}
+    @media(min-width:1600px){.main{padding-right:65px;padding-left:65px}}@media(max-width:1100px){.app{grid-template-columns:190px minmax(0,1fr)}.sidebar{padding:28px 15px}.main{padding:0 25px 30px}.grid-two{grid-template-columns:1fr}.hero-art{width:80px}.stats{gap:12px}.stat{padding:17px}.topbar .actions .btn{font-size:12px;padding:8px 11px}.project-control{gap:8px}.project-control select{max-width:190px}}@media(max-width:760px){.app{display:block}.sidebar{padding:16px 20px;gap:18px;border-right:0;border-bottom:1px solid var(--line)}.brand-mark{height:32px;width:32px;border-radius:9px}.brand-title{font-size:19px}.brand-sub{font-size:9px}.nav{flex-direction:row;gap:5px;overflow:auto}.nav button{padding:9px 12px;white-space:nowrap;font-size:13px;gap:7px}.nav svg{width:15px;height:15px}.side-label,.side-note{display:none}.main{padding:0 18px 30px}.topbar{min-height:100px;gap:12px;flex-wrap:wrap;padding:15px 0}.project-control{width:100%}.project-control select{max-width:none;flex:1}.topbar .actions{width:100%;justify-content:flex-end}.page-head{margin:25px 0 20px;align-items:flex-start}h1{font-size:25px}.page-head p{font-size:12px}.hero{padding:22px;grid-template-columns:1fr}.hero h2{font-size:20px}.hero-art{display:none}.hero p{font-size:13px}.stats{gap:8px}.stat{padding:14px 11px;border-radius:11px}.stat-value{font-size:27px}.stat-note{font-size:10px}.stat-label{font-size:11px}.grid-two,.graph-layout{grid-template-columns:1fr}.panel-head{padding:18px}.list-item{padding:17px 18px}.field-row{grid-template-columns:1fr}.search-form{flex-wrap:wrap}.search-form input{flex-basis:100%}.search-form select{flex:1}.dialog-head{padding:18px 20px}.dialog-body{padding:20px}.footnote{margin-top:18px}.onboarding{padding:35px 22px}.page-head>.btn{font-size:12px;padding:9px 12px;white-space:nowrap}.section-toolbar{align-items:stretch}.section-toolbar>select{width:100%}.node-list{max-height:350px}}@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#content">跳到主要内容</a>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><svg width="25" height="25" viewBox="0 0 26 26" fill="none"><path d="M5 3v20M13 3v20M21 3v20M3 7h20M3 15h20M3 21h20" stroke="currentColor" stroke-width="1.5"/><path d="M9 3v20M17 3v20" stroke="currentColor" stroke-opacity=".4"/></svg></div>
+        <div><div class="brand-title">织忆</div><div class="brand-sub">MEMWEAVE</div></div>
+      </div>
+      <div>
+        <div class="side-label">WORKSPACE / 工作空间</div>
+        <nav class="nav" aria-label="主要导航">
+          <button type="button" data-view="overview" aria-current="page"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><rect x="3" y="3" width="5" height="5" rx="1" stroke="currentColor"/><rect x="12" y="3" width="5" height="5" rx="1" stroke="currentColor"/><rect x="3" y="12" width="5" height="5" rx="1" stroke="currentColor"/><rect x="12" y="12" width="5" height="5" rx="1" stroke="currentColor"/></svg>工作总览</button>
+          <button type="button" data-view="tasks"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><rect x="4" y="3" width="12" height="15" rx="2" stroke="currentColor"/><path d="m7 8 1.5 1.5L12 6M7 13h6" stroke="currentColor" stroke-linecap="round"/></svg>任务记忆</button>
+          <button type="button" data-view="knowledge"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 5C7 2 3 3 2 4v12c3-2 6-1 8 1 2-2 5-3 8-1V4c-3-2-6-1-8 1Zm0 0v12" stroke="currentColor" stroke-linejoin="round"/></svg>长期知识</button>
+          <button type="button" data-view="graph"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="4" r="2" stroke="currentColor"/><circle cx="4" cy="15" r="2" stroke="currentColor"/><circle cx="16" cy="15" r="2" stroke="currentColor"/><path d="m9 6-4 7m6-7 4 7M6 15h8" stroke="currentColor"/></svg>项目图谱</button>
+        </nav>
+      </div>
+      <div class="side-note"><strong><span class="local-dot"></span>本地工作台</strong>让任务有连续性，<br>让合作有积累。<div style="margin-top:16px;font-size:10px;letter-spacing:1px">MARKDOWN + SQLITE</div></div>
+    </aside>
+    <main class="main" id="content" tabindex="-1">
+      <header class="topbar">
+        <div class="project-control"><label for="project-select">当前项目</label><select id="project-select" disabled><option value="">正在连接…</option></select></div>
+        <div class="actions"><button class="btn quiet small" id="auth-button" type="button">连接设置</button><button class="btn small" id="register-button" type="button">＋ 注册项目</button></div>
+      </header>
+      <div id="notice" role="status" aria-live="polite" hidden></div>
+      <div class="page-head"><div><div class="eyebrow" id="page-eyebrow">A CONTINUOUS WORKSPACE</div><h1 id="page-title">把工作，接着往下做。</h1><p id="page-description">从上次停下的地方，找回清晰的下一步。</p></div><button class="btn primary" id="page-action" type="button" hidden>＋ 开始新任务</button></div>
+      <div id="view-content" aria-busy="true"><div class="loading" role="status">正在读取本地工作空间…</div></div>
+      <footer class="footnote"><span>理解与提炼由宿主 Agent 完成 · 内容保存在本地</span><span id="connection-state">等待连接</span></footer>
+    </main>
+  </div>
+  <dialog id="dialog" aria-labelledby="dialog-title"><div class="dialog-head"><h2 id="dialog-title"></h2><button type="button" class="close-dialog" aria-label="关闭对话框">×</button></div><div class="dialog-body" id="dialog-body"></div></dialog>
+  <script>
+    "use strict";
+    const $ = (selector) => document.querySelector(selector);
+    const state = {projects:[], projectId:"", view:"overview", tasks:[], memories:[], memoryFilter:{query:"",scope:"project",status:"active"}, graph:null, generation:0, dialogGeneration:0, token:"", pending:new Map()};
+    const viewInfo = {
+      overview:["A CONTINUOUS WORKSPACE","把工作，接着往下做。","从上次停下的地方，找回清晰的下一步。","＋ 开始新任务"],
+      tasks:["TASK MEMORY","每一步，都有下文。","保存目标、发现与进展，让下一次接续有所依据。","＋ 开始新任务"],
+      knowledge:["LASTING UNDERSTANDING","让经验，成为下一次的起点。","保留有来源的事实、决策和经验，随时查阅与纠正。","＋ 记录知识"],
+      graph:["PROJECT UNDERSTANDING","把理解，落在项目里。","查看文件结构与架构关系，核对知识对应的实现。","扫描项目"]
+    };
+    function node(tag, className, text) {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (text !== undefined && text !== null) element.textContent = String(text);
+      return element;
+    }
+    function button(text, action, className="btn") {
+      const element = node("button", className, text);
+      element.type = "button";
+      element.addEventListener("click", action);
+      return element;
+    }
+    function currentProject() { return state.projects.find(project => project.id === state.projectId); }
+    function notify(message, type="info") {
+      const container = $("#notice");
+      container.className = "notice " + type;
+      container.replaceChildren(node("span","",message),button("×",()=>{container.hidden=true;},""));
+      container.lastChild.setAttribute("aria-label","关闭提示");
+      container.hidden = false;
+    }
+    function friendlyError(error) {
+      if (error.name === "AbortError") return "本地服务响应超时。请检查服务状态后重试；写入重试会沿用同一操作标识。";
+      if (error.code === "revision_conflict" || error.code === "conflict" || /revision|etag|conflict/i.test(error.code || "")) return "这条记录已在其他位置更新。请重新打开记录，核对最新内容后再保存。";
+      if (error.httpStatus === 401 || error.httpStatus === 403) return "连接凭据无效或已过期。请在“连接设置”中更新本次会话令牌。";
+      if (error instanceof TypeError) return "无法连接本地服务。请确认 MemWeave 仍在运行，然后重试。";
+      return error.message || "操作未完成，请稍后重试。";
+    }
+    async function api(action, payload={}, method="POST") {
+      if (!state.token) throw new Error("尚未提供连接令牌。请使用服务生成的页面链接，或在“连接设置”中输入令牌。");
+      const controller = new AbortController();
+      const timeout = setTimeout(()=>controller.abort(),20000);
+      try {
+        const response = await fetch(action === "status" ? "/api/status" : "/api/" + action, {
+          method, headers:{"Authorization":"Bearer " + state.token,"Content-Type":"application/json"},
+          body:method === "GET" ? undefined : JSON.stringify(payload), signal:controller.signal, cache:"no-store", credentials:"omit"
+        });
+        let result;
+        try { result = await response.json(); } catch { throw new Error("服务返回了无法读取的响应，请确认当前页面与服务版本一致。"); }
+        if (!response.ok || result.status !== "ok") {
+          const error = new Error(result.error?.message || "本地服务未能完成操作。");
+          error.code = result.error?.code;
+          error.httpStatus = response.status;
+          throw error;
+        }
+        $("#connection-state").textContent = "已连接本地服务";
+        return result.data;
+      } finally { clearTimeout(timeout); }
+    }
+    async function mutate(action, payload) {
+      const key = action + ":" + JSON.stringify(payload);
+      if (!state.pending.has(key)) state.pending.set(key, crypto.randomUUID());
+      const result = await api(action,{...payload,operation_id:state.pending.get(key)});
+      state.pending.delete(key);
+      return result;
+    }
+    function empty(title, description, actionText, action) {
+      const container = node("div","empty");
+      container.append(node("div","empty-symbol","◇"),node("strong","",title),node("p","",description));
+      if (actionText) container.append(button(actionText,action,"btn small"));
+      return container;
+    }
+    function panel(title, content, actionText, action) {
+      const container = node("section","panel"), head = node("div","panel-head");
+      head.append(node("h2","",title));
+      if (actionText) head.append(button(actionText,action,"btn quiet small"));
+      container.append(head,content);
+      return container;
+    }
+    function badge(status) {
+      const labels = {active:"进行中",open:"进行中",in_progress:"进行中",completed:"已完成",cancelled:"已取消",stale:"待核对",deleted:"已遗忘",valid:"已启用",candidate:"候选 · 待确认",archived:"已归档",draft:"草稿"};
+      return node("span","badge " + (status === "completed" || status === "valid" ? "done" : status === "cancelled" || status === "archived" ? "grey" : ""),labels[status] || status || "已记录");
+    }
+    function isActive(task) { return !["completed","cancelled","archived"].includes(task.status); }
+    function taskList(tasks) {
+      if (!tasks.length) return empty("还没有任务记忆","从一个明确的目标开始，把验收条件和下一步保留下来。","开始新任务",openTaskForm);
+      const list = node("div","list");
+      for (const task of tasks) {
+        const item = node("article","list-item"), title = node("div","list-title");
+        const titleButton = button(task.title || "未命名任务",()=>openTask(task.id),"link-button");
+        title.append(titleButton,badge(task.status));
+        item.append(title,node("p","",task.next_step ? "下一步 · " + task.next_step : task.goal || "打开任务查看详情与进展"));
+        const meta = node("div","meta-row");
+        meta.append(node("small","",task.id),node("small","","版本 " + (task.revision ?? "—")));
+        item.append(meta);list.append(item);
+      }
+      return list;
+    }
+    function renderOnboarding() {
+      const container = node("section","onboarding");
+      container.append(node("div","eyebrow","YOUR FIRST THREAD"),node("h2","","为项目，织起第一段记忆。"),node("p","","注册本机项目目录后，就能记录任务、积累知识，并扫描项目结构。每个项目拥有明确的记忆边界。"),button("＋ 注册第一个项目",openProjectForm,"btn primary"));
+      $("#view-content").replaceChildren(container);
+    }
+    async function loadProjects(preferredId) {
+      const data = await api("project_list");
+      state.projects = data.items || [];
+      const selector = $("#project-select");
+      selector.replaceChildren();
+      if (!state.projects.length) selector.append(new Option("尚未注册项目",""));
+      for (const project of state.projects) selector.append(new Option(project.title || project.name || project.root,project.id));
+      state.projectId = state.projects.some(project=>project.id === preferredId) ? preferredId : (state.projects[0]?.id || "");
+      selector.value = state.projectId;
+      selector.disabled = !state.projects.length;
+      await renderView();
+    }
+    async function renderView() {
+      const generation = ++state.generation, projectId = state.projectId, view = state.view;
+      const info = viewInfo[view];
+      $("#page-eyebrow").textContent=info[0];$("#page-title").textContent=info[1];$("#page-description").textContent=info[2];
+      $("#page-action").textContent=info[3];$("#page-action").hidden=!projectId;
+      document.querySelectorAll("[data-view]").forEach(element=>{
+        if (element.dataset.view === view) element.setAttribute("aria-current","page"); else element.removeAttribute("aria-current");
+      });
+      const container = $("#view-content");
+      if (!projectId) { container.setAttribute("aria-busy","false");renderOnboarding();return; }
+      container.setAttribute("aria-busy","true");container.replaceChildren(node("div","loading","正在读取项目内容…"));
+      try {
+        if (view === "overview") {
+          const [tasks,memories,graph] = await Promise.all([api("task_list",{project_id:projectId}),api("memory_search",{project_id:projectId,query:"",scope:"project",limit:20}),api("graph_query",{project_id:projectId,query:"",limit:100})]);
+          if (generation !== state.generation) return;
+          state.tasks=tasks.items || [];state.memories=memories.items || [];state.graph=graph;
+          renderOverview();
+        } else if (view === "tasks") {
+          const data = await api("task_list",{project_id:projectId});
+          if (generation !== state.generation) return;
+          state.tasks=data.items || [];renderTasks();
+        } else if (view === "knowledge") {
+          const data = await api("memory_search",{project_id:projectId,...state.memoryFilter,limit:20});
+          if (generation !== state.generation) return;
+          state.memories=data.items || [];renderKnowledge();
+        } else {
+          const data = await api("graph_query",{project_id:projectId,query:"",limit:100});
+          if (generation !== state.generation) return;
+          state.graph=data;renderGraph();
+        }
+      } catch(error) {
+        if (generation !== state.generation) return;
+        container.replaceChildren(empty("暂时无法读取工作空间",friendlyError(error),"重新读取",renderView));
+        notify(friendlyError(error),"error");
+      } finally { if (generation === state.generation) container.setAttribute("aria-busy","false"); }
+    }
+    function switchView(view) { state.view=view;renderView(); }
+    function renderOverview() {
+      const fragment = document.createDocumentFragment(), activeTasks = state.tasks.filter(isActive);
+      const hero = node("section","hero"), heroText = node("div","");
+      heroText.append(node("div","eyebrow","A THREAD TO PICK UP"),node("h2","",activeTasks.length ? "你的工作，已有接续的线索。" : "留下一段清晰的工作记忆。"),node("p","",activeTasks.length ? "打开进行中的任务，核对已有发现，再从下一步继续。完成后，把可复用的经验留给未来的自己。" : "从一个任务开始，记录做了什么、为什么这样做，以及接下来要验证什么。"));
+      hero.append(heroText,node("div","hero-art","╱ ─ ╲\n│ ◇ │\n╲ ─ ╱"));
+      hero.lastChild.setAttribute("aria-hidden","true");hero.lastChild.style.cssText="font:30px/1 Consolas,monospace;white-space:pre;text-align:center";
+      const stats = node("div","stats");
+      const statData = [["进行中的任务",activeTasks.length,"保留目标与下一步"],["项目知识",state.memories.length + (state.memories.length >= 20 ? "+" : ""),"本次检索 · 最多 20 条"],["结构节点",state.graph.nodes?.length || 0,"本次查询 · 最多 100 个"]];
+      for(const [label,value,note] of statData){const stat=node("section","stat");stat.append(node("div","stat-label",label),node("div","stat-value",value),node("div","stat-note",note));stats.append(stat);}
+      const columns = node("div","grid-two");
+      const flow=node("div","panel-body flow");
+      [["01","恢复上下文","核对目标、验收条件和当前代码状态。"],["02","记录工作进展","留下新发现、实际结果与明确的下一步。"],["03","沉淀可复用的知识","为经验补上来源，在下一个任务中找回。"]].forEach(([number,title,text])=>{const step=node("div","flow-step"),body=node("div","");body.append(node("h3","",title),node("p","",text));step.append(node("span","step-number",number),body);flow.append(step);});
+      columns.append(panel("接着做",taskList(activeTasks.slice(0,4)),"全部任务 →",()=>switchView("tasks")),panel("一段持续的工作循环",flow));
+      fragment.append(hero,stats,columns);
+      const project = currentProject();
+      if(project) fragment.append(node("p","project-path","项目目录 · " + project.root));
+      $("#view-content").replaceChildren(fragment);
+    }
+    function renderTasks() {
+      const toolbar=node("div","section-toolbar"), select=node("select","");
+      select.setAttribute("aria-label","按任务状态筛选");
+      select.append(new Option("全部任务","all"),new Option("进行中","active"),new Option("已完成","completed"),new Option("已取消","cancelled"));
+      select.style.width="180px";
+      const content=node("div","");
+      const refresh=()=>content.replaceChildren(panel("任务记录",taskList(state.tasks.filter(task=>select.value === "all" || (select.value === "active" ? isActive(task) : task.status === select.value)))));
+      select.addEventListener("change",refresh);
+      toolbar.append(node("span","muted","每个任务保留独立的目标、进展与验收记录。"),select);
+      $("#view-content").replaceChildren(toolbar,content);refresh();
+    }
+    function memoryList(memories) {
+      if (!memories.length) return empty("还没有匹配的知识","可以调整关键词或范围，也可以记录一条有明确来源的知识。");
+      const list=node("div","list");
+      for(const memory of memories) {
+        const item=node("article","list-item"),title=node("div","list-title"),meta=node("div","meta-row");
+        title.append(node("h3","",memory.title || "未命名知识"),badge(memory.status === "active" ? "valid" : memory.status || "valid"));
+        const body=String(memory.body || "");
+        item.append(title,node("p","",body.length > 360 ? body.slice(0,360) + "…" : body));
+        const kinds={fact:"事实",decision:"决策",lesson:"经验",preference:"偏好"};
+        meta.append(node("small","",memory.scope === "user" ? "用户范围" : "项目范围"),node("small","",kinds[memory.kind] || "知识"),node("small","","版本 " + (memory.revision ?? "—")),button("查看 / 纠正",()=>openMemory(memory),"btn quiet small"));
+        item.append(meta);list.append(item);
+      }
+      return list;
+    }
+    function renderKnowledge() {
+      const form=node("form","search-form"),query=node("input",""),scope=node("select",""),status=node("select",""),results=node("div","");
+      query.type="search";query.placeholder="搜索知识、决策或经验…";query.setAttribute("aria-label","知识搜索关键词");
+      scope.setAttribute("aria-label","知识范围");scope.append(new Option("当前项目","project"),new Option("用户知识","user"));
+      status.setAttribute("aria-label","知识状态");status.append(new Option("已启用知识","active"),new Option("候选 · 待确认","candidate"));
+      query.value=state.memoryFilter.query;scope.value=state.memoryFilter.scope;status.value=state.memoryFilter.status;
+      const search=button("搜索",()=>{},"btn primary");search.type="submit";form.append(query,scope,status,search);
+      const scopeNote=node("p","scope-note","项目范围仅查询所选项目；用户知识需显式选择。候选知识等待核对，启用后才进入常规知识检索与上下文。");
+      const projectId=state.projectId;
+      form.addEventListener("submit",async event=>{
+        event.preventDefault();search.disabled=true;results.setAttribute("aria-busy","true");
+        const filter={query:query.value.trim(),scope:scope.value,status:status.value};
+        state.memoryFilter=filter;
+        try { const data=await api("memory_search",{project_id:projectId,...filter,limit:20});if(state.projectId!==projectId || state.view!=="knowledge")return;state.memories=data.items || [];results.replaceChildren(panel((filter.status === "candidate" ? "候选知识" : "已启用知识") + " · 最多 20 条",memoryList(state.memories))); }
+        catch(error){notify(friendlyError(error),"error");}finally{search.disabled=false;results.setAttribute("aria-busy","false");}
+      });
+      results.append(panel((state.memoryFilter.status === "candidate" ? "候选知识" : "已启用知识") + " · 最多 20 条",memoryList(state.memories)));
+      $("#view-content").replaceChildren(form,scopeNote,results);form.style.marginBottom="12px";
+    }
+    function renderGraph() {
+      const graph=state.graph || {}, form=node("form","search-form"),query=node("input","");
+      query.type="search";query.placeholder="查找文件、目录或架构节点…";query.setAttribute("aria-label","图谱搜索关键词");
+      const search=button("查找",()=>{},"btn");search.type="submit";form.append(query,search);
+      const projectId=state.projectId;
+      form.addEventListener("submit",async event=>{
+        event.preventDefault();search.disabled=true;
+        try {const data=await api("graph_query",{project_id:projectId,query:query.value.trim(),limit:100});if(state.projectId!==projectId || state.view!=="graph")return;state.graph=data;renderGraph();const next=$("#graph-search");if(next)next.value=query.value;}
+        catch(error){notify(friendlyError(error),"error");}finally{search.disabled=false;}
+      });
+      query.id="graph-search";
+      const toolbar=node("div","section-toolbar");toolbar.append(form);
+      const nodeList=node("div","node-list"),detail=node("div","panel-body");
+      const nodes=graph.nodes || [],edges=graph.edges || [];
+      const coverage=typeof graph.coverage === "string" ? graph.coverage : graph.coverage ? JSON.stringify(graph.coverage) : "尚无覆盖信息";
+      const listing=panel("结构与架构 · " + nodes.length + " 个节点",nodeList);
+      const coverageNode=node("p","coverage","覆盖信息：" + coverage);
+      listing.insertBefore(coverageNode,nodeList);
+      const layout=node("div","graph-layout");layout.append(listing,panel("节点与关联",detail));
+      const selectNode=(selected,selectedButton)=>{
+        nodeList.querySelectorAll("button").forEach(element=>element.setAttribute("aria-pressed",String(element===selectedButton)));
+        detail.replaceChildren(node("h3","",selected.label || selected.path || selected.id),node("p","project-path",selected.path || selected.id));
+        const meta=node("div","meta-row");meta.append(node("span","badge",selected.type || "节点"));if(selected.status)meta.append(badge(selected.status));detail.append(meta);
+        const linked=edges.filter(edge=>edge.source===selected.id || edge.target===selected.id || edge.source===selected.path || edge.target===selected.path);
+        detail.append(node("p","scope-note","关联关系 · " + linked.length));detail.lastChild.style.marginTop="22px";
+        for(const edge of linked) {
+          const source=nodes.find(item=>item.id===edge.source || item.path===edge.source),target=nodes.find(item=>item.id===edge.target || item.path===edge.target),row=node("div","adjacency");
+          row.append(node("span","",source?.label || source?.path || edge.source),node("span","relation","→ " + (edge.relation || "关联") + " →"),node("span","",target?.label || target?.path || edge.target));detail.append(row);
+        }
+        if(!linked.length)detail.append(node("p","muted","当前查询中没有此节点的关联关系。"));
+      };
+      for(const item of nodes){const entry=button("",()=>selectNode(item,entry),"node-button");entry.setAttribute("aria-pressed","false");entry.append(node("strong","",item.label || item.path || item.id),node("small","",item.path || item.type || item.id));nodeList.append(entry);}
+      if(!nodes.length)nodeList.append(empty("图谱还没有匹配节点","首次使用可扫描项目，建立文件结构；架构知识由宿主 Agent 阅读后补充。"));
+      detail.append(empty("选择一个节点","查看它的位置，以及当前查询中的上下游关系。"));
+      const note=node("p","scope-note","扫描提供文件结构，架构理解由宿主 Agent 补充。本页最多展示 100 个节点；扫描不会自动完成语义理解。");note.style.marginTop="18px";
+      $("#view-content").replaceChildren(toolbar,layout,note);
+    }
+    function openDialog(title) {
+      state.dialogGeneration++;
+      const dialog=$("#dialog");$("#dialog-title").textContent=title;$("#dialog-body").replaceChildren();
+      if(!dialog.open)dialog.showModal();
+      return $("#dialog-body");
+    }
+    function field(labelText, name, {value="",type="text",hint="",required=false,rows=4}={}) {
+      const label=node("label","",labelText);
+      if(hint)label.append(node("span","hint",hint));
+      const control=node(type === "textarea" ? "textarea" : "input","");
+      if(type !== "textarea") control.type=type;else control.rows=rows;
+      control.name=name;control.value=value;control.required=required;
+      label.append(control);return label;
+    }
+    function selectField(labelText,name,options) {
+      const label=node("label","",labelText),select=node("select","");select.name=name;select.style.marginTop="7px";
+      for(const [value,text] of options)select.append(new Option(text,value));label.append(select);return label;
+    }
+    function operationForm(title,fields,submitText,handler,{destructive=false}={}) {
+      const body=openDialog(title),form=node("form","form-grid"),errorBox=node("div","notice error"),footer=node("div","form-footer");
+      errorBox.hidden=true;errorBox.setAttribute("role","alert");
+      const cancel=button("取消",()=>$("#dialog").close(),"btn"),submit=button(submitText,()=>{},destructive ? "btn danger" : "btn primary");submit.type="submit";
+      footer.append(cancel,submit);form.append(...fields,errorBox,footer);body.append(form);
+      form.addEventListener("submit",async event=>{
+        event.preventDefault();if(!form.reportValidity())return;
+        submit.disabled=true;cancel.disabled=true;errorBox.hidden=true;form.setAttribute("aria-busy","true");
+        try{await handler(new FormData(form));}
+        catch(error){errorBox.textContent=friendlyError(error);errorBox.hidden=false;}
+        finally{submit.disabled=false;cancel.disabled=false;form.setAttribute("aria-busy","false");}
+      });
+      return form;
+    }
+    function openProjectForm() {
+      operationForm("注册本地项目",[
+        field("项目名称","name",{required:true,hint:"为这个工作空间起一个便于辨认的名字。"}),
+        field("本机项目目录","root",{required:true,hint:"输入完整绝对路径，例如 C:\\Users\\你\\Projects\\my-project。"})
+      ],"注册项目",async values=>{
+        const result=await mutate("project_register",{root:values.get("root").trim(),name:values.get("name").trim()});
+        $("#dialog").close();notify("项目已注册。可以开始记录任务，或扫描项目结构。","success");await loadProjects(result.id);
+      });
+    }
+    function openTaskForm() {
+      if(!state.projectId)return openProjectForm();
+      const projectId=state.projectId;
+      operationForm("开始一项新任务",[
+        field("任务名称","title",{required:true,hint:"一句话说明这次要完成什么。"}),
+        field("任务目标","goal",{type:"textarea",required:true,hint:"保留背景、预期结果和必要约束。"}),
+        field("验收条件","acceptance",{type:"textarea",required:true,hint:"每行一条；完成任务时需要逐项记录实际结果。",rows:3})
+      ],"创建任务",async values=>{
+        await mutate("task_open",{project_id:projectId,title:values.get("title").trim(),goal:values.get("goal").trim(),acceptance:values.get("acceptance").split("\n").map(item=>item.trim()).filter(Boolean)});
+        $("#dialog").close();notify("任务已创建，目标与验收条件已保存。","success");await renderView();
+      });
+    }
+    async function openTask(taskId) {
+      const body=openDialog("任务记忆");body.append(node("div","loading","正在读取任务…"));
+      const dialogGeneration=state.dialogGeneration,projectId=state.projectId;
+      try {
+        const task=await api("task_read",{task_id:taskId});
+        if(!$("#dialog").open || state.dialogGeneration!==dialogGeneration || state.projectId!==projectId)return;
+        $("#dialog-title").textContent=task.title || "任务记忆";body.replaceChildren();
+        const meta=node("div","meta-row");meta.append(badge(task.status),node("small","","版本 " + task.revision),node("small","",task.id));body.append(meta);meta.style.marginBottom="20px";
+        if(task.status === "completed" && task.consolidation_status === "pending") {
+          const notice=node("p","notice info","待宿主提炼：任务已完成，经验提炼与知识审查尚未执行。请由宿主 Agent 核对并提炼；本地服务不会自行调用模型。");
+          notice.style.marginBottom="20px";body.append(notice);
+        } else if(task.status === "completed" && task.consolidation_status === "reviewed") {
+          const notice=node("p","notice success","宿主已记录提炼审查结果。可在长期知识中核对已启用内容与待确认的候选知识。");
+          notice.style.marginBottom="20px";body.append(notice);
+        }
+        for(const [title,value] of [["目标",task.goal],["当前发现",task.findings],["进展记录",task.progress],["下一步",task.next_step],["任务正文",task.body]]) {
+          if(!value)continue;const section=node("section","detail-section");section.append(node("h3","",title),node("div","prose",typeof value === "string" ? value : JSON.stringify(value,null,2)));body.append(section);
+        }
+        const acceptance=Array.isArray(task.acceptance) ? task.acceptance : [];
+        if(acceptance.length){const section=node("section","detail-section"),list=node("ul","criteria");acceptance.forEach(item=>list.append(node("li","",item)));section.append(node("h3","","验收条件"),list);body.append(section);}
+        if(isActive(task)){const actions=node("div","form-footer");actions.append(button("保存检查点",()=>openCheckpoint(task),"btn primary"),button("结束任务",()=>openCloseTask(task),"btn"));body.append(actions);}
+      } catch(error){if($("#dialog").open && state.dialogGeneration===dialogGeneration)body.replaceChildren(empty("任务暂时无法读取",friendlyError(error),"重试",()=>openTask(taskId)));}
+    }
+    function versionOf(record){return {expected_revision:record.revision,expected_etag:record.etag};}
+    function openCheckpoint(task) {
+      operationForm("保存任务检查点",[
+        field("新的发现","findings",{type:"textarea",hint:"保留事实、判断依据和待验证的问题。"}),
+        field("本次进展","progress",{type:"textarea",required:true,hint:"记录实际完成的工作及验证结果。"}),
+        field("明确的下一步","next_step",{type:"textarea",required:true,rows:2,value:task.next_step || ""})
+      ],"保存检查点",async values=>{
+        await mutate("task_checkpoint",{task_id:task.id,...versionOf(task),findings:values.get("findings").trim(),progress:values.get("progress").trim(),next_step:values.get("next_step").trim()});
+        $("#dialog").close();notify("检查点已保存，可以从下一步接续。","success");await renderView();
+      });
+    }
+    function openCloseTask(task) {
+      const acceptance=Array.isArray(task.acceptance) ? task.acceptance : [];
+      const fields=[selectField("结束方式","outcome",[["completed","已完成"],["cancelled","已取消"]]),field("任务结论","summary",{type:"textarea",required:true,hint:"说明实际结果、验证情况以及遗留事项。"})];
+      acceptance.forEach((criterion,index)=>fields.push(field("验收：" + criterion,"criterion_" + index,{type:"textarea",required:true,rows:2,hint:"写明实际证据；取消任务时说明未完成情况。"})));
+      operationForm("结束任务",fields,"保存并结束",async values=>{
+        const acceptanceResults={};acceptance.forEach((criterion,index)=>{Object.defineProperty(acceptanceResults,criterion,{value:values.get("criterion_" + index).trim(),enumerable:true});});
+        await mutate("task_close",{task_id:task.id,...versionOf(task),outcome:values.get("outcome"),summary:values.get("summary").trim(),acceptance_results:acceptanceResults});
+        $("#dialog").close();notify("任务已结束，结论与验收结果已保存。","success");await renderView();
+      });
+    }
+    function openMemoryForm() {
+      if(!state.projectId)return openProjectForm();
+      const projectId=state.projectId;
+      operationForm("记录一条长期知识",[
+        field("知识标题","title",{required:true}),
+        selectField("适用范围","scope",[["project","当前项目"],["user","用户范围 · 可跨项目复用"]]),
+        selectField("知识类型","kind",[["fact","事实"],["decision","决策"],["lesson","经验"],["preference","偏好"]]),
+        selectField("保存状态","status",[["active","直接启用 · 用于后续检索与上下文"],["candidate","先存为候选 · 核对后再启用"]]),
+        field("知识内容","body",{type:"textarea",required:true,hint:"说明内容、适用条件与依据。本次输入会记录为用户明确提供的来源。",rows:7})
+      ],"保存知识",async values=>{
+        const status=values.get("status"),scope=values.get("scope");
+        await mutate("memory_write",{project_id:projectId,title:values.get("title").trim(),body:values.get("body").trim(),scope,kind:values.get("kind"),status,sources:[{type:"user",reference:"用户在本地页面明确输入"}]});
+        state.memoryFilter={query:"",scope,status};
+        $("#dialog").close();notify(status === "candidate" ? "候选知识已保存，核对并启用后才会用于常规检索与上下文。" : "知识已启用，来源标记为本地页面的明确输入。","success");await renderView();
+      });
+    }
+    function openMemory(memory) {
+      const body=openDialog(memory.title || "知识详情"),sources=node("div","detail-section");
+      if(memory.status === "candidate")body.append(node("p","notice info","这是一条候选知识，尚未用于常规检索与上下文。请核对内容及来源，再确认启用。"));
+      body.append(node("div","prose",memory.body || ""));
+      sources.style.marginTop="22px";sources.append(node("h3","","来源与范围"));
+      sources.append(node("p","muted",(memory.scope === "user" ? "用户范围" : "项目范围") + " · 版本 " + memory.revision));
+      for(const source of memory.sources || [])sources.append(node("p","prose",source.reference || source.path || JSON.stringify(source)));
+      if(!memory.sources?.length)sources.append(node("p","muted","这条记录未提供来源详情。"));
+      const actions=node("div","form-footer");actions.append(button("遗忘此知识",()=>forgetMemory(memory),"btn danger"),button("纠正内容",()=>editMemory(memory),"btn primary"));
+      if(memory.status === "candidate")actions.append(button("启用知识",()=>activateMemory(memory),"btn teal"));
+      body.append(sources,actions);
+    }
+    function activateMemory(memory) {
+      operationForm("确认启用候选知识",[
+        node("p","prose","核对“" + (memory.title || "未命名知识") + "”的内容、来源与适用范围后，可将它启用，供后续知识检索与上下文使用。")
+      ],"确认启用",async()=>{
+        await mutate("memory_activate",{memory_id:memory.id,...versionOf(memory)});
+        $("#dialog").close();notify("候选知识已启用，可在“已启用知识”中查看。","success");await renderView();
+      });
+    }
+    function editMemory(memory) {
+      operationForm("纠正知识内容",[
+        field("知识标题","title",{required:true,value:memory.title || ""}),
+        field("知识内容","body",{type:"textarea",required:true,value:memory.body || "",rows:8})
+      ],"保存纠正",async values=>{
+        await mutate("memory_update",{memory_id:memory.id,...versionOf(memory),title:values.get("title").trim(),body:values.get("body").trim()});
+        $("#dialog").close();notify("知识内容已更新。","success");await renderView();
+      });
+    }
+    function forgetMemory(memory) {
+      operationForm("遗忘这条知识",[
+        node("p","prose","即将遗忘“" + (memory.title || "未命名知识") + "”。遗忘后，这条内容将不再作为可用知识参与检索。"),
+        field("输入“遗忘”以确认","confirmation",{required:true})
+      ],"确认遗忘",async values=>{
+        if(values.get("confirmation") !== "遗忘")throw new Error("请输入“遗忘”后再提交。");
+        await mutate("memory_forget",{memory_id:memory.id,...versionOf(memory)});
+        $("#dialog").close();notify("这条知识已遗忘。","success");await renderView();
+      },{destructive:true});
+    }
+    async function scanProject() {
+      const projectId=state.projectId,action=$("#page-action");if(!projectId)return;
+      action.disabled=true;action.textContent="正在扫描…";
+      try {
+        const data=await mutate("project_scan",{project_id:projectId});
+        const skipped=Array.isArray(data.skipped) ? data.skipped.length : data.skipped;
+        notify("项目扫描完成：读取 " + (data.file_count ?? "—") + " 个文件" + (skipped ? "，跳过 " + skipped + " 项" : "") + "。请根据覆盖信息核对扫描范围。","success");
+        await renderView();
+      }catch(error){notify(friendlyError(error),"error");}finally{action.disabled=false;action.textContent=viewInfo[state.view][3];}
+    }
+    function saveToken(token) {
+      state.token=token;
+      try {if(token)sessionStorage.setItem("memweave-session-token",token);else sessionStorage.removeItem("memweave-session-token");}catch{}
+    }
+    function openAuth() {
+      operationForm("本次会话连接设置",[
+        node("p","scope-note","输入本地服务提供的令牌。凭据仅用于当前浏览器会话；使用服务生成的带令牌链接也可连接。"),
+        field("连接令牌","token",{type:"password",required:true,hint:"不会显示已有令牌，也不会写入长期浏览器存储。"})
+      ],"连接",async values=>{
+        const previous=state.token;saveToken(values.get("token").trim());
+        try {await api("status",{},"GET");await loadProjects(state.projectId);$("#dialog").close();notify("本地服务连接成功。","success");}
+        catch(error){saveToken(previous);throw error;}
+      });
+      const tokenInput=$("#dialog input");tokenInput.autocomplete="off";tokenInput.spellcheck=false;
+    }
+    $("#register-button").addEventListener("click",openProjectForm);
+    $("#auth-button").addEventListener("click",openAuth);
+    $("#project-select").addEventListener("change",event=>{state.projectId=event.target.value;state.memoryFilter={query:"",scope:"project",status:"active"};$("#notice").hidden=true;renderView();});
+    document.querySelectorAll("[data-view]").forEach(element=>element.addEventListener("click",()=>switchView(element.dataset.view)));
+    $("#page-action").addEventListener("click",()=>{if(state.view==="knowledge")openMemoryForm();else if(state.view==="graph")scanProject();else openTaskForm();});
+    $(".close-dialog").addEventListener("click",()=>{if(!$("#dialog-body").querySelector('form[aria-busy="true"]'))$("#dialog").close();});
+    $("#dialog").addEventListener("cancel",event=>{if($("#dialog-body").querySelector('form[aria-busy="true"]'))event.preventDefault();});
+    $("#dialog").addEventListener("close",()=>{state.dialogGeneration++;$("#dialog-body").replaceChildren();});
+    async function start() {
+      const url=new URL(location.href),urlToken=url.searchParams.get("token");
+      if(url.searchParams.has("token")){url.searchParams.delete("token");history.replaceState(null,"",url.pathname + url.search + url.hash);}
+      if(urlToken)saveToken(urlToken);else{try{state.token=sessionStorage.getItem("memweave-session-token") || "";}catch{}}
+      try {await api("status",{},"GET");await loadProjects();}
+      catch(error) {
+        $("#connection-state").textContent="尚未连接";
+        $("#project-select").replaceChildren(new Option("尚未连接",""));
+        $("#view-content").setAttribute("aria-busy","false");
+        $("#view-content").replaceChildren(empty("连接你的本地记忆空间",friendlyError(error),"设置连接令牌",openAuth));
+        notify(friendlyError(error),"error");
+      }
+    }
+    start();
+  </script>
+</body>
+</html>
