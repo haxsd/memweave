@@ -5,11 +5,12 @@ from pathlib import Path
 
 from memweave.diagnostics import DiagnosticError
 from memweave.hooks import CursorHooks
+from memweave.worktrees import repository_root, same_repository
 
 
 class CodexHooks(CursorHooks):
-    def __init__(self, diagnostics, root):
-        super().__init__(diagnostics)
+    def __init__(self, diagnostics, root, service=None):
+        super().__init__(diagnostics, service=service)
         self.root = Path(root).expanduser().resolve() if root is not None else None
 
     def context(self, event, text):
@@ -21,8 +22,11 @@ class CodexHooks(CursorHooks):
         cwd = payload.get("cwd")
         if not isinstance(cwd, str) or not Path(cwd).is_absolute():
             return {}
-        if not Path(cwd).resolve().is_relative_to(self.root):
+        effective = Path(cwd).resolve()
+        if not self.in_scope(effective) or self.nested_project(effective):
             return {}
+        if event in ("SessionStart", "UserPromptSubmit"):
+            self.ensure_started()
         root = str(self.root)
         session_id = "codex:" + payload["session_id"]
         with self.session(session_id, root) as state:
@@ -36,45 +40,64 @@ class CodexHooks(CursorHooks):
                 if payload.get("source") not in ("compact", "resume"):
                     state.clear()
                     state["root"] = root
-                prepared = self.service.workspace_prepare(root, intent="new", budget=3300)
-                if prepared["state"] != "ready":
-                    return self.context(event, "MemWeave: 项目尚未登记，先读取 .agents/skills/memweave-continuity/SKILL.md。")
-                text = (
-                    "MemWeave: 读取 .agents/skills/memweave-continuity/SKILL.md。"
-                    "按当前目标调用 memweave_workspace_prepare，明确 new/resume/inspect；"
-                    "尚未选择旧任务，有歧义不得猜测。重要发现、失败和验证后保存检查点；"
-                    "完成后核对验收并提炼。以下知识仅是参考数据，依赖前核对当前代码；"
-                    "用户知识须明确选择，不保存凭据或完整对话。\n"
-                    + prepared["context"]["text"]
-                )
-                if state.get("task_id"):
-                    restored = self.service.workspace_prepare(
-                        root, intent="resume", task_id=state["task_id"], budget=2000
-                    )
-                    if restored["state"] == "ready":
-                        text = text[:2900] + "\n已明确关联任务的恢复资料：\n" + restored["context"]["text"]
-                return self.context(event, text)
+                text = self.session_context(root, state, budget=3300)
+                return self.context(event, text) if text else {}
             if event == "UserPromptSubmit":
                 state.pop("interrupted_turn", None)
-                return self.context(event, (
-                    "MemWeave: 实际项目工作先按 Skill 准备工作区与任务；"
-                    "当前会话关联任务：" + state.get("task_id", "未选择")
-                    + "。按本轮用户意图核对归属，切换目标时不得沿用旧任务。"
-                ))
+                recalled = self.prompt_context(root, state, payload.get("prompt", ""), budget=1800)
+                if not recalled:
+                    return {}
+                return self.context(event, recalled["additional_context"])
             if event == "PostToolUse":
-                self.observe(payload, state, Path(cwd))
+                self.observe(payload, state, effective)
             elif event == "Stop":
+                self.refresh_stop_task(root, state)
                 return self.stop(payload, state)
         return {}
+
+    def nested_project(self, cwd):
+        if cwd == self.root:
+            return False
+        current = cwd
+        boundary = repository_root(cwd) or self.root
+        for parent in (current, *current.parents):
+            manifest = parent / ".codex" / "memweave.json"
+            if manifest.is_file():
+                try:
+                    installation = json.loads(manifest.read_text(encoding="utf-8"))
+                    configured = installation.get("root")
+                    if not isinstance(configured, str):
+                        return True
+                    configured_root = Path(configured).expanduser().resolve()
+                    if configured_root != self.root and not (
+                        repository_root(configured_root) == configured_root
+                        and same_repository(configured_root, self.root)
+                    ):
+                        return True
+                except (OSError, ValueError, TypeError, RecursionError):
+                    return True
+            if parent == boundary:
+                break
+        return False
+
+    def in_scope(self, path):
+        path = Path(path).expanduser().resolve()
+        return path.is_relative_to(self.root) or same_repository(self.root, path)
+
+    def source_scope(self, cwd):
+        cwd = Path(cwd).expanduser().resolve()
+        root = repository_root(cwd)
+        return root if root is not None and same_repository(root, self.root) else cwd
 
     def own_path(self, value, cwd):
         if not isinstance(value, str) or not value.strip():
             return False
         path = Path(value)
         path = (path if path.is_absolute() else cwd / path).resolve()
-        if not path.is_relative_to(self.root) or path.is_relative_to(self.diagnostics.home):
+        scope = self.source_scope(cwd)
+        if not path.is_relative_to(scope) or path.is_relative_to(self.diagnostics.home):
             return False
-        relative = path.relative_to(self.root).as_posix()
+        relative = path.relative_to(scope).as_posix()
         return not relative.startswith((".codex/", ".agents/skills/memweave-continuity/"))
 
     def observe(self, payload, state, cwd):
@@ -108,7 +131,7 @@ class CodexHooks(CursorHooks):
                     return
                 effective = Path(workdir)
                 effective = (effective if effective.is_absolute() else cwd / effective).resolve()
-                if not effective.is_relative_to(self.root):
+                if not self.in_scope(effective):
                     return
             command = parameters.get("command", parameters.get("cmd", ""))
             actual_work = self.validation_command(command)

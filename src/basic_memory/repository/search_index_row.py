@@ -1,0 +1,204 @@
+"""Search index data structures."""
+
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+from basic_memory.schemas.search import SearchItemType
+from basic_memory.utils import ensure_timezone_aware
+
+
+# Search reads never carry more of content_snippet than any reader of a search row
+# uses: the displayed `content` (CONTENT_DISPLAY_LIMIT), the small-note passage
+# (2,000), and the reranker's fallback document (reranker_max_document_chars, 2,000
+# by default). Only the rerank prefix reads further, to honor a larger or unbounded
+# reranker setting (see SemanticSearch._materialize). content_snippet stores the whole
+# note, 41 KB on average in a large production project, so selecting it uncapped
+# moved megabytes per search (#1746).
+SNIPPET_READ_LIMIT = 4000
+
+
+def snippet_length_columns(table: str) -> str:
+    """SELECT columns carrying no note text, only the stored content_snippet's length.
+
+    Ranking reads ids and scores; the text of the rows a search returns is fetched once
+    they are known (#1746). The length still answers content_length and the small-note
+    rule before that text arrives.
+    """
+    return f"NULL AS content_snippet, length({table}.content_snippet) AS content_snippet_length"
+
+
+def capped_snippet_columns(table: str, limit: int | None = SNIPPET_READ_LIMIT) -> str:
+    """SELECT columns carrying content_snippet, cut at ``limit``, and the stored length.
+
+    ``None`` reads the whole text: the reranker's own document limit can be unbounded.
+    """
+    text_column = (
+        f"{table}.content_snippet"
+        if limit is None
+        else f"substr({table}.content_snippet, 1, {int(limit)})"
+    )
+    return (
+        f"{text_column} AS content_snippet, "
+        f"length({table}.content_snippet) AS content_snippet_length"
+    )
+
+
+@dataclass
+class SearchIndexRow:
+    """Search result with score and metadata."""
+
+    project_id: int
+    id: int
+    type: str
+    file_path: str
+
+    # date values
+    created_at: datetime
+    updated_at: datetime
+
+    permalink: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+
+    # assigned in result
+    score: Optional[float] = None
+
+    # Type-specific fields
+    title: Optional[str] = None  # entity
+    content_stems: Optional[str] = None  # entity, observation
+    content_snippet: Optional[str] = None  # entity, observation
+    entity_id: Optional[int] = None  # observations
+    category: Optional[str] = None  # observations
+    from_id: Optional[int] = None  # relations
+    to_id: Optional[int] = None  # relations
+    to_name: Optional[str] = None  # relations: literal target text, set even when unresolved
+    relation_type: Optional[str] = None  # relations
+
+    # Matched chunk text from vector search (the actual content that matched the query)
+    matched_chunk_text: Optional[str] = None
+    # Length of the stored content_snippet when a search read capped the text it
+    # transported (see SNIPPET_READ_LIMIT); None when content_snippet is the whole value.
+    content_snippet_length: Optional[int] = None
+
+    CONTENT_DISPLAY_LIMIT = 4000
+
+    @classmethod
+    def from_mapping(cls, row: Mapping[str, Any]) -> "SearchIndexRow":
+        """Hydrate one persisted search row from either supported database backend."""
+        metadata = row.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = json.loads(metadata) if metadata else {}
+
+        raw_score = row.get("score")
+        return cls(
+            project_id=row["project_id"],
+            id=row["id"],
+            title=row.get("title"),
+            permalink=row.get("permalink"),
+            file_path=row["file_path"],
+            type=row["type"],
+            score=float(raw_score) if raw_score is not None else None,
+            metadata=metadata,
+            from_id=row.get("from_id"),
+            to_id=row.get("to_id"),
+            to_name=row.get("to_name"),
+            relation_type=row.get("relation_type"),
+            entity_id=row.get("entity_id"),
+            content_stems=row.get("content_stems"),
+            content_snippet=row.get("content_snippet"),
+            content_snippet_length=row.get("content_snippet_length"),
+            category=row.get("category"),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def __post_init__(self) -> None:
+        """Restore typed, timezone-aware datetimes from raw search query results."""
+        if isinstance(self.created_at, str):
+            self.created_at = datetime.fromisoformat(self.created_at)
+        if isinstance(self.updated_at, str):
+            self.updated_at = datetime.fromisoformat(self.updated_at)
+        self.created_at = ensure_timezone_aware(self.created_at)
+        self.updated_at = ensure_timezone_aware(self.updated_at)
+
+    @property
+    def content(self) -> Optional[str]:
+        """Return truncated content for display. Full content in content_snippet."""
+        if self.content_snippet and len(self.content_snippet) > self.CONTENT_DISPLAY_LIMIT:
+            return self.content_snippet[: self.CONTENT_DISPLAY_LIMIT]
+        return self.content_snippet
+
+    @property
+    def content_length(self) -> int | None:
+        """Return the full indexed content length before display truncation."""
+        if self.content_snippet_length is not None:
+            return self.content_snippet_length
+        return len(self.content_snippet) if self.content_snippet is not None else None
+
+    @property
+    def content_truncated(self) -> bool:
+        """Whether the transported content omits characters from the indexed value."""
+        length = self.content_length
+        return length is not None and length > self.CONTENT_DISPLAY_LIMIT
+
+    @property
+    def directory(self) -> str:
+        """Extract directory part from file_path.
+
+        For a file at "projects/notes/ideas.md", returns "/projects/notes"
+        For a file at root level "README.md", returns "/"
+        """
+        if not self.type == SearchItemType.ENTITY.value and not self.file_path:
+            return ""
+
+        # Normalize path separators to handle both Windows (\) and Unix (/) paths
+        normalized_path = Path(self.file_path).as_posix()
+
+        # Split the path by slashes
+        parts = normalized_path.split("/")
+
+        # If there's only one part (e.g., "README.md"), it's at the root
+        if len(parts) <= 1:
+            return "/"
+
+        # Join all parts except the last one (filename)
+        directory_path = "/".join(parts[:-1])
+        return f"/{directory_path}"
+
+    def to_insert(self, serialize_json: bool = True):
+        """Convert to dict for database insertion.
+
+        Args:
+            serialize_json: If True, converts metadata dict to JSON string (for SQLite).
+                           If False, keeps metadata as dict (for Postgres JSONB).
+        """
+        return {
+            "id": self.id,
+            "title": self.title,
+            "content_stems": self.content_stems,
+            "content_snippet": self.content_snippet,
+            "permalink": self.permalink,
+            "file_path": self.file_path,
+            "type": self.type,
+            "metadata": json.dumps(self.metadata)
+            if serialize_json and self.metadata
+            else self.metadata,
+            "from_id": self.from_id,
+            "to_id": self.to_id,
+            "to_name": self.to_name,
+            "relation_type": self.relation_type,
+            "entity_id": self.entity_id,
+            "category": self.category,
+            "created_at": self.created_at if self.created_at else None,
+            "updated_at": self.updated_at if self.updated_at else None,
+            "project_id": self.project_id,
+        }
+
+
+# Entity, observation, and relation rows carry ids from independent auto-increment
+# sequences, so a bare id is ambiguous across row types. Every map in the retrieval
+# path keys rows by (type, id) to avoid collisions.
+type SearchIndexKey = tuple[str, int]

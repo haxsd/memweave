@@ -1,0 +1,605 @@
+"""Typed client for knowledge/entity API operations.
+
+Encapsulates all /v2/projects/{project_id}/knowledge/* endpoints.
+"""
+
+from collections.abc import Sequence
+from itertools import batched
+from typing import Any
+
+from httpx import AsyncClient, HTTPStatusError
+from pydantic import TypeAdapter
+
+import logfire
+
+# call_* helpers live in basic_memory.mcp.tools.utils; importing that at module
+# level executes the whole tools package (fastmcp + mcp SDK) during CLI startup,
+# so each method defers the import to call time instead (#886).
+from basic_memory.runtime.note_content_responses import NOTE_CONTENT_BASE_CHECKSUM_HEADER
+from basic_memory.schemas.response import (
+    EntityResponse,
+    DeleteEntitiesResponse,
+    DirectoryMoveResult,
+    DirectoryDeleteResult,
+)
+from basic_memory.schemas.v2.graph import GraphNode, OrphanEntitiesResponse
+from basic_memory.schemas.v2.entity import (
+    EntityResolveResponse,
+    EntityResponseV2,
+    LinkResolveResponse,
+)
+from basic_memory.schemas.v2.accepted_content import (
+    MAX_ACCEPTED_CONTENT_BATCH,
+    AcceptedNoteContentBatchResponse,
+)
+from basic_memory.schemas.v2.note_placement import (
+    AmbiguousNotePlacementResponse,
+    NoteCreatePlacementResponse,
+    NotePlacementResponse,
+    OutsideProjectPlacementResponse,
+)
+from basic_memory.schemas.base import Entity
+from basic_memory.schemas.v2.note_write import (
+    WriteNoteRequest,
+    WriteNoteResponse,
+    write_note_response_adapter,
+)
+
+
+_NOTE_PLACEMENT_ADAPTER: TypeAdapter[
+    NoteCreatePlacementResponse | AmbiguousNotePlacementResponse | OutsideProjectPlacementResponse
+] = TypeAdapter(NotePlacementResponse)
+
+
+class KnowledgeClient:
+    """Typed client for knowledge graph entity operations.
+
+    Centralizes:
+    - API path construction for /v2/projects/{project_id}/knowledge/*
+    - Response validation via Pydantic models
+    - Consistent error handling through call_* utilities
+
+    Usage:
+        async with get_client() as http_client:
+            client = KnowledgeClient(http_client, project_id)
+            entity = await client.create_entity(entity_data)
+    """
+
+    def __init__(self, http_client: AsyncClient, project_id: str):
+        """Initialize the knowledge client.
+
+        Args:
+            http_client: HTTPX AsyncClient for making requests
+            project_id: Project external_id (UUID) for API calls
+        """
+        self.http_client = http_client
+        self.project_id = project_id
+        self._base_path = f"/v2/projects/{project_id}/knowledge"
+
+    # --- Entity CRUD Operations ---
+
+    async def write_note(
+        self,
+        note: Entity,
+        *,
+        overwrite: bool,
+        expected_checksum: str | None = None,
+    ) -> WriteNoteResponse:
+        """Write at an exact path and preserve the service's expected outcomes."""
+        from basic_memory.mcp.tools.utils import call_post
+
+        with logfire.span(
+            "mcp.client.knowledge.write_note",
+            client_name="knowledge",
+            operation="write_note",
+        ):
+            response = await call_post(
+                self.http_client,
+                f"{self._base_path}/write",
+                json=WriteNoteRequest(
+                    note=note,
+                    overwrite=overwrite,
+                    expected_checksum=expected_checksum,
+                ).model_dump(mode="json"),
+                client_name="knowledge",
+                operation="write_note",
+                path_template="/v2/projects/{project_id}/knowledge/write",
+            )
+        return write_note_response_adapter.validate_json(response.content)
+
+    async def create_entity(self, entity_data: dict[str, Any]) -> EntityResponseV2:
+        """Create a new entity.
+
+        Args:
+            entity_data: Entity data including title, content, folder, etc.
+
+        Returns:
+            EntityResponseV2 with created entity details. The endpoint's
+            response_model is EntityResponseV2 (it carries file_checksum /
+            db_checksum, not the legacy EntityResponse.checksum key), so the
+            response must be parsed as that type or those fields silently
+            default to None (#1586).
+
+        Raises:
+            ToolError: If the request fails
+        """
+        from basic_memory.mcp.tools.utils import call_post
+
+        with logfire.span(
+            "mcp.client.knowledge.create_entity",
+            client_name="knowledge",
+            operation="create_entity",
+        ):
+            response = await call_post(
+                self.http_client,
+                f"{self._base_path}/entities",
+                json=entity_data,
+                client_name="knowledge",
+                operation="create_entity",
+                path_template="/v2/projects/{project_id}/knowledge/entities",
+            )
+        return EntityResponseV2.model_validate(response.json())
+
+    async def update_entity(
+        self,
+        entity_id: str,
+        entity_data: dict[str, Any],
+    ) -> EntityResponseV2:
+        """Update an existing entity (full replacement).
+
+        Args:
+            entity_id: Entity external_id (UUID)
+            entity_data: Complete entity data for replacement
+
+        Returns:
+            EntityResponseV2 with updated entity details. See create_entity
+            for why this must be EntityResponseV2, not EntityResponse (#1586).
+
+        Raises:
+            ToolError: If the request fails
+        """
+        from basic_memory.mcp.tools.utils import call_put
+
+        with logfire.span(
+            "mcp.client.knowledge.update_entity",
+            client_name="knowledge",
+            operation="update_entity",
+        ):
+            response = await call_put(
+                self.http_client,
+                f"{self._base_path}/entities/{entity_id}",
+                json=entity_data,
+                client_name="knowledge",
+                operation="update_entity",
+                path_template="/v2/projects/{project_id}/knowledge/entities/{entity_id}",
+            )
+        return EntityResponseV2.model_validate(response.json())
+
+    async def get_entity(
+        self,
+        entity_id: str,
+        *,
+        section: str | None = None,
+        lines: str | None = None,
+        max_tokens: int | None = None,
+    ) -> EntityResponseV2:
+        """Get an entity by ID, optionally sliced server-side.
+
+        Args:
+            entity_id: Entity external_id (UUID)
+            section: Optional heading selector ("Decisions", "Auth/Decisions",
+                "Heading[1]") returning one section slice
+            lines: Optional document-absolute line range ("N-M", "N-", or "N")
+            max_tokens: Optional token budget truncating the returned content
+
+        Returns:
+            EntityResponseV2 with accepted note content and entity metadata;
+            sliced responses carry the content_* slice coordinates
+
+        Raises:
+            ToolError: If the entity or requested section is not found or the
+                request fails
+        """
+        from basic_memory.mcp.tools.utils import call_get
+
+        params: dict[str, str | int] = {}
+        if section is not None:
+            params["section"] = section
+        if lines is not None:
+            params["lines"] = lines
+        if max_tokens is not None:
+            params["max_tokens"] = max_tokens
+
+        with logfire.span(
+            "mcp.client.knowledge.get_entity",
+            client_name="knowledge",
+            operation="get_entity",
+        ):
+            response = await call_get(
+                self.http_client,
+                f"{self._base_path}/entities/{entity_id}",
+                client_name="knowledge",
+                operation="get_entity",
+                path_template="/v2/projects/{project_id}/knowledge/entities/{entity_id}",
+                params=params or None,
+            )
+        return EntityResponseV2.model_validate(response.json())
+
+    async def get_accepted_note_contents(
+        self,
+        entity_ids: list[str],
+    ) -> AcceptedNoteContentBatchResponse:
+        """Get accepted Markdown for one bounded note batch."""
+        from basic_memory.mcp.tools.utils import call_query
+
+        with logfire.span(
+            "mcp.client.knowledge.get_accepted_note_contents",
+            client_name="knowledge",
+            operation="get_accepted_note_contents",
+            batch_size=len(entity_ids),
+        ):
+            response = await call_query(
+                self.http_client,
+                f"{self._base_path}/entities/batch",
+                json={"entity_ids": entity_ids},
+                client_name="knowledge",
+                operation="get_accepted_note_contents",
+                path_template="/v2/projects/{project_id}/knowledge/entities/batch",
+            )
+        return AcceptedNoteContentBatchResponse.model_validate(response.json())
+
+    async def accepted_note_contents(self, entity_ids: Sequence[str]) -> dict[str, str]:
+        """Accepted Markdown by external id, for any number of notes.
+
+        Reads in batches of MAX_ACCEPTED_CONTENT_BATCH. Ids with no accepted
+        content (files that are not notes) are absent from the result. Repeated
+        ids are read once: observation and relation hits share their note's id,
+        and the batch request refuses duplicates.
+        """
+        contents: dict[str, str] = {}
+        for chunk in batched(dict.fromkeys(entity_ids), MAX_ACCEPTED_CONTENT_BATCH):
+            response = await self.get_accepted_note_contents(list(chunk))
+            contents.update({item.external_id: item.content for item in response.items})
+        return contents
+
+    async def patch_entity(
+        self,
+        entity_id: str,
+        patch_data: dict[str, Any],
+        *,
+        base_checksum: str | None = None,
+    ) -> EntityResponseV2:
+        """Partially update an entity.
+
+        Args:
+            entity_id: Entity external_id (UUID)
+            patch_data: Partial entity data to update
+            base_checksum: Optional accepted-revision checksum; when it no longer
+                matches, the server refuses the edit with a structured 409
+
+        Returns:
+            EntityResponseV2 with updated entity details. See create_entity
+            for why this must be EntityResponseV2, not EntityResponse (#1586).
+
+        Raises:
+            ToolError: If the request fails
+        """
+        from basic_memory.mcp.tools.utils import call_patch
+
+        with logfire.span(
+            "mcp.client.knowledge.patch_entity",
+            client_name="knowledge",
+            operation="patch_entity",
+        ):
+            response = await call_patch(
+                self.http_client,
+                f"{self._base_path}/entities/{entity_id}",
+                json=patch_data,
+                headers=_base_checksum_headers(base_checksum),
+                client_name="knowledge",
+                operation="patch_entity",
+                path_template="/v2/projects/{project_id}/knowledge/entities/{entity_id}",
+            )
+        return EntityResponseV2.model_validate(response.json())
+
+    async def delete_entity(
+        self, entity_id: str, *, base_checksum: str | None = None
+    ) -> DeleteEntitiesResponse:
+        """Delete an entity.
+
+        Args:
+            entity_id: Entity external_id (UUID)
+            base_checksum: Optional accepted-revision checksum; a stale one, or a
+                note that is already gone, makes the server refuse with a 409
+
+        Returns:
+            DeleteEntitiesResponse confirming deletion
+
+        Raises:
+            ToolError: If the entity is not found or request fails
+        """
+        from basic_memory.mcp.tools.utils import call_delete
+
+        with logfire.span(
+            "mcp.client.knowledge.delete_entity",
+            client_name="knowledge",
+            operation="delete_entity",
+        ):
+            response = await call_delete(
+                self.http_client,
+                f"{self._base_path}/entities/{entity_id}",
+                headers=_base_checksum_headers(base_checksum),
+                client_name="knowledge",
+                operation="delete_entity",
+                path_template="/v2/projects/{project_id}/knowledge/entities/{entity_id}",
+            )
+        return DeleteEntitiesResponse.model_validate(response.json())
+
+    async def move_entity(
+        self, entity_id: str, destination_path: str, *, base_checksum: str | None = None
+    ) -> EntityResponseV2:
+        """Move an entity to a new location.
+
+        Args:
+            entity_id: Entity external_id (UUID)
+            destination_path: New file path for the entity
+            base_checksum: Optional accepted-revision checksum; a stale one makes the
+                server refuse the move with a structured 409
+
+        Returns:
+            EntityResponseV2, the route's response model; it carries db_checksum,
+            which the legacy EntityResponse drops (#1586)
+
+        Raises:
+            ToolError: If the request fails
+        """
+        from basic_memory.mcp.tools.utils import call_put
+
+        with logfire.span(
+            "mcp.client.knowledge.move_entity",
+            client_name="knowledge",
+            operation="move_entity",
+        ):
+            response = await call_put(
+                self.http_client,
+                f"{self._base_path}/entities/{entity_id}/move",
+                json={"destination_path": destination_path},
+                headers=_base_checksum_headers(base_checksum),
+                client_name="knowledge",
+                operation="move_entity",
+                path_template="/v2/projects/{project_id}/knowledge/entities/{entity_id}/move",
+            )
+        return EntityResponseV2.model_validate(response.json())
+
+    async def move_directory(
+        self, source_directory: str, destination_directory: str
+    ) -> DirectoryMoveResult:
+        """Move all entities in a directory to a new location.
+
+        Args:
+            source_directory: Source directory path (relative to project root)
+            destination_directory: Destination directory path (relative to project root)
+
+        Returns:
+            DirectoryMoveResult with counts and details of moved files
+
+        Raises:
+            ToolError: If the request fails
+        """
+        from basic_memory.mcp.tools.utils import call_post
+
+        with logfire.span(
+            "mcp.client.knowledge.move_directory",
+            client_name="knowledge",
+            operation="move_directory",
+        ):
+            response = await call_post(
+                self.http_client,
+                f"{self._base_path}/move-directory",
+                json={
+                    "source_directory": source_directory,
+                    "destination_directory": destination_directory,
+                },
+                client_name="knowledge",
+                operation="move_directory",
+                path_template="/v2/projects/{project_id}/knowledge/move-directory",
+            )
+        return DirectoryMoveResult.model_validate(response.json())
+
+    async def delete_directory(self, directory: str) -> DirectoryDeleteResult:
+        """Delete all entities in a directory.
+
+        Args:
+            directory: Directory path to delete (relative to project root)
+
+        Returns:
+            DirectoryDeleteResult with counts and details of deleted files
+
+        Raises:
+            ToolError: If the request fails
+        """
+        from basic_memory.mcp.tools.utils import call_post
+
+        with logfire.span(
+            "mcp.client.knowledge.delete_directory",
+            client_name="knowledge",
+            operation="delete_directory",
+        ):
+            response = await call_post(
+                self.http_client,
+                f"{self._base_path}/delete-directory",
+                json={"directory": directory},
+                client_name="knowledge",
+                operation="delete_directory",
+                path_template="/v2/projects/{project_id}/knowledge/delete-directory",
+            )
+        return DirectoryDeleteResult.model_validate(response.json())
+
+    # --- Single-file indexing ---
+
+    async def index_file(self, file_path: str) -> EntityResponse:
+        """Index a markdown file that exists on disk but is not indexed yet.
+
+        Args:
+            file_path: Markdown file path relative to the project root
+
+        Returns:
+            EntityResponse for the indexed entity
+
+        Raises:
+            ToolError: If the file does not exist on disk or indexing fails
+        """
+        from basic_memory.mcp.tools.utils import call_post
+
+        with logfire.span(
+            "mcp.client.knowledge.index_file",
+            client_name="knowledge",
+            operation="index_file",
+        ):
+            response = await call_post(
+                self.http_client,
+                f"{self._base_path}/index-file",
+                json={"file_path": file_path},
+                client_name="knowledge",
+                operation="index_file",
+                path_template="/v2/projects/{project_id}/knowledge/index-file",
+            )
+        return EntityResponse.model_validate(response.json())
+
+    # --- Orphan detection ---
+
+    async def get_orphans(self) -> list[GraphNode]:
+        """Get entities that have no incoming or outgoing relations."""
+        from basic_memory.mcp.tools.utils import call_get
+
+        with logfire.span(
+            "mcp.client.knowledge.get_orphans",
+            client_name="knowledge",
+            operation="get_orphans",
+        ):
+            response = await call_get(
+                self.http_client,
+                f"{self._base_path}/orphans",
+                client_name="knowledge",
+                operation="get_orphans",
+                path_template="/v2/projects/{project_id}/knowledge/orphans",
+            )
+        return OrphanEntitiesResponse.model_validate(response.json()).entities
+
+    # --- Placement ---
+
+    async def place_note(
+        self, identifier: str
+    ) -> (
+        NoteCreatePlacementResponse
+        | AmbiguousNotePlacementResponse
+        | OutsideProjectPlacementResponse
+    ):
+        """Ask where a note that resolves under none of its readings would be created."""
+        from basic_memory.mcp.tools.utils import call_query
+
+        with logfire.span(
+            "mcp.client.knowledge.place_note",
+            client_name="knowledge",
+            operation="place_note",
+        ):
+            response = await call_query(
+                self.http_client,
+                f"{self._base_path}/placement",
+                json={"identifier": identifier},
+                client_name="knowledge",
+                operation="place_note",
+                path_template="/v2/projects/{project_id}/knowledge/placement",
+            )
+        return _NOTE_PLACEMENT_ADAPTER.validate_python(response.json())
+
+    # --- Resolution ---
+
+    async def _resolve_entity_data(
+        self,
+        identifier: str,
+        *,
+        strict: bool = False,
+    ) -> dict[str, Any]:
+        """Request the complete entity-resolution payload."""
+        from basic_memory.mcp.tools.utils import call_query
+
+        with logfire.span(
+            "mcp.client.knowledge.resolve_entity",
+            client_name="knowledge",
+            operation="resolve_entity",
+        ):
+            response = await call_query(
+                self.http_client,
+                f"{self._base_path}/resolve",
+                json={"identifier": identifier, "strict": strict},
+                client_name="knowledge",
+                operation="resolve_entity",
+                path_template="/v2/projects/{project_id}/knowledge/resolve",
+            )
+        data: dict[str, Any] = response.json()
+        return data
+
+    async def resolve_entity_response(
+        self,
+        identifier: str,
+        *,
+        strict: bool = False,
+    ) -> EntityResolveResponse:
+        """Resolve an identifier while preserving owning-project metadata.
+
+        Args:
+            identifier: The identifier to resolve (permalink, title, or path)
+            strict: If True, require exact matching (no fuzzy fallback)
+
+        Returns:
+            The complete validated resolution response
+
+        Raises:
+            ToolError: If the identifier cannot be resolved
+        """
+        data = await self._resolve_entity_data(identifier, strict=strict)
+        return EntityResolveResponse.model_validate(data)
+
+    async def resolve_link(
+        self, identifier: str, *, source_path: str
+    ) -> LinkResolveResponse | None:
+        """Resolve a wikilink as indexing resolves it, from the note at ``source_path``.
+
+        Returns None when the link names no note: a forward reference is an ordinary
+        link, so the API's 404 is an answer here, not a failure.
+
+        Raises:
+            ToolError: If the request fails for any other reason
+        """
+        from fastmcp.exceptions import ToolError
+
+        from basic_memory.mcp.tools.utils import call_query
+
+        try:
+            response = await call_query(
+                self.http_client,
+                f"{self._base_path}/links/resolve",
+                json={"identifier": identifier, "source_path": source_path},
+                client_name="knowledge",
+                operation="resolve_link",
+                path_template="/v2/projects/{project_id}/knowledge/links/resolve",
+            )
+        except ToolError as error:
+            cause = error.__cause__
+            if isinstance(cause, HTTPStatusError) and cause.response.status_code == 404:
+                return None
+            raise
+        return LinkResolveResponse.model_validate(response.json())
+
+    async def resolve_entity(self, identifier: str, *, strict: bool = False) -> str:
+        """Resolve a string identifier to an entity external_id."""
+        data = await self._resolve_entity_data(identifier, strict=strict)
+        return data["external_id"]
+
+
+def _base_checksum_headers(base_checksum: str | None) -> dict[str, str] | None:
+    """The revision-precondition header, when the caller pinned a revision."""
+    if base_checksum is None:
+        return None
+    return {NOTE_CONTENT_BASE_CHECKSUM_HEADER: base_checksum}

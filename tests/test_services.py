@@ -13,7 +13,8 @@ class ServiceTests(unittest.TestCase):
         self.root = Path(self.temporary.name) / "project"
         self.root.mkdir()
         self.service = Service(Path(self.temporary.name) / "home")
-        self.service.initialize()
+        self.service.start()
+        self.addCleanup(self.service.close)
         self.project = self.call("project_register", root=str(self.root), name="示例", operation_id="p")["id"]
 
     def call(self, action, **parameters):
@@ -28,7 +29,9 @@ class ServiceTests(unittest.TestCase):
                   next_step="修复刷新逻辑", operation_id="checkpoint")
         restored = Service(self.service.vault.home).dispatch("task_read", {"task_id": task["id"]})["data"]
         self.assertEqual(restored["next_step"], "修复刷新逻辑")
-        self.assertIn("令牌过期", restored["body"])
+        self.assertEqual(restored["checkpoint_total"], 1)
+        self.assertEqual(restored["checkpoints"][0]["findings"], "令牌过期")
+        self.assertNotIn("令牌过期", restored["body"])
         self.assertEqual(restored["revision"], 2)
         parameters = dict(task_id=task["id"], expected_revision=2, expected_etag=restored["etag"],
                           outcome="completed", summary="完成", operation_id="close")
@@ -71,6 +74,133 @@ class ServiceTests(unittest.TestCase):
         with self.service.vault.diagnostics._connect() as connection:
             values = str([tuple(row) for row in connection.execute("SELECT * FROM operations")])
             self.assertNotIn("短期令牌五分钟", values)
+
+    def test_user_scope_requires_explicit_user_source_and_no_task_binding(self):
+        with self.assertRaises(DiagnosticError) as missing_user:
+            self.call(
+                "memory_write", scope="user", title="项目事实", body="不应成为跨项目记忆",
+                sources=[{"type": "host", "reference": "自动观察"}], operation_id="user-host",
+            )
+        self.assertEqual(missing_user.exception.code, "SCOPE_DENIED")
+        task = self.call(
+            "task_open", project_id=self.project, title="任务", goal="目标",
+            acceptance=["检查"], operation_id="user-task",
+        )
+        with self.assertRaises(DiagnosticError) as bound:
+            self.call(
+                "memory_write", scope="user", task_id=task["id"], title="绑定任务",
+                body="不应绑定", sources=[{"type": "user", "reference": "明确输入"}],
+                operation_id="user-bound",
+            )
+        self.assertEqual(bound.exception.code, "SCOPE_DENIED")
+
+    def test_status_reports_knowledge_scope_and_architecture_freshness(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="状态计数", goal="验证状态",
+            acceptance=["计数正确"], operation_id="status-task",
+        )
+        self.call(
+            "memory_write", project_id=self.project, scope="project", title="项目知识",
+            body="项目范围", sources=[{"type": "user", "reference": "输入"}],
+            operation_id="status-project-memory",
+        )
+        self.call(
+            "memory_write", project_id=self.project, scope="task", task_id=task["id"],
+            title="任务候选", body="任务范围", status="candidate",
+            sources=[{"type": "task", "reference": task["id"]}],
+            operation_id="status-task-memory",
+        )
+        self.call(
+            "memory_write", scope="user", title="用户偏好", body="长期偏好",
+            sources=[{"type": "user", "reference": "明确偏好"}],
+            operation_id="status-user-memory",
+        )
+        source_file = self.root / "main.py"
+        source_file.write_text("print('status')\n", encoding="utf-8")
+        self.call("project_scan", project_id=self.project, operation_id="status-scan")
+        source = self.call("evidence_read", project_id=self.project, path="main.py")
+        architecture = self.call(
+            "graph_write", project_id=self.project, operation_id="status-architecture",
+            title="状态架构", body="入口", sources=[{"path": source["path"], "hash": source["hash"]}],
+            relations=[],
+        )
+        status = self.call("status")
+        self.assertEqual(status["knowledge"]["total"], 3)
+        self.assertEqual(status["knowledge"]["by_scope"], {"project": 1, "task": 1, "user": 1})
+        self.assertEqual(status["knowledge"]["by_status"], {"active": 2, "candidate": 1})
+        self.assertEqual(
+            status["knowledge"]["by_scope_status"],
+            {
+                "project": {"active": 1, "candidate": 0},
+                "task": {"active": 0, "candidate": 1},
+                "user": {"active": 1, "candidate": 0},
+            },
+        )
+        self.assertEqual(status["architecture"]["total"], 1)
+        self.assertEqual(status["architecture"]["stale"], 0)
+
+        other_root = self.root.parent / "status-other"
+        other_root.mkdir()
+        other_project = self.call(
+            "project_register", root=str(other_root), name="其他状态项目",
+            operation_id="status-other-project",
+        )["id"]
+        self.call(
+            "memory_write", project_id=other_project, scope="project", title="其他项目知识",
+            body="不应计入当前项目", sources=[{"type": "user", "reference": "输入"}],
+            operation_id="status-other-memory",
+        )
+        self.call(
+            "task_open", project_id=self.project, title="排队任务", goal="验证项目队列",
+            acceptance=["队列计数"], operation_id="status-queued-task",
+        )
+        project_status = self.call("status", project_id=self.project)
+        self.assertEqual(project_status["project"]["id"], self.project)
+        self.assertEqual(project_status["project"]["knowledge"]["total"], 2)
+        self.assertEqual(
+            project_status["project"]["knowledge"]["by_scope"],
+            {"project": 1, "task": 1, "user": 0},
+        )
+        self.assertEqual(
+            project_status["project"]["knowledge"]["by_status"],
+            {"active": 1, "candidate": 1},
+        )
+        self.assertEqual(
+            project_status["project"]["tasks"],
+            {
+                "total": 2, "current": 1, "queued": 1, "pending_review": 0,
+                "completed": 0, "cancelled": 0, "archived": 0,
+            },
+        )
+        self.assertEqual(project_status["project"]["architecture"]["total"], 1)
+        self.assertEqual(project_status["project"]["architecture"]["stale"], 0)
+        other_status = self.call("status", project_id=other_project)
+        self.assertEqual(other_status["project"]["knowledge"]["total"], 1)
+        self.assertEqual(other_status["project"]["architecture"]["total"], 0)
+        with self.assertRaises(DiagnosticError):
+            self.call("status", project_id="missing-project")
+
+        source_file.write_text("print('changed')\n", encoding="utf-8")
+        stale = self.call("status")
+        self.assertEqual(stale["architecture"]["stale"], 1)
+        self.assertEqual(stale["architecture"]["stale_record_ids"], [architecture["id"]])
+        project_stale = self.call("status", project_id=self.project)
+        self.assertEqual(project_stale["project"]["architecture"]["stale"], 1)
+        self.assertEqual(
+            project_stale["project"]["architecture"]["stale_record_ids"],
+            [architecture["id"]],
+        )
+        self.call(
+            "graph_forget", project_id=self.project, operation_id="status-forget-architecture",
+            architecture_id=architecture["id"], expected_revision=1,
+            expected_etag=architecture["etag"],
+        )
+        removed = self.call("status")
+        self.assertEqual(removed["architecture"]["total"], 0)
+        self.assertEqual(removed["architecture"]["stale"], 0)
+        project_removed = self.call("status", project_id=self.project)
+        self.assertEqual(project_removed["project"]["architecture"]["total"], 0)
+        self.assertEqual(project_removed["project"]["architecture"]["stale"], 0)
 
     def test_retry_registration_and_version_conflict(self):
         retry = self.call("project_register", root=str(self.root), name="示例", operation_id="p")
@@ -125,6 +255,35 @@ class ServiceTests(unittest.TestCase):
                           expected_etag=read["etag"], operation_id="invalid")
             self.assertEqual(caught.exception.code, "RECORD_INVALID")
 
+    def test_long_chinese_query_rejects_single_character_overlap(self):
+        self.call("memory_write", project_id=self.project, title="任务接续方法",
+                  body="切换工具前保存检查点，恢复时读取当前任务和下一步。",
+                  sources=[{"type": "user", "reference": "输入"}], operation_id="continuation")
+        self.call("memory_write", project_id=self.project, title="验收候选知识",
+                  body="候选知识经核对并明确启用后，才进入常规检索与上下文。",
+                  sources=[{"type": "host", "reference": "验收"}], operation_id="acceptance")
+        hits = self.call("memory_search", project_id=self.project,
+                         query="怎样在新窗口知道旧线程做到哪里")["items"]
+        self.assertEqual(hits, [])
+        exact = self.call("memory_search", project_id=self.project, query="任务接续")["items"]
+        self.assertEqual([item["title"] for item in exact], ["任务接续方法"])
+
+    def test_retrieval_cues_support_a_changed_language(self):
+        memory = self.call(
+            "memory_write",
+            project_id=self.project,
+            title="任务接续方法",
+            body=(
+                "切换工具前保存检查点，恢复时读取当前任务和下一步。\n"
+                "Retrieval cues: resume previous work, another client, where left off"
+            ),
+            sources=[{"type": "user", "reference": "输入"}],
+            operation_id="cued-continuation",
+        )
+        hits = self.call("memory_search", project_id=self.project,
+                         query="resume previous work in another client")["items"]
+        self.assertEqual([item["id"] for item in hits], [memory["id"]])
+
     def test_checkpoint_can_record_progress_without_new_findings(self):
         task = self.call("task_open", project_id=self.project, title="任务", goal="目标",
                          acceptance=["检查"], operation_id="t")
@@ -168,9 +327,10 @@ class ServiceTests(unittest.TestCase):
         self.call("memory_review_complete", task_id=task["id"], expected_revision=latest["revision"],
                   expected_etag=latest["etag"], memory_ids=[activated["id"]], summary="已去重并激活一条经验",
                   operation_id="review-complete")
-        reviewed = Service(self.service.vault.home).dispatch("memory_review", {"task_id": task["id"]})["data"]
-        self.assertEqual(reviewed["state"], "reviewed")
-        self.assertEqual(reviewed["task"]["consolidation_memory_ids"], [memory["id"]])
+        with Service(self.service.vault.home) as restarted:
+            reviewed = restarted.dispatch("memory_review", {"task_id": task["id"]})["data"]
+            self.assertEqual(reviewed["state"], "reviewed")
+            self.assertEqual(reviewed["task"]["consolidation_memory_ids"], [memory["id"]])
         self.assertEqual(len(self.call("memory_search", project_id=self.project, query="认证")["items"]), 1)
 
     def test_workspace_prepare_does_not_register_or_choose_a_task_for_new_work(self):
@@ -191,20 +351,25 @@ class ServiceTests(unittest.TestCase):
             with self.subTest(task_id=invalid), self.assertRaises(DiagnosticError):
                 self.call("workspace_prepare", root=str(unregistered), intent="resume", task_id=invalid)
 
-    def test_workspace_prepare_requires_selection_when_resuming_multiple_tasks(self):
+    def test_workspace_prepare_resumes_current_and_does_not_resume_queued(self):
         tasks = [
             self.call("task_open", project_id=self.project, title=title, goal="目标",
                       acceptance=["检查"], operation_id=title)
             for title in ("任务甲", "任务乙")
         ]
-        ambiguous = self.call("workspace_prepare", root=str(self.root), intent="resume")
-        self.assertEqual(ambiguous["state"], "task_selection_required")
-        self.assertEqual({item["id"] for item in ambiguous["tasks"]}, {item["id"] for item in tasks})
-        self.assertIsNone(ambiguous["context"])
-        explicit = self.call("workspace_prepare", root=str(self.root), intent="resume", task_id=tasks[0]["id"])
-        self.assertEqual(explicit["state"], "ready")
-        self.assertIn(tasks[0]["id"], explicit["context"]["candidate_sources"])
-        self.assertNotIn(tasks[1]["id"], explicit["context"]["text"])
+        self.assertEqual(tasks[0]["status"], "current")
+        self.assertEqual(tasks[1]["status"], "queued")
+        resumed = self.call("workspace_prepare", root=str(self.root), intent="resume")
+        self.assertEqual(resumed["state"], "ready")
+        self.assertEqual(resumed["task_id"], tasks[0]["id"])
+        self.assertEqual([item["id"] for item in resumed["tasks"]],
+                         [tasks[0]["id"], tasks[1]["id"]])
+        self.assertIn(tasks[0]["id"], resumed["context"]["candidate_sources"])
+        self.assertNotIn(tasks[1]["id"], resumed["context"]["text"])
+        with self.assertRaises(DiagnosticError) as caught:
+            self.call("workspace_prepare", root=str(self.root), intent="resume",
+                      task_id=tasks[1]["id"])
+        self.assertEqual(caught.exception.code, "TASK_NOT_CURRENT")
         inspect = self.call("workspace_prepare", root=str(self.root))
         self.assertIsNone(inspect["context"])
 
@@ -213,10 +378,10 @@ class ServiceTests(unittest.TestCase):
                          acceptance=["检查"], operation_id="resume-task")
         self.call("task_checkpoint", task_id=task["id"], expected_revision=1, expected_etag=task["etag"],
                   findings="定位完成", progress="实现中", next_step="验证会话过期", operation_id="resume-cp")
-        restarted = Service(self.service.vault.home)
-        restored = restarted.dispatch("workspace_prepare", {"root": str(self.root), "intent": "resume"})["data"]
-        self.assertEqual(restored["state"], "ready")
-        self.assertIn("验证会话过期", restored["context"]["text"])
+        with Service(self.service.vault.home) as restarted:
+            restored = restarted.dispatch("workspace_prepare", {"root": str(self.root), "intent": "resume"})["data"]
+            self.assertEqual(restored["state"], "ready")
+            self.assertIn("验证会话过期", restored["context"]["text"])
         other = self.root.parent / "other"
         other.mkdir()
         self.call("project_register", root=str(other), name="其他", operation_id="other")
@@ -238,6 +403,34 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(prepared["state"], "no_active_task")
         self.assertIsNone(prepared["context"])
         self.assertEqual(prepared["pending_consolidation"][0]["id"], task["id"])
+        self.assertIn(
+            "pending_consolidation",
+            {item["code"] for item in prepared["attention"]},
+        )
+
+    def test_workspace_prepare_exposes_reboot_attention_and_completion(self):
+        closed = self.call(
+            "task_open", project_id=self.project, title="closed task", goal="close",
+            acceptance=["closed"], operation_id="closed-task",
+        )
+        self.call(
+            "task_close", task_id=closed["id"], expected_revision=closed["revision"],
+            expected_etag=closed["etag"], outcome="completed", summary="closed",
+            acceptance_results={"closed": "verified"}, operation_id="close-closed-task",
+        )
+        current = self.call(
+            "task_open", project_id=self.project, title="current task", goal="continue",
+            acceptance=["current visible"], operation_id="current-task",
+        )
+        prepared = self.call("workspace_prepare", root=str(self.root), intent="resume")
+        self.assertEqual(prepared["task_id"], current["id"])
+        self.assertEqual(prepared["context"]["reboot"]["next"],
+                         "No next step recorded; set one before continuing.")
+        self.assertEqual(prepared["completion"]["state"], "ready")
+        self.assertIn("pending_consolidation",
+                      {item["code"] for item in prepared["context"]["attention"]})
+        self.assertIn("pending_consolidation",
+                      {item["code"] for item in prepared["attention"]})
 
 
 if __name__ == "__main__":

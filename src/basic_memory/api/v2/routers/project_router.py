@@ -1,0 +1,696 @@
+"""V2 Project Router - External ID-based project management operations.
+
+This router provides external_id (UUID) based CRUD operations for projects,
+using stable string UUIDs that never change (unlike integer IDs or names).
+
+Key improvements:
+- Stable external UUIDs that won't change with renames or database migrations
+- Better API ergonomics with consistent string identifiers
+- Direct database lookups via unique indexed column
+- Consistent with v2 entity operations
+"""
+
+from contextlib import nullcontext
+import os
+from typing import Literal, Optional
+
+from fastapi import APIRouter, HTTPException, Body, Query, Path
+from loguru import logger
+
+from basic_memory import db
+from basic_memory.deps import (
+    ProjectServiceDep,
+    ProjectRepositoryDep,
+    ProjectConfigV2ExternalDep,
+    ProjectIndexCommandDep,
+    ProjectIndexObserverDep,
+    ProjectReadinessServiceDep,
+    ProjectExternalIdPathDep,
+    ReadCacheDep,
+    SessionDep,
+    SessionMakerDep,
+)
+from basic_memory.index.local_project import ProjectIndexRouteRequest
+from basic_memory.read_cache import invalidate_cache
+from basic_memory.schemas import ProjectIndexStatusResponse
+from basic_memory.models import Project
+from basic_memory.schemas.doctor import ProjectDoctorReport
+from basic_memory.services.project_doctor import diagnose_project
+from basic_memory.repository.project_repository import ProjectRepository
+from basic_memory.schemas.project_info import (
+    ProjectItem,
+    ProjectList,
+    ProjectInfoRequest,
+    ProjectInfoResponse,
+    ProjectStatusResponse,
+)
+from basic_memory.schemas.v2 import (
+    ProjectIndexResponse,
+    ProjectResolveRequest,
+    ProjectResolveResponse,
+)
+from basic_memory.utils import normalize_project_path, generate_permalink
+
+router = APIRouter(prefix="/projects", tags=["project_management-v2"])
+ProjectResolveMethod = Literal["external_id", "name", "permalink"]
+
+
+def _split_qualified_project_identifier(identifier: str) -> tuple[str | None, str]:
+    """Split ``<workspace>/<project>`` identifiers while preserving plain project names."""
+    cleaned = identifier.strip()
+    if "/" not in cleaned:
+        return None, cleaned
+
+    workspace_identifier, project_identifier = cleaned.split("/", 1)
+    if not workspace_identifier or not project_identifier:
+        return None, cleaned
+    return workspace_identifier, project_identifier
+
+
+async def _resolve_project_identifier_candidate(
+    session: SessionDep,
+    project_repository: ProjectRepository,
+    identifier: str,
+) -> tuple[Project | None, ProjectResolveMethod]:
+    """Resolve one project identifier candidate and report the matching method."""
+    identifier_permalink = generate_permalink(identifier)
+
+    project = await project_repository.get_by_external_id(session, identifier)
+    if project:
+        return project, "external_id"
+
+    project = await project_repository.get_by_permalink(session, identifier_permalink)
+    if project:
+        return project, "permalink"
+
+    project = await project_repository.get_by_name_case_insensitive(session, identifier)
+    if project:
+        return project, "name"  # pragma: no cover
+
+    return None, "name"
+
+
+async def _resolve_project_identifier(
+    session: SessionDep,
+    project_repository: ProjectRepository,
+    identifier: str,
+) -> tuple[Project | None, ProjectResolveMethod]:
+    """Resolve exact identifiers first, then accepted workspace-qualified forms."""
+    project, resolution_method = await _resolve_project_identifier_candidate(
+        session,
+        project_repository,
+        identifier,
+    )
+    if project:
+        return project, resolution_method
+
+    workspace_identifier, project_identifier = _split_qualified_project_identifier(identifier)
+    if workspace_identifier is None:
+        return None, resolution_method
+
+    # Trigger: an MCP disambiguation error suggested ``workspace/project``.
+    # Why: request routing already selected the workspace/tenant; this endpoint
+    #   only needs the project segment to validate the active project.
+    # Outcome: models can follow the hint verbatim instead of looping on a 404.
+    project, resolution_method = await _resolve_project_identifier_candidate(
+        session,
+        project_repository,
+        project_identifier,
+    )
+    if project:
+        return project, resolution_method
+
+    return None, resolution_method
+
+
+@router.get("/", response_model=ProjectList)
+async def list_projects(
+    project_service: ProjectServiceDep,
+) -> ProjectList:
+    """List all configured projects.
+
+    Returns:
+        A list of all projects with metadata
+    """
+    projects = await project_service.list_projects()
+    default_project = await project_service.get_default_project_name()
+
+    project_items = [
+        ProjectItem(
+            id=project.id,
+            external_id=project.external_id,
+            name=project.name,
+            path=normalize_project_path(project.path),
+            is_default=project.is_default or False,
+        )
+        for project in projects
+    ]
+
+    return ProjectList(
+        projects=project_items,
+        default_project=default_project,
+    )
+
+
+@router.post("/", response_model=ProjectStatusResponse, status_code=201)
+async def add_project(
+    project_data: ProjectInfoRequest,
+    project_service: ProjectServiceDep,
+) -> ProjectStatusResponse:
+    """Add a new project to configuration and database.
+
+    Args:
+        project_data: The project name and path, with option to set as default
+
+    Returns:
+        Response confirming the project was added
+    """
+    # Check if project already exists before attempting to add
+    existing_project = await project_service.get_project(project_data.name)
+    if existing_project:
+        # Project exists - check if paths match for true idempotency
+        # Normalize paths for comparison (resolve symlinks, etc.)
+        requested_path = os.path.abspath(os.path.expanduser(project_data.path))
+        existing_path = os.path.abspath(os.path.expanduser(existing_project.path))
+
+        if requested_path == existing_path:
+            # Same name, same path - return 200 OK (idempotent)
+            return ProjectStatusResponse(  # pyright: ignore [reportCallIssue]
+                message=f"Project '{project_data.name}' already exists",
+                status="success",
+                default=existing_project.is_default or False,
+                new_project=ProjectItem(
+                    id=existing_project.id,
+                    external_id=existing_project.external_id,
+                    name=existing_project.name,
+                    path=existing_project.path,
+                    is_default=existing_project.is_default or False,
+                ),
+            )
+        else:
+            # Same name, different path - this is an error
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Project '{project_data.name}' already exists with different path. "
+                    f"Existing: {existing_project.path}, Requested: {project_data.path}"
+                ),
+            )
+
+    try:  # pragma: no cover
+        # The service layer handles cloud mode validation and path sanitization
+        await project_service.add_project(
+            project_data.name, project_data.path, set_default=project_data.set_default
+        )
+
+        # Fetch the newly created project to get its ID
+        new_project = await project_service.get_project(project_data.name)
+        if not new_project:
+            raise HTTPException(status_code=500, detail="Failed to retrieve newly created project")
+
+        return ProjectStatusResponse(  # pyright: ignore [reportCallIssue]
+            message=f"Project '{new_project.name}' added successfully",
+            status="success",
+            default=new_project.is_default or False,
+            new_project=ProjectItem(
+                id=new_project.id,
+                external_id=new_project.external_id,
+                name=new_project.name,
+                path=new_project.path,
+                is_default=new_project.is_default or False,
+            ),
+        )
+    except ValueError as e:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/config/sync", response_model=ProjectStatusResponse)
+async def synchronize_projects(
+    project_service: ProjectServiceDep,
+) -> ProjectStatusResponse:
+    """Synchronize projects between configuration file and database."""
+    try:  # pragma: no cover
+        await project_service.synchronize_projects()
+
+        return ProjectStatusResponse(  # pyright: ignore [reportCallIssue]
+            message="Projects synchronized successfully between configuration and database",
+            status="success",
+            default=False,
+        )
+    except ValueError as e:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/{project_id}/index", response_model=ProjectIndexResponse)
+async def index_project(
+    project_index_command: ProjectIndexCommandDep,
+    project_config: ProjectConfigV2ExternalDep,
+    project_internal_id: ProjectExternalIdPathDep,
+    force_full: bool = Query(False, description="Request a full project index run"),
+    run_in_background: bool = Query(True, description="Run in background"),
+) -> ProjectIndexResponse:
+    """Run project-wide indexing through the event-index coordinator."""
+    return await project_index_command.index_project(
+        ProjectIndexRouteRequest(
+            project_id=project_internal_id,
+            project_name=project_config.name,
+            force_full=force_full,
+            run_in_background=run_in_background,
+        )
+    )
+
+
+# Doctor only reads, so it is a GET for the same reason as status below: read-only
+# gates (viewers, read-only API keys) treat POSTs as writes.
+@router.get("/{project_id}/doctor", response_model=ProjectDoctorReport)
+async def get_project_doctor_report(
+    project_config: ProjectConfigV2ExternalDep,
+    project_index_observer: ProjectIndexObserverDep,
+    project_readiness: ProjectReadinessServiceDep,
+    project_internal_id: ProjectExternalIdPathDep,
+    session_maker: SessionMakerDep,
+) -> ProjectDoctorReport:
+    """Report a project's problems and their repairs without indexing or repairing."""
+    return await diagnose_project(
+        project_id=project_internal_id,
+        project_path=project_config.home,
+        session_maker=session_maker,
+        index_observer=project_index_observer,
+        readiness_service=project_readiness,
+    )
+
+
+# Status only reads: it walks the project files and reports index readiness. It was a
+# POST when it ran a sync scan; read-only gates (viewers, read-only API keys) treat
+# POSTs as writes, so empty-result guidance that calls it failed for them.
+@router.get("/{project_id}/status", response_model=ProjectIndexStatusResponse)
+async def get_project_status(
+    project_index_observer: ProjectIndexObserverDep,
+    project_readiness: ProjectReadinessServiceDep,
+    project_internal_id: ProjectExternalIdPathDep,
+    project_id: str = Path(..., description="Project external ID (UUID)"),
+) -> ProjectIndexStatusResponse:
+    """Observe current project-index files and readiness for a project."""
+    logger.debug(f"API v2 request: get_project_status for project_id={project_id}")
+    observation = await project_index_observer.observe_project(project_internal_id)
+    # The observation is handed to the readiness reader rather than re-derived:
+    # it already cost a full project walk, and a waiter polls this route.
+    readiness = await project_readiness.readiness_for_project_id(
+        project_internal_id,
+        observation.observed_files,
+    )
+    return ProjectIndexStatusResponse.from_observation(observation, readiness)
+
+
+# Older clients still POST here (their own core version, e.g. a local `bm` in cloud
+# mode). Kept out of the schema; remove once those clients have upgraded.
+router.add_api_route(
+    "/{project_id}/status",
+    get_project_status,
+    methods=["POST"],
+    response_model=ProjectIndexStatusResponse,
+    include_in_schema=False,
+    deprecated=True,
+)
+
+
+@router.post("/resolve", response_model=ProjectResolveResponse)
+async def resolve_project_identifier(
+    data: ProjectResolveRequest,
+    session: SessionDep,
+    project_repository: ProjectRepositoryDep,
+) -> ProjectResolveResponse:
+    """Resolve a project identifier (name, permalink, or external_id) to project info.
+
+    This endpoint provides efficient lookup of projects by various identifiers
+    without needing to fetch the entire project list. Supports:
+    - External ID (UUID string) - preferred stable identifier
+    - Permalink
+    - Case-insensitive name matching
+
+    Args:
+        data: Request containing the identifier to resolve
+
+    Returns:
+        Project information including the external_id (UUID)
+
+    Raises:
+        HTTPException: 404 if project not found
+
+    Example:
+        POST /v2/projects/resolve
+        {"identifier": "my-project"}
+
+        Returns:
+        {
+            "external_id": "550e8400-e29b-41d4-a716-446655440000",
+            "project_id": 1,
+            "name": "my-project",
+            "permalink": "my-project",
+            "path": "/path/to/project",
+            "is_active": true,
+            "is_default": false,
+            "resolution_method": "name"
+        }
+    """
+    logger.debug("API v2 request: resolve_project_identifier for {!r}", data.identifier)
+
+    project, resolution_method = await _resolve_project_identifier(
+        session,
+        project_repository,
+        data.identifier,
+    )
+
+    if not project:
+        detail = f"Project not found: '{data.identifier}'"
+        # Trigger: resolution missed and the projects table is empty.
+        # Why: a fresh install bootstraps config.json's default project before any
+        #      reconciliation has created database rows (the one-shot CLI never runs
+        #      the server lifespan), so the first read fails on the configured
+        #      default and the bare not-found message reads as a broken install
+        #      rather than a missing first-run step (#974 follow-up).
+        # Outcome: the error names the setup command instead.
+        if not await project_repository.find_all(session, limit=1, use_load_options=False):
+            detail = (
+                f"{detail}. No projects are set up yet — run "
+                "'basic-memory project add <name> <path>' to create one."
+            )
+        raise HTTPException(status_code=404, detail=detail)
+
+    return ProjectResolveResponse(
+        external_id=project.external_id,
+        project_id=project.id,
+        name=project.name,
+        permalink=generate_permalink(project.name),
+        path=normalize_project_path(project.path),
+        is_active=project.is_active if hasattr(project, "is_active") else True,
+        is_default=project.is_default or False,
+        resolution_method=resolution_method,
+    )
+
+
+@router.get("/{project_id}", response_model=ProjectItem)
+async def get_project_by_id(
+    session: SessionDep,
+    project_repository: ProjectRepositoryDep,
+    project_id: str = Path(..., description="Project external ID (UUID)"),
+) -> ProjectItem:
+    """Get project by its external ID (UUID).
+
+    This is the primary project retrieval method in v2, using stable UUID
+    identifiers that won't change with project renames.
+
+    Args:
+        project_id: External ID (UUID string)
+
+    Returns:
+        Project information including external_id
+
+    Raises:
+        HTTPException: 404 if project not found
+
+    Example:
+        GET /v2/projects/550e8400-e29b-41d4-a716-446655440000
+    """
+    logger.debug(f"API v2 request: get_project_by_id for project_id={project_id}")
+
+    project = await project_repository.get_by_external_id(session, project_id)
+    if not project:
+        raise HTTPException(
+            status_code=404, detail=f"Project with external_id '{project_id}' not found"
+        )
+
+    return ProjectItem(
+        id=project.id,
+        external_id=project.external_id,
+        name=project.name,
+        path=normalize_project_path(project.path),
+        is_default=project.is_default or False,
+    )
+
+
+@router.get("/{project_id}/info", response_model=ProjectInfoResponse)
+async def get_project_info_by_id(
+    project_service: ProjectServiceDep,
+    session_maker: SessionMakerDep,
+    project_repository: ProjectRepositoryDep,
+    project_id: str = Path(..., description="Project external ID (UUID)"),
+) -> ProjectInfoResponse:
+    """Get detailed project information by external ID."""
+    logger.debug(f"API v2 request: get_project_info_by_id for project_id={project_id}")
+    async with db.scoped_session(session_maker) as session:
+        project = await project_repository.get_by_external_id(session, project_id)
+    if not project:
+        raise HTTPException(
+            status_code=404, detail=f"Project with external_id '{project_id}' not found"
+        )
+    return await project_service.get_project_info(project.name)
+
+
+@router.patch("/{project_id}", response_model=ProjectStatusResponse)
+async def update_project_by_id(
+    project_service: ProjectServiceDep,
+    session_maker: SessionMakerDep,
+    project_repository: ProjectRepositoryDep,
+    read_cache: ReadCacheDep,
+    project_id: str = Path(..., description="Project external ID (UUID)"),
+    path: Optional[str] = Body(None, description="New absolute path for the project"),
+    is_active: Optional[bool] = Body(None, description="Status of the project (active/inactive)"),
+) -> ProjectStatusResponse:
+    """Update a project's information by external ID.
+
+    Args:
+        project_id: External ID (UUID string)
+        path: Optional new absolute path for the project
+        is_active: Optional status update for the project
+
+    Returns:
+        Response confirming the project was updated
+
+    Raises:
+        HTTPException: 400 if validation fails, 404 if project not found
+
+    Example:
+        PATCH /v2/projects/550e8400-e29b-41d4-a716-446655440000
+        {"path": "/new/path"}
+    """
+    logger.debug(f"API v2 request: update_project_by_id for project_id={project_id}")
+
+    try:
+        # Validate that path is absolute if provided
+        if path and not os.path.isabs(path):
+            raise HTTPException(status_code=400, detail="Path must be absolute")
+
+        # Get original project info for the response
+        async with db.scoped_session(session_maker) as session:
+            old_project = await project_repository.get_by_external_id(session, project_id)
+        if not old_project:
+            raise HTTPException(
+                status_code=404, detail=f"Project with external_id '{project_id}' not found"
+            )
+
+        old_project_info = ProjectItem(
+            id=old_project.id,
+            external_id=old_project.external_id,
+            name=old_project.name,
+            path=old_project.path,
+            is_default=old_project.is_default or False,
+        )
+
+        # Update using project name (service layer still uses names internally)
+        if path:
+            # A path update changes the filesystem source behind every
+            # resource key while project and entity UUIDs stay stable. The
+            # service can update config before its DB follow-up completes,
+            # so invalidate on every attempted move completion path.
+            invalidation_scope = (
+                invalidate_cache(read_cache, project_id)
+                if read_cache is not None
+                else nullcontext()
+            )
+            async with invalidation_scope:
+                await project_service.move_project(old_project.name, path)
+        elif is_active is not None:
+            await project_service.update_project(old_project.name, is_active=is_active)
+
+        # Get updated project info (use the same external_id)
+        async with db.scoped_session(session_maker) as session:
+            updated_project = await project_repository.get_by_external_id(session, project_id)
+        if not updated_project:  # pragma: no cover
+            raise HTTPException(
+                status_code=404,
+                detail=f"Project with external_id '{project_id}' not found after update",
+            )
+
+        return ProjectStatusResponse(
+            message=f"Project '{updated_project.name}' updated successfully",
+            status="success",
+            default=old_project.is_default or False,
+            old_project=old_project_info,
+            new_project=ProjectItem(
+                id=updated_project.id,
+                external_id=updated_project.external_id,
+                name=updated_project.name,
+                path=updated_project.path,
+                is_default=updated_project.is_default or False,
+            ),
+        )
+    except ValueError as e:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=str(e))  # pragma: no cover
+
+
+@router.delete("/{project_id}", response_model=ProjectStatusResponse)
+async def delete_project_by_id(
+    project_service: ProjectServiceDep,
+    session_maker: SessionMakerDep,
+    project_repository: ProjectRepositoryDep,
+    read_cache: ReadCacheDep,
+    project_id: str = Path(..., description="Project external ID (UUID)"),
+    delete_notes: bool = Query(
+        False, description="If True, delete project directory from filesystem"
+    ),
+) -> ProjectStatusResponse:
+    """Delete a project by external ID.
+
+    Args:
+        project_id: External ID (UUID string)
+        delete_notes: If True, delete the project directory from the filesystem
+
+    Returns:
+        Response confirming the project was deleted
+
+    Raises:
+        HTTPException: 400 if trying to delete default project, 404 if not found
+
+    Example:
+        DELETE /v2/projects/550e8400-e29b-41d4-a716-446655440000?delete_notes=false
+    """
+    logger.debug(
+        f"API v2 request: delete_project_by_id for project_id={project_id}, delete_notes={delete_notes}"
+    )
+
+    try:
+        async with db.scoped_session(session_maker) as session:
+            old_project = await project_repository.get_by_external_id(session, project_id)
+        if not old_project:
+            raise HTTPException(
+                status_code=404, detail=f"Project with external_id '{project_id}' not found"
+            )
+
+        # Check if trying to delete the default project
+        # Use is_default from database, not ConfigManager (which doesn't work in cloud mode)
+        if old_project.is_default:
+            available_projects = await project_service.list_projects()
+            other_projects = [p.name for p in available_projects if p.external_id != project_id]
+            detail = f"Cannot delete default project '{old_project.name}'. "
+            if other_projects:
+                detail += (  # pragma: no cover
+                    f"Set another project as default first. Available: {', '.join(other_projects)}"
+                )
+            else:
+                detail += "This is the only project in your configuration."  # pragma: no cover
+            raise HTTPException(status_code=400, detail=detail)
+
+        # Cached reads are answered before a route checks that its project exists,
+        # so a deleted project's entries must be retired, not left to their TTL. A
+        # removal that fails partway retires them too: what it committed is unknown.
+        invalidation_scope = (
+            invalidate_cache(read_cache, old_project.external_id)
+            if read_cache is not None
+            else nullcontext()
+        )
+        async with invalidation_scope:
+            # Delete using project name (service layer still uses names internally)
+            file_delete_status = await project_service.remove_project(
+                old_project.name, delete_notes=delete_notes
+            )
+
+        return ProjectStatusResponse(
+            message=f"Project '{old_project.name}' removed successfully",
+            status="success",
+            default=False,
+            file_delete_status=file_delete_status,
+            old_project=ProjectItem(
+                id=old_project.id,
+                external_id=old_project.external_id,
+                name=old_project.name,
+                path=old_project.path,
+                is_default=old_project.is_default or False,
+            ),
+            new_project=None,
+        )
+    except ValueError as e:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=str(e))  # pragma: no cover
+
+
+@router.put("/{project_id}/default", response_model=ProjectStatusResponse)
+async def set_default_project_by_id(
+    project_service: ProjectServiceDep,
+    session_maker: SessionMakerDep,
+    project_repository: ProjectRepositoryDep,
+    project_id: str = Path(..., description="Project external ID (UUID)"),
+) -> ProjectStatusResponse:
+    """Set a project as the default project by external ID.
+
+    Args:
+        project_id: External ID (UUID string) to set as default
+
+    Returns:
+        Response confirming the project was set as default
+
+    Raises:
+        HTTPException: 404 if project not found
+
+    Example:
+        PUT /v2/projects/550e8400-e29b-41d4-a716-446655440000/default
+    """
+    logger.debug(f"API v2 request: set_default_project_by_id for project_id={project_id}")
+
+    try:
+        # Get the old default project from database. It may be absent during
+        # bootstrap/recovery (no default row yet); that is a valid state, not an
+        # error, so we only echo it back when one exists.
+        async with db.scoped_session(session_maker) as session:
+            default_project = await project_repository.get_default_project(session)
+
+            # Get the new default project by external_id
+            new_default_project = await project_repository.get_by_external_id(session, project_id)
+        if not new_default_project:
+            raise HTTPException(
+                status_code=404, detail=f"Project with external_id '{project_id}' not found"
+            )
+
+        # Set as default using project name (service layer still uses names internally)
+        await project_service.set_default_project(new_default_project.name)
+
+        # Trigger: a previous default existed
+        # Why: ProjectStatusResponse.old_project is Optional; the no-default
+        #   bootstrap case must succeed with old_project=None
+        # Outcome: response echoes the prior default only when there was one
+        old_project = (
+            ProjectItem(
+                id=default_project.id,
+                external_id=default_project.external_id,
+                name=default_project.name,
+                path=default_project.path,
+                is_default=False,
+            )
+            if default_project
+            else None
+        )
+
+        return ProjectStatusResponse(
+            message=f"Project '{new_default_project.name}' set as default successfully",
+            status="success",
+            default=True,
+            old_project=old_project,
+            new_project=ProjectItem(
+                id=new_default_project.id,
+                external_id=new_default_project.external_id,
+                name=new_default_project.name,
+                path=new_default_project.path,
+                is_default=True,
+            ),
+        )
+    except ValueError as e:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=str(e))  # pragma: no cover

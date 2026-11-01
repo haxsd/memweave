@@ -15,7 +15,8 @@ class ContextTests(unittest.TestCase):
         self.source = self.root / "auth.py"
         self.source.write_text("def refresh(): return 'token'", encoding="utf-8")
         self.service = Service(Path(self.temporary.name) / "home")
-        self.service.initialize()
+        self.service.start()
+        self.addCleanup(self.service.close)
         self.project = self.call("project_register", root=str(self.root), name="Auth", operation_id="p")["id"]
 
     def call(self, action, **parameters):
@@ -45,7 +46,7 @@ class ContextTests(unittest.TestCase):
         self.assertIn("auth.py", context["text"])
         self.assertIn("auth refresh boundary", context["text"])
         self.assertLessEqual(len(context["text"]), 2400)
-        self.assertTrue(context["truncated"])
+        self.assertNotIn("Old exploration", context["text"])
         self.assertTrue({task["id"], memory["id"], architecture["id"], "file:auth.py"}.issubset(
             {source["id"] for source in context["included_sources"]}
         ))
@@ -99,6 +100,75 @@ class ContextTests(unittest.TestCase):
         self.assertTrue(context["included_sources"])
         self.assertTrue(context["truncated"])
 
+    def test_context_does_not_inject_recent_memory_when_query_misses(self):
+        continuation = self.call(
+            "memory_write",
+            project_id=self.project,
+            title="任务接续方法",
+            body="切换工具前保存检查点，恢复时读取当前任务和下一步。",
+            sources=[{"type": "user", "reference": "输入"}],
+            operation_id="continuation",
+        )
+        self.call(
+            "memory_write",
+            project_id=self.project,
+            title="验收候选知识",
+            body="候选知识经核对并明确启用后，才进入常规检索与上下文。",
+            sources=[{"type": "host", "reference": "验收"}],
+            operation_id="acceptance",
+        )
+        context = self.call(
+            "context_get",
+            project_id=self.project,
+            query="resume previous work in another client",
+            budget=4000,
+        )
+        sources = {source["id"]: source for source in context["included_sources"]}
+        self.assertNotIn(continuation["id"], sources)
+        self.assertNotIn("任务接续方法", context["text"])
+        self.assertFalse(context["memory"]["recent_fallback"])
+        self.assertEqual(context["memory"]["strategy"], "basic_memory_sqlite_fts5+context")
+
+    def test_empty_query_only_injects_current_task_scoped_knowledge(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="auth task", goal="Fix auth",
+            acceptance=["verified"], operation_id="task",
+        )
+        task_memory = self.call(
+            "memory_write", project_id=self.project, scope="task", task_id=task["id"],
+            title="task-only rule", body="Check the current task boundary.",
+            sources=[{"type": "task", "reference": task["id"]}], operation_id="task-memory",
+        )
+        self.call(
+            "memory_write", project_id=self.project, title="unrelated project note",
+            body="This should require a matching query.",
+            sources=[{"type": "user", "reference": "explicit"}], operation_id="project-memory",
+        )
+        context = self.call("context_get", project_id=self.project, task_id=task["id"])
+        sources = {source["id"]: source for source in context["included_sources"]}
+        self.assertIn(task_memory["id"], sources)
+        self.assertEqual(sources[task_memory["id"]]["reason"], "task_scope")
+        self.assertNotIn("unrelated project note", context["text"])
+        self.assertFalse(context["memory"]["recent_fallback"])
+
+    def test_memory_search_returns_retrieval_and_context_metadata(self):
+        memory = self.call(
+            "memory_write", project_id=self.project, title="Basic Memory context boundary",
+            body="The search row is the only canonical retrieval result.",
+            sources=[{"type": "host", "reference": "test"}], operation_id="retrieval",
+        )
+        hit = self.call("memory_search", project_id=self.project, query="canonical retrieval")["items"][0]
+        self.assertEqual(hit["id"], memory["id"])
+        self.assertTrue(hit["retrieval"]["permalink"])
+        detail = self.service.memory_context(hit["retrieval"]["permalink"])
+        self.assertEqual(detail["metadata"]["primary_count"], 1)
+        context = self.call(
+            "context_get", project_id=self.project, query="canonical retrieval", budget=3000
+        )
+        self.assertEqual(context["memory"]["strategy"], "basic_memory_sqlite_fts5+context")
+        self.assertEqual(context["memory"]["contexts_checked"], 1)
+        self.assertIn(memory["id"], {source["id"] for source in context["included_sources"]})
+
     def test_architecture_is_prioritized_before_graph_result_limit(self):
         for position in range(45):
             (self.root / f"auth_{position}.py").write_text("pass", encoding="utf-8")
@@ -106,6 +176,176 @@ class ContextTests(unittest.TestCase):
         context = self.call("context_get", project_id=self.project, query="auth")
         self.assertIn(architecture["id"], {source["id"] for source in context["included_sources"]})
         self.assertIn("host_reported", context["text"])
+
+    def test_task_and_open_work_units_keep_priority_in_a_small_budget(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="auth continuity",
+            goal="Preserve the current task boundary. " * 80,
+            acceptance=["current next step remains visible"], operation_id="task",
+        )
+        self.call(
+            "task_checkpoint", task_id=task["id"], expected_revision=1,
+            expected_etag=task["etag"], findings="Located the auth boundary. " * 80,
+            progress="Parallel checks are running", next_step="Run targeted regression",
+            operation_id="checkpoint",
+        )
+        unit = self.call(
+            "work_unit_update", task_id=task["id"], title="blocked integration",
+            owner="worker-blocked", status="running", progress="waiting on contract",
+            operation_id="unit",
+        )
+        unit = self.call(
+            "work_unit_update", unit_id=unit["id"], expected_revision=unit["revision"],
+            expected_etag=unit["etag"], status="blocked", blocker="Contract is unconfirmed",
+            next_step="Confirm the current contract", operation_id="unit-blocked",
+        )
+        for position in range(12):
+            self.call(
+                "memory_write", project_id=self.project, title=f"auth memory {position}",
+                body="An older auth detail. " * 120,
+                sources=[{"type": "user", "reference": "explicit"}],
+                operation_id=f"memory-{position}",
+            )
+        context = self.call(
+            "context_get", project_id=self.project, task_id=task["id"],
+            query="auth", budget=1200,
+        )
+        included = {source["id"] for source in context["included_sources"]}
+        self.assertIn("Run targeted regression", context["text"])
+        self.assertIn("worker-blocked", context["text"])
+        self.assertIn("Contract is unconfirmed", context["text"])
+        self.assertIn(unit["id"], included)
+        self.assertTrue(context["truncated"])
+
+    def test_reboot_summary_exposes_five_questions_and_blocked_completion(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="auth continuity",
+            goal="Keep the current task recoverable.",
+            acceptance=["next step remains visible"], operation_id="reboot-task",
+        )
+        self.call(
+            "task_checkpoint", task_id=task["id"], expected_revision=1,
+            expected_etag=task["etag"], findings="Located the boundary.",
+            failures="First attempt missed the expiry check.",
+            progress="Implementation is in progress.", next_step="Run targeted regression",
+            operation_id="reboot-checkpoint",
+        )
+        unit = self.call(
+            "work_unit_update", task_id=task["id"], title="blocked integration",
+            owner="worker-blocked", status="running", progress="waiting on contract",
+            operation_id="reboot-unit",
+        )
+        unit = self.call(
+            "work_unit_update", unit_id=unit["id"], expected_revision=unit["revision"],
+            expected_etag=unit["etag"], status="blocked", blocker="Contract is unconfirmed",
+            next_step="Confirm the current contract", operation_id="reboot-unit-blocked",
+        )
+        context = self.call("context_get", project_id=self.project, task_id=task["id"])
+        reboot = context["reboot"]
+        self.assertEqual(set(reboot), {
+            "where", "goal", "done", "failed", "next", "contract", "attention", "completion", "text",
+        })
+        self.assertIn("Run targeted regression", reboot["next"])
+        self.assertIn("Contract is unconfirmed", reboot["failed"])
+        self.assertIn("Reboot summary:", reboot["text"])
+        self.assertIn("Completion: blocked", reboot["text"])
+        self.assertEqual(context["completion"]["state"], "blocked")
+        self.assertEqual(context["completion"]["blocked_work_unit_ids"], [unit["id"]])
+        self.assertEqual(reboot["contract"]["state"], "attested")
+        self.assertIn("blocked_work_units", {item["code"] for item in context["attention"]})
+
+    def test_task_contract_attestation_detects_external_drift(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="contract task",
+            goal="Keep the task contract stable.",
+            acceptance=["contract remains stable"], operation_id="contract-task",
+        )
+        task = self.call("task_read", task_id=task["id"])
+        self.assertTrue(task["contract_hash"])
+        context = self.call("context_get", project_id=self.project, task_id=task["id"])
+        self.assertEqual(context["reboot"]["contract"]["state"], "attested")
+        self.assertNotIn("task_contract_drift", {item["code"] for item in context["attention"]})
+
+        path = Path(self.service.vault.home) / task["path"]
+        text = path.read_text(encoding="utf-8")
+        old = '"goal": "Keep the task contract stable."'
+        self.assertIn(old, text)
+        path.write_text(
+            text.replace(old, '"goal": "Changed outside the task lifecycle."', 1),
+            encoding="utf-8",
+        )
+        drifted = self.call("context_get", project_id=self.project, task_id=task["id"])
+        self.assertEqual(drifted["reboot"]["contract"]["state"], "drift")
+        self.assertIn("task_contract_drift", {item["code"] for item in drifted["attention"]})
+
+        task = self.call("task_read", task_id=task["id"])
+        self.call(
+            "task_checkpoint", task_id=task["id"], expected_revision=task["revision"],
+            expected_etag=task["etag"], findings="", progress="Contract change confirmed",
+            next_step="Continue with the confirmed contract", attest_contract=True,
+            operation_id="contract-reattest",
+        )
+        reattested = self.call("context_get", project_id=self.project, task_id=task["id"])
+        self.assertEqual(reattested["reboot"]["contract"]["state"], "attested")
+        self.assertNotIn("task_contract_drift", {item["code"] for item in reattested["attention"]})
+
+    def test_context_attention_marks_missing_next_step_and_stale_graph(self):
+        self.map_architecture()
+        task = self.call(
+            "task_open", project_id=self.project, title="unplanned task",
+            goal="Exercise attention signals.", acceptance=["signal visible"],
+            operation_id="attention-task",
+        )
+        self.source.write_text("def refresh(): return 'changed'", encoding="utf-8")
+        context = self.call("context_get", project_id=self.project, task_id=task["id"])
+        codes = {item["code"] for item in context["attention"]}
+        self.assertIn("next_step_missing", codes)
+        self.assertIn("graph_stale", codes)
+        self.assertEqual(context["completion"]["state"], "ready")
+        self.assertIn("next_step_missing", context["reboot"]["text"])
+
+    def test_context_is_project_scoped_and_stable_after_rebuild(self):
+        other_root = Path(self.temporary.name) / "other"
+        other_root.mkdir()
+        other_project = self.call(
+            "project_register", root=str(other_root), name="Other",
+            operation_id="other-project",
+        )["id"]
+        own_memory = self.call(
+            "memory_write", project_id=self.project, title="auth boundary",
+            body="Current project validates refresh expiry at the boundary.",
+            sources=[{"type": "host", "reference": "test"}], operation_id="own-memory",
+        )
+        self.call(
+            "memory_write", project_id=other_project, title="other boundary",
+            body="auth zephyr marker belongs to another project.",
+            sources=[{"type": "host", "reference": "test"}], operation_id="other-memory",
+        )
+        before = self.call(
+            "context_get", project_id=self.project, query="auth boundary", budget=3000
+        )
+        self.assertIn(own_memory["id"], {source["id"] for source in before["included_sources"]})
+        self.assertNotIn("zephyr marker", before["text"])
+        other_context = self.call(
+            "context_get", project_id=other_project, query="auth boundary", budget=3000
+        )
+        self.assertNotIn(own_memory["id"], {source["id"] for source in other_context["included_sources"]})
+        self.assertNotIn("Current project validates", other_context["text"])
+
+        rebuilt = self.service.rebuild()
+
+        self.assertEqual(rebuilt["search_index"]["failed"], [])
+        after = self.call(
+            "context_get", project_id=self.project, query="auth boundary", budget=3000
+        )
+        self.assertEqual(
+            [source["id"] for source in before["included_sources"]],
+            [source["id"] for source in after["included_sources"]],
+        )
+        self.assertEqual(
+            before["memory"]["recent_fallback"], after["memory"]["recent_fallback"]
+        )
+        self.assertFalse(after["memory"]["recent_fallback"])
 
     def test_invalid_task_ids_cannot_silently_disable_task_scope(self):
         for invalid in ("", False, 0, []):

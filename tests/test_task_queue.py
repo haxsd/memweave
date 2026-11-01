@@ -1,0 +1,374 @@
+import json
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+from memweave.diagnostics import DiagnosticError
+from memweave.services import Service
+from memweave.storage import Vault, encode_record, now
+
+
+class TaskQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "project"
+        self.root.mkdir()
+        self.home = Path(self.temporary.name) / "home"
+        self.service = Service(self.home)
+        self.service.start()
+        self.addCleanup(self.service.close)
+        self.project = self.call(
+            "project_register", root=str(self.root), name="队列测试", operation_id="project"
+        )["id"]
+
+    def call(self, action, **parameters):
+        return self.service.dispatch(action, parameters)["data"]
+
+    def open_task(self, title, operation_id):
+        return self.call(
+            "task_open",
+            project_id=self.project,
+            title=title,
+            goal=f"{title} 的目标",
+            acceptance=[f"{title} 的验收"],
+            operation_id=operation_id,
+        )
+
+    def test_single_current_queue_promotes_in_order(self):
+        first = self.open_task("第一项", "task-1")
+        second = self.open_task("第二项", "task-2")
+        third = self.open_task("第三项", "task-3")
+        self.assertEqual([first["status"], second["status"], third["status"]],
+                         ["current", "queued", "queued"])
+        queued = self.call("task_list", project_id=self.project, status="queued")["items"]
+        self.assertEqual([item["id"] for item in queued], [second["id"], third["id"]])
+
+        closed = self.call(
+            "task_close",
+            task_id=first["id"],
+            expected_revision=first["revision"],
+            expected_etag=first["etag"],
+            outcome="completed",
+            summary="第一项完成",
+            acceptance_results={"第一项 的验收": "已运行验证"},
+            operation_id="close-1",
+        )
+        self.assertEqual(closed["promoted_task_id"], second["id"])
+        promoted = self.call("task_read", task_id=second["id"])
+        self.assertEqual(promoted["status"], "current")
+        self.assertEqual(self.call("task_read", task_id=third["id"])["status"], "queued")
+
+        prepared = self.call("workspace_prepare", root=str(self.root), intent="resume")
+        self.assertEqual(prepared["state"], "ready")
+        self.assertEqual(prepared["task_id"], second["id"])
+        self.assertEqual([item["id"] for item in prepared["tasks"]],
+                         [second["id"], third["id"]])
+        with self.assertRaises(DiagnosticError) as caught:
+            self.call("workspace_prepare", root=str(self.root), intent="resume",
+                      task_id=third["id"])
+        self.assertEqual(caught.exception.code, "TASK_NOT_CURRENT")
+
+    def test_concurrent_task_open_creates_exactly_one_current(self):
+        services = [Service(self.home), Service(self.home)]
+
+        def create(position):
+            return services[position].dispatch("task_open", {
+                "project_id": self.project,
+                "title": f"并发任务 {position}",
+                "goal": "只能有一个当前任务",
+                "acceptance": ["唯一 current"],
+                "operation_id": f"concurrent-{position}",
+            })["data"]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            created = list(pool.map(create, (0, 1)))
+        self.assertCountEqual([item["status"] for item in created], ["current", "queued"])
+        tasks = self.call("task_list", project_id=self.project)["items"]
+        self.assertEqual(sum(item["status"] == "current" for item in tasks), 1)
+        self.assertEqual(sum(item["status"] == "queued" for item in tasks), 1)
+
+    def test_legacy_active_tasks_migrate_to_one_current_and_queue(self):
+        self.service.close()
+        vault = Vault(self.home)
+        project_id = "project_legacy"
+        created = "2026-10-27T00:00:00+00:00"
+        project = {
+            "id": project_id, "type": "project", "scope": "project", "project_id": project_id,
+            "title": "旧项目", "name": "旧项目", "root": str(self.root), "status": "active",
+            "body": "# 旧项目\n", "revision": 1, "created_at": created, "updated_at": created,
+        }
+        vault.commit("legacy-project", {"project": project_id}, lambda: (
+            [{"record": project, "path": f"projects/{project_id}.md", "expected": None}],
+            {"id": project_id},
+        ))
+        for position, title in enumerate(("旧任务甲", "旧任务乙"), start=1):
+            task_id = f"task_legacy_{position}"
+            task = {
+                "id": task_id, "type": "task", "scope": "project", "project_id": project_id,
+                "title": title, "goal": "旧目标", "acceptance": ["旧验收"], "status": "active",
+                "findings": "", "progress": "", "next_step": "", "body": f"# {title}\n",
+                "revision": 1, "created_at": f"2026-10-27T00:0{position}:00+00:00",
+                "updated_at": f"2026-10-27T00:0{position}:00+00:00",
+            }
+            vault.commit(f"legacy-{position}", {"task": task_id}, lambda task=task: (
+                [{"record": task, "path": f"tasks/{task['id']}.md", "expected": None}],
+                {"id": task["id"]},
+            ))
+
+        with Service(self.home) as migrated:
+            tasks = migrated.dispatch(
+                "task_list", {"project_id": project_id, "status": "all"}
+            )["data"]["items"]
+            self.assertEqual([item["status"] for item in tasks], ["current", "queued"])
+            self.assertEqual([item["queue_position"] for item in tasks], [0, 1])
+            self.assertEqual(tasks[0]["id"], "task_legacy_1")
+
+        with Service(self.home) as restarted:
+            again = restarted.dispatch(
+                "task_list", {"project_id": project_id, "status": "all"}
+            )["data"]["items"]
+            self.assertEqual([item["revision"] for item in again], [2, 2])
+
+    def test_legacy_migration_resolves_duplicate_current_and_preserves_closed_tasks(self):
+        self.service.close()
+        vault = Vault(self.home)
+        project_id = "project_conflict"
+        created = "2026-10-27T00:00:00+00:00"
+        project = {
+            "id": project_id, "type": "project", "scope": "project", "project_id": project_id,
+            "title": "冲突项目", "name": "冲突项目", "root": str(self.root), "status": "active",
+            "body": "# 冲突项目\n", "revision": 1, "created_at": created, "updated_at": created,
+        }
+        vault.commit("conflict-project", {"project": project_id}, lambda: (
+            [{"record": project, "path": f"projects/{project_id}.md", "expected": None}],
+            {"id": project_id},
+        ))
+        task_specs = (
+            ("task_conflict_current_early", "current", 4, "2026-10-27T00:01:00+00:00"),
+            ("task_conflict_current_late", "current", 9, "2026-10-27T00:02:00+00:00"),
+            ("task_conflict_legacy", "active", 0, "2026-10-26T23:59:00+00:00"),
+            ("task_conflict_completed", "completed", 2, "2026-10-26T20:00:00+00:00"),
+            ("task_conflict_cancelled", "cancelled", 3, "2026-10-26T21:00:00+00:00"),
+        )
+        for task_id, status, position, timestamp in task_specs:
+            task = {
+                "id": task_id, "type": "task", "scope": "project", "project_id": project_id,
+                "title": task_id, "goal": "迁移目标", "acceptance": ["保留状态"],
+                "status": status, "queue_position": position, "findings": "", "progress": "",
+                "next_step": "", "body": f"# {task_id}\n", "revision": 1,
+                "created_at": timestamp, "updated_at": timestamp,
+            }
+            vault.commit(f"create-{task_id}", {"task": task_id}, lambda task=task: (
+                [{"record": task, "path": f"tasks/{task['id']}.md", "expected": None}],
+                {"id": task["id"]},
+            ))
+
+        with Service(self.home) as migrated:
+            tasks = migrated.dispatch(
+                "task_list", {"project_id": project_id, "status": "all"}
+            )["data"]["items"]
+        by_id = {task["id"]: task for task in tasks}
+        self.assertEqual(by_id["task_conflict_current_early"]["status"], "current")
+        self.assertEqual(by_id["task_conflict_current_late"]["status"], "queued")
+        self.assertEqual(by_id["task_conflict_legacy"]["status"], "queued")
+        self.assertEqual(by_id["task_conflict_completed"]["status"], "completed")
+        self.assertEqual(by_id["task_conflict_cancelled"]["status"], "cancelled")
+        self.assertEqual(by_id["task_conflict_completed"]["revision"], 1)
+        self.assertEqual(by_id["task_conflict_cancelled"]["revision"], 1)
+        self.assertEqual(
+            sorted(
+                task["queue_position"]
+                for task in tasks
+                if task["status"] in ("current", "queued")
+            ),
+            [0, 4, 9],
+        )
+
+    def test_parallel_work_units_block_parent_close_until_resolved(self):
+        task = self.open_task("并行任务", "parallel-task")
+        first = self.call(
+            "work_unit_update",
+            task_id=task["id"],
+            title="后端实现",
+            owner="worker-backend",
+            status="running",
+            progress="正在实现接口",
+            next_step="运行后端测试",
+            operation_id="unit-1",
+        )
+        second = self.call(
+            "work_unit_update",
+            task_id=task["id"],
+            title="前端实现",
+            owner="worker-frontend",
+            status="running",
+            progress="正在调整页面",
+            next_step="运行页面检查",
+            operation_id="unit-2",
+        )
+        detail = self.call("task_read", task_id=task["id"])
+        self.assertEqual({item["status"] for item in detail["work_units"]}, {"running"})
+        self.assertEqual({item["owner"] for item in detail["work_units"]},
+                         {"worker-backend", "worker-frontend"})
+
+        self.call(
+            "work_unit_update",
+            unit_id=first["id"],
+            expected_revision=first["revision"],
+            expected_etag=first["etag"],
+            status="completed",
+            progress="后端测试通过",
+            verification="unit tests passed",
+            operation_id="unit-1-complete",
+        )
+        with self.assertRaises(DiagnosticError) as caught:
+            self.call(
+                "task_close",
+                task_id=task["id"],
+                expected_revision=task["revision"],
+                expected_etag=task["etag"],
+                outcome="completed",
+                summary="并行任务完成",
+                acceptance_results={"并行任务 的验收": "测试通过"},
+                operation_id="close-blocked",
+            )
+        self.assertEqual(caught.exception.code, "WORK_UNITS_ACTIVE")
+
+        blocked = self.call(
+            "work_unit_update",
+            unit_id=second["id"],
+            expected_revision=second["revision"],
+            expected_etag=second["etag"],
+            status="blocked",
+            progress="等待后端接口",
+            blocker="接口契约未确认",
+            next_step="确认契约",
+            operation_id="unit-2-blocked",
+        )
+        context = self.call("context_get", project_id=self.project, task_id=task["id"],
+                            budget=4000)
+        self.assertIn("worker-frontend", context["text"])
+        self.assertIn("接口契约未确认", context["text"])
+
+        closed = self.call(
+            "task_close",
+            task_id=task["id"],
+            expected_revision=task["revision"],
+            expected_etag=task["etag"],
+            outcome="completed",
+            summary="并行任务完成",
+            acceptance_results={"并行任务 的验收": "测试通过"},
+            abandon_work_units=True,
+            operation_id="close-abandon",
+        )
+        self.assertEqual(closed["abandoned_work_units"], [blocked["id"]])
+        final_units = {
+            unit["id"]: unit["status"]
+            for unit in self.call("task_read", task_id=task["id"])["work_units"]
+        }
+        self.assertEqual(final_units[first["id"]], "completed")
+        self.assertEqual(final_units[second["id"]], "cancelled")
+
+    def test_subagents_update_distinct_work_units_without_parent_conflict(self):
+        task = self.open_task("并发更新", "concurrent-task")
+        workers = [Service(self.home), Service(self.home)]
+        self.addCleanup(workers[0].close)
+        self.addCleanup(workers[1].close)
+        units = [
+            self.call(
+                "work_unit_update", task_id=task["id"], title=f"工作 {index}",
+                owner=f"worker-{index}", status="running", progress=f"worker-{index} 已分派",
+                operation_id=f"unit-{index}",
+            )
+            for index in (1, 2)
+        ]
+
+        def update(pair):
+            position, unit = pair
+            return workers[position].dispatch("work_unit_update", {
+                "unit_id": unit["id"],
+                "expected_revision": unit["revision"],
+                "expected_etag": unit["etag"],
+                "status": "completed",
+                "progress": f"{unit['owner']} 完成",
+                "operation_id": f"complete-{unit['owner']}",
+            })["data"]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(update, enumerate(units)))
+        self.assertEqual({item["status"] for item in results}, {"completed"})
+        self.assertEqual(self.call("task_read", task_id=task["id"])["revision"], 1)
+
+    def test_phase_closes_and_reviews_without_closing_current_task(self):
+        task = self.open_task("阶段任务", "phase-task")
+        phase = self.call(
+            "task_phase_close",
+            task_id=task["id"],
+            expected_revision=task["revision"],
+            expected_etag=task["etag"],
+            title="需求与设计",
+            summary="设计边界已确认",
+            findings="设计采用单 current 加并行 WorkUnit",
+            verification="设计评审完成",
+            next_step="进入实现阶段",
+            operation_id="phase-close",
+        )
+        current = self.call("task_read", task_id=task["id"])
+        self.assertEqual(current["status"], "current")
+        self.assertEqual(current["phases"][0]["id"], phase["phase_id"])
+        prepared = self.call("workspace_prepare", root=str(self.root), intent="resume")
+        self.assertEqual(prepared["state"], "ready")
+        self.assertEqual([item["id"] for item in prepared["pending_phases"]], [phase["phase_id"]])
+
+        review = self.call("memory_review", task_id=task["id"], phase_id=phase["phase_id"])
+        self.assertEqual(review["state"], "pending")
+        memory = self.call(
+            "memory_write", project_id=self.project, title="阶段设计结论",
+            body="单 current 任务内允许并行 WorkUnit。",
+            sources=[{"type": "task", "reference": task["id"]}],
+            status="candidate", operation_id="phase-memory",
+        )
+        self.call(
+            "memory_review_complete",
+            task_id=task["id"],
+            phase_id=phase["phase_id"],
+            expected_revision=review["phase"]["revision"],
+            expected_etag=review["phase"]["etag"],
+            memory_ids=[memory["id"]],
+            summary="阶段经验经审查后保留为候选",
+            operation_id="phase-review-complete",
+        )
+        reviewed = self.call("memory_review", task_id=task["id"], phase_id=phase["phase_id"])
+        self.assertEqual(reviewed["state"], "reviewed")
+        self.assertEqual(self.call("task_read", task_id=task["id"])["status"], "current")
+
+    def test_checkpoint_persists_failures_and_verification(self):
+        task = self.open_task("验证记录", "verification-task")
+        self.call(
+            "task_checkpoint",
+            task_id=task["id"],
+            expected_revision=task["revision"],
+            expected_etag=task["etag"],
+            findings="定位到旧状态模型",
+            progress="迁移实现中",
+            failures="第一次尝试在锁内启动索引导致自锁",
+            verification="迁移单测通过",
+            next_step="运行全套测试",
+            operation_id="verification-checkpoint",
+        )
+        restored = self.call("task_read", task_id=task["id"])
+        self.assertEqual(restored["failures"], "第一次尝试在锁内启动索引导致自锁")
+        self.assertEqual(restored["verification"], "迁移单测通过")
+        self.assertEqual(restored["checkpoint_total"], 1)
+        self.assertEqual(
+            restored["checkpoints"][0]["failures"],
+            "第一次尝试在锁内启动索引导致自锁",
+        )
+        self.assertEqual(restored["checkpoints"][0]["verification"], "迁移单测通过")
+        self.assertNotIn("### Failures", restored["body"])
+
+
+if __name__ == "__main__":
+    unittest.main()

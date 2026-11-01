@@ -1,0 +1,1440 @@
+"""V2 Knowledge Router - External ID-based entity operations.
+
+This router provides external_id (UUID) based CRUD operations for entities,
+using stable string UUIDs that won't change with file moves or database migrations.
+
+Key improvements:
+- Stable external UUIDs that won't change with file moves or renames
+- Better API ergonomics with consistent string identifiers
+- Direct database lookups via unique indexed column
+- Simplified caching strategies
+"""
+
+from collections.abc import Mapping
+from contextlib import nullcontext
+from hashlib import sha256
+import os
+import pathlib
+from typing import Annotated
+
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, Path, status
+from loguru import logger
+
+import logfire
+from basic_memory import db
+from basic_memory.file_utils import has_frontmatter
+from basic_memory.services.exceptions import AmbiguousIdentifierError
+from basic_memory.services.link_resolver import normalize_link_text
+from basic_memory.services import directory_moves
+from basic_memory.services.directory_deletes import DirectoryDeleteServiceError
+from basic_memory.services.note_content_writes import NoteContentMutationServiceError
+from basic_memory.ignore_utils import (
+    IGNORED_PATH_REJECTION_DETAIL,
+    load_gitignore_patterns,
+    should_ignore_path,
+)
+from basic_memory.markdown.sections import (
+    LineRange,
+    NoteSliceError,
+    SectionSelector,
+    parse_line_range,
+    parse_section_selector,
+    slice_note_content,
+)
+from basic_memory.deps import (
+    AppConfigDep,
+    EntityServiceV2ExternalDep,
+    FileServiceV2ExternalDep,
+    SearchServiceV2ExternalDep,
+    LinkResolverV2ExternalDep,
+    NoteContentMaterializationProviderDep,
+    NoteContentMutationServiceDep,
+    NoteContentQueryServiceDep,
+    DirectoryDeleteServiceDep,
+    ProjectRepositoryDep,
+    ProjectConfigV2ExternalDep,
+    EntityRepositoryV2ExternalDep,
+    RelationRepositoryV2ExternalDep,
+    ProjectExternalIdPathDep,
+    ReadCacheDep,
+    IndexFileExecutorV2ExternalDep,
+    EntityVectorSyncSchedulerDep,
+    RelationResolutionSchedulerDep,
+    SessionDep,
+    SessionMakerDep,
+)
+from basic_memory.read_cache import ReadCacheOperation, invalidate_cache
+from basic_memory.read_cache.policy import READ_CACHE_TTL_SECONDS
+from basic_memory.read_cache.routes import (
+    cached_read,
+    note_group,
+    project_group,
+    skip_read_cache_store,
+)
+from basic_memory.runtime.note_content import (
+    NOTE_CONTENT_BASE_CHECKSUM_HEADER,
+    runtime_note_content_payload_as_dict,
+    runtime_note_content_payload_as_json_bytes,
+)
+from basic_memory.schemas import DeleteEntitiesResponse
+from basic_memory.schemas.base import Entity
+from basic_memory.schemas.request import EditEntityRequest
+from basic_memory.schemas.v2.note_placement import (
+    AmbiguousNotePlacementResponse,
+    NoteCreatePlacementResponse,
+    NotePlacementRequest,
+    NotePlacementResponse,
+    OutsideProjectPlacementResponse,
+)
+from basic_memory.services.note_placement import (
+    AmbiguousNotePlacement,
+    NoteCreatePlacement,
+    OutsideProjectPlacement,
+    note_path_readings,
+    place_missing_note,
+)
+from basic_memory.workspace_context import workspace_slug_for_canonical_permalinks
+from basic_memory.schemas.v2 import (
+    EntityResolveRequest,
+    EntityResolveResponse,
+    LinkResolveRequest,
+    LinkResolveResponse,
+    EntityResponseV2,
+    GraphEdge,
+    GraphNode,
+    GraphResponse,
+    MoveEntityRequestV2,
+    MoveDirectoryRequestV2,
+    DeleteDirectoryRequestV2,
+    OrphanEntitiesResponse,
+    IndexFileRequest,
+)
+from basic_memory.schemas.response import DirectoryMoveResult
+from basic_memory.utils import (
+    generate_permalink,
+    nfc_path,
+    normalize_project_reference,
+    validate_project_path,
+)
+
+router = APIRouter(prefix="/knowledge", tags=["knowledge-v2"])
+
+
+def _schedule_post_write_followups(
+    *,
+    relation_resolution_scheduler,
+    project_id: int,
+) -> None:
+    """Schedule out-of-band follow-ups after an accepted note mutation.
+
+    Relation resolution always runs so a newly written note back-resolves inbound
+    forward references that name it — parity with the watcher's relation repair,
+    which the inline write path does not otherwise trigger (#1015). It is a no-op
+    in test mode.
+
+    Vector sync is not scheduled here. The materialization job embeds the note
+    after it indexes the written file (local provider and cloud's
+    materialize_note_file job alike). A request-time embed raced that job and
+    could publish vectors for the body-only search row the accept path writes
+    (#1732).
+
+    CLOUD/LOCAL PARITY (do not break): every follow-up here is a core *router
+    scheduler* that the runtime overrides via dependency injection — local runs
+    it in-process (debounced), cloud overrides it to enqueue a queue job. Cloud
+    must override get_relation_resolution_scheduler; if a new follow-up scheduler
+    is added here, cloud needs a matching override or it will run the local
+    in-process work on the cloud API server. See basic_memory_cloud
+    api/deps/cloud_overrides.
+    """
+    relation_resolution_scheduler.schedule_relation_resolution(project_id=project_id)
+
+
+def entity_response_from_note_content_payload(payload) -> EntityResponseV2:
+    """Serialize an accepted-note payload through the v2 entity response model."""
+    return EntityResponseV2.model_validate(runtime_note_content_payload_as_dict(payload))
+
+
+def delete_response_from_note_content_payload(payload) -> DeleteEntitiesResponse:
+    """Serialize an accepted-note delete payload through the existing delete model."""
+    return DeleteEntitiesResponse.model_validate(runtime_note_content_payload_as_dict(payload))
+
+
+def etag_for_response_body(body: bytes) -> str:
+    """Return a stable HTTP ETag for a runtime JSON response body."""
+    return f'"{sha256(body).hexdigest()}"'
+
+
+def runtime_json_response(
+    *,
+    status_code: int,
+    payload: Mapping[str, object],
+) -> Response:
+    """Serialize a runtime payload without dropping adapter-specific fields."""
+    response_body = runtime_note_content_payload_as_json_bytes(payload)
+    return Response(
+        status_code=status_code,
+        headers={
+            "content-type": "application/json",
+            "etag": etag_for_response_body(response_body),
+        },
+        content=response_body,
+    )
+
+
+## Graph endpoint
+
+
+@router.get("/graph", response_model=GraphResponse)
+async def get_graph(
+    project_id: ProjectExternalIdPathDep,
+    entity_repository: EntityRepositoryV2ExternalDep,
+    relation_repository: RelationRepositoryV2ExternalDep,
+    session: SessionDep,
+) -> GraphResponse:
+    """Return all entities and resolved relations for knowledge graph visualization.
+
+    Returns a flat node/edge structure optimized for rendering with graph libraries.
+    Only includes resolved relations (where to_id is not null).
+    """
+    with logfire.span(
+        "api.request.knowledge.get_graph",
+        entrypoint="api",
+        domain="knowledge",
+        action="get_graph",
+    ):
+        logger.debug("API v2 request: get_graph")
+
+        # Fetch all entities for this project
+        entities = await entity_repository.find_all(session, use_load_options=False)
+        nodes = [
+            GraphNode(
+                external_id=entity.external_id,
+                title=entity.title,
+                note_type=entity.note_type,
+                file_path=entity.file_path,
+            )
+            for entity in entities
+        ]
+
+        # Fetch all resolved relations (to_id is not null) with eager-loaded entities
+        relations = await relation_repository.find_all(session)
+        edges = [
+            GraphEdge(
+                from_id=relation.from_entity.external_id,
+                to_id=relation.to_entity.external_id,
+                relation_type=relation.relation_type,
+            )
+            for relation in relations
+            if relation.to_entity is not None
+        ]
+
+        logger.debug(f"API v2 response: graph with {len(nodes)} nodes and {len(edges)} edges")
+        return GraphResponse(nodes=nodes, edges=edges)
+
+
+## Orphan entities endpoint
+
+
+@router.get("/orphans", response_model=OrphanEntitiesResponse)
+async def get_orphan_entities(
+    project_id: ProjectExternalIdPathDep,
+    entity_repository: EntityRepositoryV2ExternalDep,
+    session: SessionDep,
+) -> OrphanEntitiesResponse:
+    """Return entities that have no incoming or outgoing relations."""
+    with logfire.span(
+        "api.request.knowledge.get_orphans",
+        entrypoint="api",
+        domain="knowledge",
+        action="get_orphans",
+    ):
+        logger.debug("API v2 request: get_orphan_entities")
+
+        entities = await entity_repository.find_without_relations(session)
+        nodes = [
+            GraphNode(
+                external_id=entity.external_id,
+                title=entity.title,
+                note_type=entity.note_type,
+                file_path=entity.file_path,
+            )
+            for entity in entities
+        ]
+
+        logger.debug(f"API v2 response: {len(nodes)} orphan entities")
+        return OrphanEntitiesResponse(entities=nodes, total=len(nodes))
+
+
+## Resolution endpoint
+
+
+# QUERY only: resolution is a safe, cacheable read with a body (RFC 9110 draft).
+# OpenAPI cannot describe QUERY, so the route stays out of the schema. Exact
+# answers change only with the project's names; see skip_read_cache_store below.
+@router.api_route(
+    "/resolve",
+    methods=["QUERY"],
+    response_model=EntityResolveResponse,
+    include_in_schema=False,
+    dependencies=[
+        cached_read(
+            ReadCacheOperation.resolve,
+            group=project_group,
+            ttl_seconds=READ_CACHE_TTL_SECONDS,
+        )
+    ],
+)
+async def resolve_identifier(
+    project_id: ProjectExternalIdPathDep,
+    project_external_id: Annotated[
+        str, Path(alias="project_id", description="Project external UUID")
+    ],
+    data: EntityResolveRequest,
+    link_resolver: LinkResolverV2ExternalDep,
+    entity_repository: EntityRepositoryV2ExternalDep,
+    project_repository: ProjectRepositoryDep,
+    session: SessionDep,
+    request: Request,
+) -> EntityResolveResponse:
+    """Resolve an entity inside the target project named in the route.
+
+    This endpoint provides a bridge between v1-style identifiers and v2 external_ids.
+    Qualified identifiers cannot escape the route project. Use ``/links/resolve`` for
+    source-aware cross-project wikilinks.
+
+    Args:
+        data: Request containing the identifier to resolve
+
+    Returns:
+        Entity external_id and metadata about how it was resolved
+
+    Raises:
+        HTTPException: 404 if identifier cannot be resolved
+
+    Example:
+        QUERY /v2/{project_id}/knowledge/resolve
+        {"identifier": "specs/search"}
+
+        Returns:
+        {
+            "external_id": "550e8400-e29b-41d4-a716-446655440000",
+            "entity_id": 123,
+            "project_external_id": "4b9b7a10-7a63-48d2-ae3f-0d6a2c69313f",
+            "permalink": "specs/search",
+            "file_path": "specs/search.md",
+            "title": "Search Specification",
+            "resolution_method": "permalink"
+        }
+    """
+    with logfire.span(
+        "api.request.knowledge.resolve_entity",
+        entrypoint="api",
+        domain="knowledge",
+        action="resolve_entity",
+    ):
+        logger.debug("API v2 request: resolve_identifier for {!r}", data.identifier)
+
+        entity = await entity_repository.get_by_external_id(session, data.identifier)
+        resolution_method = "external_id" if entity else "search"
+
+        if not entity:
+            # Trigger: the identifier uses legacy ``project/note`` syntax and the prefix
+            # names a different project.
+            # Why: non-strict resolution includes fuzzy search, which can otherwise turn a
+            # qualified miss into an unrelated entity from the route project.
+            # Outcome: allow an exact local title/path/permalink first, but reject the miss
+            # before fuzzy fallback and direct the caller to source-aware link resolution.
+            link_identifier, _ = normalize_link_text(data.identifier)
+            normalized_identifier = normalize_project_reference(link_identifier).strip("/")
+            project_prefix, separator, _ = normalized_identifier.partition("/")
+            referenced_project = None
+            if separator:
+                referenced_project = await project_repository.get_by_name(session, project_prefix)
+                if referenced_project is None:
+                    referenced_project = await project_repository.get_by_name_case_insensitive(
+                        session, project_prefix
+                    )
+                if referenced_project is None:
+                    referenced_project = await project_repository.get_by_permalink(
+                        session, generate_permalink(project_prefix)
+                    )
+            qualified_other_project = (
+                referenced_project is not None and referenced_project.id != project_id
+            )
+
+            try:
+                entity = await link_resolver.resolve_entity(
+                    data.identifier,
+                    source_path=data.source_path,
+                    strict=True if qualified_other_project else data.strict,
+                    session=session,
+                )
+            except AmbiguousIdentifierError as exc:
+                if qualified_other_project and not data.strict:
+                    # An ambiguity proves that exact local title candidates exist, so retain
+                    # the non-strict caller's historical shortest-path selection without
+                    # opening the fuzzy qualified-miss path.
+                    entity = await link_resolver.resolve_entity(
+                        data.identifier,
+                        source_path=data.source_path,
+                        strict=False,
+                        session=session,
+                    )
+                else:
+                    # A strict resolve refused to guess between several same-title notes
+                    # (#1148). Surface it as 409 so edit/move report ambiguity and ask for
+                    # an exact id.
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=str(exc),
+                    ) from exc
+            if entity:
+                if entity.permalink == data.identifier:
+                    resolution_method = "permalink"
+                elif entity.title == data.identifier:
+                    resolution_method = "title"
+                elif entity.file_path == data.identifier:
+                    resolution_method = "path"
+
+            if not entity and qualified_other_project:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Qualified project references must use /knowledge/links/resolve",
+                )
+
+        if not entity:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Entity not found: '{data.identifier}'",
+            )
+
+        if entity.project_id != project_id:  # pragma: no cover
+            raise HTTPException(status_code=404, detail=f"Entity not found: '{data.identifier}'")
+
+        result = EntityResolveResponse(
+            external_id=entity.external_id,
+            entity_id=entity.id,
+            project_external_id=project_external_id,
+            permalink=entity.permalink,
+            file_path=entity.file_path,
+            title=entity.title,
+            resolution_method=resolution_method,
+        )
+        logger.debug(
+            f"API v2 response: resolved '{data.identifier}' "
+            f"to external_id={result.external_id} via {resolution_method}"
+        )
+        # A fuzzy match can change when any note's content changes, but resolve
+        # entries are retired only when the project's names change. Keep it uncached.
+        if resolution_method == "search":
+            skip_read_cache_store(request)
+        return result
+
+
+# QUERY only, like /resolve: a safe read with a body. Not cached: its answer depends on
+# which folders storage holds, which change without any note being written.
+@router.api_route(
+    "/placement",
+    methods=["QUERY"],
+    response_model=NotePlacementResponse,
+    include_in_schema=False,
+)
+async def place_note(
+    project_id: ProjectExternalIdPathDep,
+    data: NotePlacementRequest,
+    project_repository: ProjectRepositoryDep,
+    entity_repository: EntityRepositoryV2ExternalDep,
+    file_service: FileServiceV2ExternalDep,
+    app_config: AppConfigDep,
+    session: SessionDep,
+) -> NoteCreatePlacementResponse | AmbiguousNotePlacementResponse | OutsideProjectPlacementResponse:
+    """Say where a note that resolves under none of its readings would be created.
+
+    The readings are the ones resolution tried, and the folder evidence comes from
+    canonical note state -- accepted notes and storage -- rather than the index (#1775). A caller probes the readings for files not
+    indexed yet before it creates anything.
+    """
+    with logfire.span(
+        "api.request.knowledge.place_note",
+        entrypoint="api",
+        domain="knowledge",
+        action="place_note",
+    ):
+        project = await project_repository.get_by_id(session, project_id)
+        if project is None:  # pragma: no cover - the path dependency already found it
+            raise HTTPException(status_code=404, detail="Project not found")
+        readings = note_path_readings(
+            data.identifier,
+            project_permalink=project.permalink,
+            workspace_permalink=workspace_slug_for_canonical_permalinks(),
+        )
+        project_home = file_service.local_project_path
+
+        async def folder_exists(folder: str) -> bool:
+            # Canonical note state is the accepted notes plus the files on storage.
+            # An accepted note is not materialized yet, and a file on storage is not
+            # indexed yet, so either one alone can miss a folder that exists.
+            return await entity_repository.directory_has_entities(
+                session, folder
+            ) or await file_service.directory_has_files(folder)
+
+        placement = await place_missing_note(
+            readings,
+            within_project=lambda path: validate_project_path(path, project_home),
+            folder_exists=folder_exists,
+            prefix_is_routing=app_config.permalinks_include_project,
+        )
+        match placement:
+            case NoteCreatePlacement(directory=directory, title=title):
+                return NoteCreatePlacementResponse(
+                    readings=list(readings), directory=directory, title=title
+                )
+            case AmbiguousNotePlacement(literal=literal, below_prefix=below_prefix):
+                return AmbiguousNotePlacementResponse(
+                    readings=list(readings), literal=literal, below_prefix=below_prefix
+                )
+            case OutsideProjectPlacement(path=path):
+                return OutsideProjectPlacementResponse(readings=list(readings), path=path)
+
+
+# QUERY only, like /resolve: a safe read with a body. Not cached: its answer
+# depends on the source note's project and on other projects' names.
+@router.api_route(
+    "/links/resolve",
+    methods=["QUERY"],
+    response_model=LinkResolveResponse,
+    include_in_schema=False,
+)
+async def resolve_link(
+    project_id: ProjectExternalIdPathDep,
+    source_project_external_id: Annotated[
+        str,
+        Path(
+            alias="project_id",
+            description="Source/default project external UUID for wikilink resolution",
+        ),
+    ],
+    data: LinkResolveRequest,
+    link_resolver: LinkResolverV2ExternalDep,
+    project_repository: ProjectRepositoryDep,
+    session: SessionDep,
+) -> LinkResolveResponse:
+    """Resolve a wikilink from the route project and return its explicit target project.
+
+    The route project is the source/default context and owns ``source_path``. A qualified
+    reference may select another target project. Hosted callers must authorize the returned
+    ``target_project_external_id`` separately before exposing target metadata.
+
+    This endpoint is intentionally not stored in the project read cache: a cross-project result
+    depends on both source and target generations, while entity resolution depends on one target.
+    """
+    with logfire.span(
+        "api.request.knowledge.resolve_link",
+        entrypoint="api",
+        domain="knowledge",
+        action="resolve_link",
+        source_project_id=project_id,
+        source_project_external_id=source_project_external_id,
+    ):
+        logger.debug(f"API v2 request: resolve_link for '{data.identifier}'")
+
+        try:
+            entity = await link_resolver.resolve_link(
+                data.identifier,
+                source_path=data.source_path,
+                strict=data.strict,
+                session=session,
+            )
+        except AmbiguousIdentifierError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+        if not entity:
+            raise HTTPException(
+                status_code=404, detail=f"Link target not found: '{data.identifier}'"
+            )
+
+        target_project = await project_repository.get_by_id(session, entity.project_id)
+        if not target_project:  # pragma: no cover
+            raise HTTPException(
+                status_code=500,
+                detail="Resolved link target references an unknown project",
+            )
+
+        resolution_method = "search"
+        if entity.permalink == data.identifier:
+            resolution_method = "permalink"
+        elif entity.title == data.identifier:
+            resolution_method = "title"
+        elif entity.file_path == data.identifier:
+            resolution_method = "path"
+
+        return LinkResolveResponse(
+            external_id=entity.external_id,
+            entity_id=entity.id,
+            target_project_external_id=target_project.external_id,
+            permalink=entity.permalink,
+            file_path=entity.file_path,
+            title=entity.title,
+            resolution_method=resolution_method,
+        )
+
+
+## Single-file indexing endpoint
+
+
+def _canonical_file_path(home: pathlib.Path, segments: list[str]) -> str | None:
+    """Resolve the actual on-disk casing of a file path under the project home.
+
+    Trigger: case-insensitive filesystems (macOS/Windows) pass existence checks for
+        wrong-cased paths like 'notes/Disk-Note.md' when the file is 'notes/disk-note.md'.
+    Why: indexing the caller-supplied casing misses the existing DB row keyed by the
+        on-disk path and inserts a duplicate entity under the wrong-cased path.
+    Outcome: each segment is matched against real directory entries — exact name first
+        (so distinct case-variant files on case-sensitive filesystems stay distinct),
+        then a unique case-insensitive match. Returns None when any segment cannot be
+        matched to exactly one entry, including missing files. Traversal stops at the
+        project boundary: a directory whose resolved path escapes the project home is
+        never scanned.
+    """
+    resolved_home = home.resolve()
+    current = home
+    canonical_segments: list[str] = []
+    for segment in segments:
+        # Trigger: a previously matched segment may be a symlink whose target lies
+        #     outside the project root (e.g. wrong-cased 'LINK' matched the on-disk
+        #     'link' -> /tmp/outside on a case-sensitive filesystem).
+        # Why: os.scandir follows symlinked directories, so continuing would read
+        #     directory contents outside the project boundary even though the
+        #     post-canonicalization containment check rejects the request later.
+        # Outcome: bail before scanning the moment resolution escapes the home.
+        if not current.resolve().is_relative_to(resolved_home):
+            return None
+        try:
+            with os.scandir(current) as entries_iter:
+                entries = [entry.name for entry in entries_iter]
+        except OSError:
+            # A parent segment resolved to a non-directory (or vanished): no canonical
+            # path exists for the remaining segments.
+            return None
+        if segment in entries:
+            matched = segment
+        else:
+            # Trigger: on macOS the request and the directory entry may spell the same
+            #     name in different Unicode forms (NFC vs NFD) as well as different case.
+            # Why: nfc_path is the identity rule the scanner and watcher use (#1275);
+            #     elsewhere it returns the name unchanged and this is a case-only match.
+            wanted = nfc_path(segment).lower()
+            matches = [entry for entry in entries if nfc_path(entry).lower() == wanted]
+            if len(matches) != 1:
+                return None
+            matched = matches[0]
+        canonical_segments.append(matched)
+        current = current / matched
+    return nfc_path("/".join(canonical_segments))
+
+
+@router.post("/index-file", response_model=EntityResponseV2)
+async def index_file(
+    data: IndexFileRequest,
+    project_id: ProjectExternalIdPathDep,
+    project_external_id: Annotated[
+        str, Path(alias="project_id", description="Project external UUID")
+    ],
+    file_service: FileServiceV2ExternalDep,
+    file_indexer: IndexFileExecutorV2ExternalDep,
+    entity_repository: EntityRepositoryV2ExternalDep,
+    project_config: ProjectConfigV2ExternalDep,
+    search_service: SearchServiceV2ExternalDep,
+    session_maker: SessionMakerDep,
+    read_cache: ReadCacheDep,
+) -> EntityResponseV2:
+    """Index a single markdown file that exists on disk but is not indexed yet.
+
+    Recovery path for files written directly to disk before the watcher indexed
+    them (#581): callers such as edit_note can index the exact file and retry
+    identifier resolution without running a full project sync.
+
+    Args:
+        data: Request containing the markdown file path relative to project root
+
+    Returns:
+        The indexed entity
+
+    Raises:
+        HTTPException: 400 if the path escapes the project root, contains
+            non-normalized segments, matches the project ignore rules, or is
+            not markdown, 404 if the file does not exist on disk
+    """
+    with logfire.span(
+        "api.request.knowledge.index_file",
+        entrypoint="api",
+        domain="knowledge",
+        action="index_file",
+    ):
+        logger.debug(f"API v2 request: index_file file_path='{data.file_path}'")
+
+        # This recovery endpoint scans disk; object storage is indexed by its own
+        # runtime. A logical cloud prefix must never become a host filesystem probe.
+        if file_service.local_project_path is None:
+            raise HTTPException(status_code=404, detail="Local file recovery is unavailable")
+
+        if not validate_project_path(data.file_path, project_config.home):
+            raise HTTPException(
+                status_code=400,
+                detail=f"File path '{data.file_path}' is not allowed - "
+                "paths must stay within project boundaries",
+            )
+
+        # Trigger: segments like './' or '//' survive the traversal check above
+        # Why: a non-normalized path would index under a non-canonical DB key
+        # Outcome: reject fail-fast instead of guessing the canonical form
+        segments = data.file_path.replace("\\", "/").split("/")
+        if any(segment in ("", ".") for segment in segments):
+            raise HTTPException(
+                status_code=400,
+                detail=f"File path '{data.file_path}' is not normalized - "
+                "segments like './' or '//' are not allowed",
+            )
+
+        # Canonicalize to the actual on-disk casing so the DB lookup below hits the
+        # row keyed by the real path instead of inserting a wrong-cased duplicate.
+        file_path = _canonical_file_path(project_config.home, segments)
+        if file_path is None:
+            raise HTTPException(
+                status_code=404, detail=f"File not found on disk: '{data.file_path}'"
+            )
+        # Trigger: canonicalization rewrote a segment to its on-disk form, and that
+        #     segment may be a symlink. The pre-check above validated the ORIGINAL
+        #     request path — on a case-sensitive filesystem 'LINK/secret.md' does not
+        #     exist, so resolve() cannot follow the real 'link' symlink and the check
+        #     passes even when 'link' points outside the project root.
+        # Why: indexing through an escaping symlink would read and index content
+        #     outside the project boundary — and even an is_file() existence probe on
+        #     the joined path would follow the symlink and stat its target, so
+        #     containment must hold BEFORE any filesystem probe that follows symlinks.
+        #     Path.resolve() only walks symlink names (readlink); it never opens or
+        #     stats the final target, so it is safe to run pre-containment.
+        # Outcome: the canonical path is re-validated and the fully-resolved absolute
+        #     target must stay inside the resolved project home; escapes get a 400
+        #     before the file-existence probe below ever touches the target.
+        resolved_target = (project_config.home / file_path).resolve()
+        if not validate_project_path(file_path, project_config.home) or not (
+            resolved_target.is_relative_to(project_config.home.resolve())
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"File path '{data.file_path}' is not allowed - "
+                "paths must stay within project boundaries",
+            )
+        # Containment holds, so probing the resolved target cannot leave the project.
+        if not resolved_target.is_file():
+            raise HTTPException(
+                status_code=404, detail=f"File not found on disk: '{data.file_path}'"
+            )
+        # Trigger: the canonical path matches the .bmignore / project .gitignore rules
+        # Why: scan and watch flows filter ignored files before they ever reach the
+        #      indexer; indexing one here would bypass the ignored-file contract and
+        #      make hidden or gitignored content searchable
+        # Outcome: the same should_ignore_path() rules apply to single-file indexing
+        ignore_patterns = load_gitignore_patterns(project_config.home)
+        if should_ignore_path(
+            project_config.home / file_path, project_config.home, ignore_patterns
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"File path '{data.file_path}' {IGNORED_PATH_REJECTION_DETAIL} "
+                "and cannot be indexed",
+            )
+        if not file_service.is_markdown(file_path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only markdown files can be indexed: '{data.file_path}'",
+            )
+
+        # The file indexer commits entity state before search and reconciliation
+        # follow-ups finish. Invalidate even when a later phase raises so those
+        # partial commits cannot remain reachable through the old generation.
+        invalidation_scope = (
+            invalidate_cache(read_cache, project_external_id)
+            if read_cache is not None
+            else nullcontext()
+        )
+        async with invalidation_scope:
+            indexed = await file_indexer.index_file(file_path, source="api-index-file")
+        async with db.scoped_session(session_maker) as session:
+            entity = await entity_repository.get_by_id(session, indexed.entity_id)
+        if entity is None:  # pragma: no cover
+            raise HTTPException(
+                status_code=500,
+                detail=f"Indexed entity not found after indexing: '{data.file_path}'",
+            )
+
+        # Trigger: the entity index was just refreshed
+        # Why: project indexing refreshes embedding vectors after changed files are
+        #      indexed; without the single-entity equivalent, a note recovered via
+        #      index-file stays missing or stale in semantic search until later work
+        # Outcome: vectors refresh synchronously before the response returns,
+        #          mirroring project indexing instead of the out-of-band scheduler
+        await search_service.sync_entity_vectors_batch([entity.id])
+
+        result = EntityResponseV2.model_validate(entity)
+        logger.debug(
+            f"API v2 response: index_file file_path='{file_path}' external_id={result.external_id}"
+        )
+        return result
+
+
+## Read endpoints
+
+
+def _parse_note_slice_params(
+    *,
+    section: str | None,
+    lines: str | None,
+) -> tuple[SectionSelector | None, LineRange | None]:
+    """Validate raw slice query params into typed selectors, failing fast with 422s."""
+    if section is not None and lines is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="section and lines are mutually exclusive; a section response carries "
+            "content_start_line/content_end_line for follow-up line reads",
+        )
+    selector: SectionSelector | None = None
+    if section is not None:
+        selector = parse_section_selector(section)
+        if selector is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid section selector: '{section}'",
+            )
+    line_range: LineRange | None = None
+    if lines is not None:
+        line_range = parse_line_range(lines)
+        if line_range is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid lines range: '{lines}' (expected 'N-M', 'N-', or 'N')",
+            )
+    return selector, line_range
+
+
+def _apply_note_slice(
+    result: EntityResponseV2,
+    *,
+    selector: SectionSelector | None,
+    line_range: LineRange | None,
+    max_tokens: int | None,
+) -> EntityResponseV2:
+    """Slice a full note response after cache retrieval.
+
+    Slice params are deliberately NOT part of the read-cache digest: the cache
+    keeps exactly one pristine full-note entry per entity and every slice is
+    computed from it per request, so differently-sliced reads share one entry
+    and the cached value is never a partial note.
+    """
+    if selector is None and line_range is None and max_tokens is None:
+        return result
+    if result.content is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Entity '{result.external_id}' has no markdown content to slice",
+        )
+    sliced = slice_note_content(
+        result.content,
+        section=selector,
+        lines=line_range,
+        max_tokens=max_tokens,
+        note_title=result.title,
+    )
+    if isinstance(sliced, NoteSliceError):
+        raise HTTPException(status_code=404, detail=sliced.message)
+    return result.model_copy(
+        update={
+            "content": sliced.content,
+            "section": sliced.section,
+            "content_start_line": sliced.start_line,
+            "content_end_line": sliced.end_line,
+            "content_total_lines": sliced.total_lines,
+            "content_truncated": sliced.truncated,
+            "content_continue_line": sliced.continue_line,
+        }
+    )
+
+
+@router.get(
+    "/entities/{entity_id}",
+    response_model=EntityResponseV2,
+    dependencies=[
+        cached_read(
+            ReadCacheOperation.entity,
+            group=note_group,
+            ttl_seconds=READ_CACHE_TTL_SECONDS,
+        )
+    ],
+)
+async def get_entity_by_id(
+    project_id: ProjectExternalIdPathDep,
+    project_external_id: Annotated[
+        str, Path(alias="project_id", description="Project external UUID")
+    ],
+    entity_repository: EntityRepositoryV2ExternalDep,
+    note_content_query_service: NoteContentQueryServiceDep,
+    session: SessionDep,
+    read_cache: ReadCacheDep,
+    entity_id: str = Path(..., description="Entity external ID (UUID)"),
+    section: str | None = Query(
+        None,
+        description="Return one section by heading text: 'Decisions', path form "
+        "'Auth/Decisions' to disambiguate, bracket form 'Heading[1]' for duplicate "
+        "headings. Mutually exclusive with lines.",
+    ),
+    lines: str | None = Query(
+        None,
+        description="Return a document-absolute line range: 'N-M', 'N-' (to end), or 'N'.",
+    ),
+    max_tokens: int | None = Query(
+        None,
+        ge=1,
+        description="Approximate token budget; longer content is truncated at a "
+        "section or paragraph boundary with an explicit marker and a continue line.",
+    ),
+) -> EntityResponseV2:
+    """Get an entity by its external ID (UUID).
+
+    This is the primary entity retrieval method in v2, using stable UUID
+    identifiers that won't change with file moves.
+
+    Args:
+        entity_id: External ID (UUID string)
+        section: Optional heading selector returning one section slice
+        lines: Optional document-absolute line range slice
+        max_tokens: Optional token-budget truncation of the returned content
+
+    Returns:
+        Complete entity with observations and relations; when a slice param is
+        set, `content` is the slice and the content_* fields carry its
+        document-absolute coordinates
+
+    Raises:
+        HTTPException: 404 if entity or requested section not found, 422 for
+            malformed or conflicting slice params
+    """
+    with logfire.span(
+        "api.request.knowledge.get_entity",
+        entrypoint="api",
+        domain="knowledge",
+        action="get_entity",
+    ):
+        logger.debug("API v2 request: get_entity_by_id entity_id={}", entity_id)
+
+        selector, line_range = _parse_note_slice_params(section=section, lines=lines)
+
+        note_payload = await note_content_query_service.get_note_entity_payload_with_read_repair(
+            project_external_id=project_external_id,
+            entity_external_id=entity_id,
+            session=session,
+            read_cache=read_cache,
+        )
+        if note_payload is not None:
+            result = entity_response_from_note_content_payload(note_payload)
+        else:
+            entity = await entity_repository.get_by_external_id(session, entity_id)
+            if not entity:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Entity with external_id '{entity_id}' not found",
+                )
+            result = EntityResponseV2.model_validate(entity)
+        logger.debug(f"API v2 response: external_id={entity_id}, title='{result.title}'")
+        return _apply_note_slice(
+            result,
+            selector=selector,
+            line_range=line_range,
+            max_tokens=max_tokens,
+        )
+
+
+## Create endpoints
+
+
+@router.post("/entities", response_model=EntityResponseV2, status_code=status.HTTP_202_ACCEPTED)
+async def create_entity(
+    project_id: ProjectExternalIdPathDep,
+    project_external_id: Annotated[
+        str, Path(alias="project_id", description="Project external UUID")
+    ],
+    data: Entity,
+    note_content_mutation_service: NoteContentMutationServiceDep,
+    note_content_materialization_provider: NoteContentMaterializationProviderDep,
+    relation_resolution_scheduler: RelationResolutionSchedulerDep,
+) -> EntityResponseV2:
+    """Create a new entity.
+
+    Args:
+        data: Entity data to create
+
+    Returns:
+        Created entity with generated external_id (UUID) and file content
+    """
+    with logfire.span(
+        "api.request.knowledge.create_entity",
+        entrypoint="api",
+        domain="knowledge",
+        action="create_entity",
+    ):
+        logger.debug(
+            "API v2 request", endpoint="create_entity", note_type=data.note_type, title=data.title
+        )
+
+        try:
+            accepted = await note_content_mutation_service.create_note(
+                project_external_id=project_external_id,
+                data=data,
+                user_profile_id=None,
+                source="api",
+            )
+        except NoteContentMutationServiceError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+        accepted = await note_content_materialization_provider.materialize_write_change(accepted)
+        result = entity_response_from_note_content_payload(accepted.payload)
+        _schedule_post_write_followups(
+            relation_resolution_scheduler=relation_resolution_scheduler,
+            project_id=project_id,
+        )
+
+        logger.debug(
+            f"API v2 response: endpoint='create_entity' external_id={result.external_id}, title={result.title}, permalink={result.permalink}, status_code=202"
+        )
+        return result
+
+
+## Update endpoints
+
+
+@router.put(
+    "/entities/{entity_id}",
+    response_model=EntityResponseV2,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def update_entity_by_id(
+    data: Entity,
+    response: Response,
+    project_id: ProjectExternalIdPathDep,
+    project_external_id: Annotated[
+        str, Path(alias="project_id", description="Project external UUID")
+    ],
+    note_content_mutation_service: NoteContentMutationServiceDep,
+    note_content_materialization_provider: NoteContentMaterializationProviderDep,
+    relation_resolution_scheduler: RelationResolutionSchedulerDep,
+    entity_id: str = Path(..., description="Entity external ID (UUID)"),
+    base_checksum: Annotated[
+        str | None,
+        Header(
+            alias=NOTE_CONTENT_BASE_CHECKSUM_HEADER,
+            description="Optional optimistic-concurrency precondition: the "
+            "db_checksum the caller last synced. A stale value rejects the write "
+            "with a structured 409 instead of overwriting the newer accepted note.",
+        ),
+    ] = None,
+) -> EntityResponseV2:
+    """Update an entity by external ID.
+
+    If the entity doesn't exist, it will be created (upsert behavior).
+
+    Args:
+        entity_id: External ID (UUID string)
+        data: Updated entity data
+        base_checksum: Optional db_checksum precondition from the
+            x-bm-cloud-note-base-checksum header (issue #1445)
+
+    Returns:
+        Updated entity with file content
+    """
+    with logfire.span(
+        "api.request.knowledge.update_entity",
+        entrypoint="api",
+        domain="knowledge",
+        action="update_entity",
+    ):
+        logger.debug(f"API v2 request: update_entity_by_id entity_id={entity_id}")
+
+        try:
+            accepted = await note_content_mutation_service.update_note(
+                project_external_id=project_external_id,
+                entity_external_id=entity_id,
+                data=data,
+                user_profile_id=None,
+                source="api",
+                base_checksum=base_checksum,
+                # Trigger: the PUT supplies frontmatter, in its content or as entity_metadata.
+                # Why: a writer that sends frontmatter sends all of it, so a key it omits
+                # was deleted (#1768); an empty map means every custom key was removed.
+                # A body-only PUT did not mean to touch the keys.
+                # Outcome: supplied frontmatter replaces the stored keys; otherwise merge.
+                replace_frontmatter=data.entity_metadata is not None
+                or bool(data.content and has_frontmatter(data.content)),
+            )
+        except NoteContentMutationServiceError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+        accepted = await note_content_materialization_provider.materialize_write_change(accepted)
+        response.status_code = status.HTTP_202_ACCEPTED
+        result = entity_response_from_note_content_payload(accepted.payload)
+        _schedule_post_write_followups(
+            relation_resolution_scheduler=relation_resolution_scheduler,
+            project_id=project_id,
+        )
+
+        logger.debug(
+            f"API v2 response: external_id={entity_id}, status_code={response.status_code}"
+        )
+        return result
+
+
+@router.patch(
+    "/entities/{entity_id}",
+    response_model=EntityResponseV2,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def edit_entity_by_id(
+    data: EditEntityRequest,
+    project_id: ProjectExternalIdPathDep,
+    project_external_id: Annotated[
+        str, Path(alias="project_id", description="Project external UUID")
+    ],
+    note_content_mutation_service: NoteContentMutationServiceDep,
+    note_content_materialization_provider: NoteContentMaterializationProviderDep,
+    relation_resolution_scheduler: RelationResolutionSchedulerDep,
+    entity_id: str = Path(..., description="Entity external ID (UUID)"),
+    base_checksum: Annotated[
+        str | None,
+        Header(
+            alias=NOTE_CONTENT_BASE_CHECKSUM_HEADER,
+            description="Optional optimistic-concurrency precondition: the "
+            "db_checksum the caller last read. A stale value rejects the edit "
+            "with a structured 409 instead of editing a newer accepted note.",
+        ),
+    ] = None,
+) -> EntityResponseV2:
+    """Edit an existing entity by external ID using operations like append, prepend, etc.
+
+    Args:
+        entity_id: External ID (UUID string)
+        data: Edit operation details
+        base_checksum: Optional db_checksum precondition from the
+            x-bm-cloud-note-base-checksum header (issue #1552)
+
+    Returns:
+        Updated entity with file content
+
+    Raises:
+        HTTPException: 404 if entity not found, 400 if edit fails
+    """
+    with logfire.span(
+        "api.request.knowledge.edit_entity",
+        entrypoint="api",
+        domain="knowledge",
+        action="edit_entity",
+    ):
+        logger.debug(
+            "API v2 request: edit_entity_by_id entity_id={} operation={}",
+            entity_id,
+            data.operation,
+        )
+
+        try:
+            accepted = await note_content_mutation_service.edit_note(
+                project_external_id=project_external_id,
+                entity_external_id=entity_id,
+                data=data,
+                user_profile_id=None,
+                source="api",
+                base_checksum=base_checksum,
+            )
+        except NoteContentMutationServiceError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+        accepted = await note_content_materialization_provider.materialize_write_change(accepted)
+        result = entity_response_from_note_content_payload(accepted.payload)
+        _schedule_post_write_followups(
+            relation_resolution_scheduler=relation_resolution_scheduler,
+            project_id=project_id,
+        )
+
+        logger.debug(
+            f"API v2 response: external_id={entity_id}, operation='{data.operation}', status_code=202"
+        )
+
+        return result
+
+
+## Delete endpoints
+
+
+@router.delete(
+    "/entities/{entity_id}",
+    response_model=DeleteEntitiesResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def delete_entity_by_id(
+    project_id: ProjectExternalIdPathDep,
+    project_external_id: Annotated[
+        str, Path(alias="project_id", description="Project external UUID")
+    ],
+    note_content_mutation_service: NoteContentMutationServiceDep,
+    note_content_materialization_provider: NoteContentMaterializationProviderDep,
+    entity_id: str = Path(..., description="Entity external ID (UUID)"),
+    base_checksum: Annotated[
+        str | None,
+        Header(
+            alias=NOTE_CONTENT_BASE_CHECKSUM_HEADER,
+            description="Optional optimistic-concurrency precondition: the "
+            "db_checksum the caller last read. A stale value rejects the delete "
+            "with a structured 409.",
+        ),
+    ] = None,
+) -> DeleteEntitiesResponse:
+    """Delete an entity by external ID.
+
+    Args:
+        entity_id: External ID (UUID string)
+
+    Returns:
+        Deletion status
+
+    Note: Returns deleted=False if entity doesn't exist (idempotent), unless
+    base_checksum pins a revision, which then refuses with a 409.
+    """
+    with logfire.span(
+        "api.request.knowledge.delete_entity",
+        entrypoint="api",
+        domain="knowledge",
+        action="delete_entity",
+    ):
+        logger.debug(f"API v2 request: delete_entity_by_id entity_id={entity_id}")
+
+        try:
+            accepted = await note_content_mutation_service.delete_note(
+                project_external_id=project_external_id,
+                entity_external_id=entity_id,
+                user_profile_id=None,
+                source="api",
+                base_checksum=base_checksum,
+            )
+        except NoteContentMutationServiceError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+        accepted = await note_content_materialization_provider.materialize_delete_change(accepted)
+        result = delete_response_from_note_content_payload(accepted.payload)
+
+        logger.debug(f"API v2 response: external_id={entity_id}, deleted={result.deleted}")
+
+        return result
+
+
+## Move endpoint
+
+
+@router.put(
+    "/entities/{entity_id}/move",
+    response_model=EntityResponseV2,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def move_entity(
+    data: MoveEntityRequestV2,
+    project_id: ProjectExternalIdPathDep,
+    project_external_id: Annotated[
+        str, Path(alias="project_id", description="Project external UUID")
+    ],
+    note_content_mutation_service: NoteContentMutationServiceDep,
+    note_content_materialization_provider: NoteContentMaterializationProviderDep,
+    relation_resolution_scheduler: RelationResolutionSchedulerDep,
+    entity_id: str = Path(..., description="Entity external ID (UUID)"),
+    base_checksum: Annotated[
+        str | None,
+        Header(
+            alias=NOTE_CONTENT_BASE_CHECKSUM_HEADER,
+            description="Optional optimistic-concurrency precondition: the "
+            "db_checksum the caller last read. A stale value rejects the move "
+            "with a structured 409.",
+        ),
+    ] = None,
+) -> EntityResponseV2:
+    """Move an entity to a new file location.
+
+    V2 API uses external_id (UUID) in the URL path for stable references.
+    The external_id will remain stable after the move.
+
+    Args:
+        project_id: Project external ID from URL path
+        entity_id: Entity external ID from URL path (primary identifier)
+        data: Move request with destination path only
+
+    Returns:
+        Updated entity with new file path
+    """
+    with logfire.span(
+        "api.request.knowledge.move_entity",
+        entrypoint="api",
+        domain="knowledge",
+        action="move_entity",
+    ):
+        logger.debug(
+            f"API v2 request: move_entity entity_id={entity_id}, destination='{data.destination_path}'"
+        )
+
+        try:
+            accepted = await note_content_mutation_service.move_note(
+                project_external_id=project_external_id,
+                entity_external_id=entity_id,
+                destination_path=data.destination_path,
+                user_profile_id=None,
+                source="api",
+                base_checksum=base_checksum,
+            )
+        except NoteContentMutationServiceError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+        accepted = await note_content_materialization_provider.materialize_write_change(accepted)
+        result = entity_response_from_note_content_payload(accepted.payload)
+        _schedule_post_write_followups(
+            relation_resolution_scheduler=relation_resolution_scheduler,
+            project_id=project_id,
+        )
+
+        logger.debug(f"API v2 response: moved external_id={entity_id} to '{data.destination_path}'")
+
+        return result
+
+
+## Move directory endpoint
+
+
+@router.post("/move-directory", response_model=DirectoryMoveResult)
+async def move_directory(
+    data: MoveDirectoryRequestV2,
+    project_id: ProjectExternalIdPathDep,
+    project_external_id: Annotated[
+        str, Path(alias="project_id", description="Project external UUID")
+    ],
+    note_content_mutation_service: NoteContentMutationServiceDep,
+    note_content_materialization_provider: NoteContentMaterializationProviderDep,
+    entity_service: EntityServiceV2ExternalDep,
+    search_service: SearchServiceV2ExternalDep,
+    vector_sync_scheduler: EntityVectorSyncSchedulerDep,
+    relation_resolution_scheduler: RelationResolutionSchedulerDep,
+    read_cache: ReadCacheDep,
+) -> DirectoryMoveResult:
+    """Move all entities in a directory to a new location.
+
+    V2 API uses project external_id in the URL path for stable references.
+    Each Markdown note moves as an accepted note move, exactly like the single
+    move endpoint; regular files move their stored bytes.
+
+    Args:
+        project_id: Project external ID from URL path
+        data: Move request with source and destination directories
+
+    Returns:
+        DirectoryMoveResult with counts and details of moved files
+    """
+    with logfire.span(
+        "api.request.knowledge.move_directory",
+        entrypoint="api",
+        domain="knowledge",
+        action="move_directory",
+    ):
+        logger.debug(
+            f"API v2 request: move_directory source='{data.source_directory}', destination='{data.destination_directory}'"
+        )
+
+        def schedule_followups(entity_id: int) -> None:
+            _schedule_post_write_followups(
+                relation_resolution_scheduler=relation_resolution_scheduler,
+                project_id=project_id,
+            )
+
+        # Trigger: a regular file (image, PDF) moved directly, with no accepted
+        #   note change and so no materialization job to embed it.
+        # Why: its search rows carry the new permalink, which is part of the chunk
+        #   text, so its vectors must be refreshed. Cloud no-ops this scheduler
+        #   because the storage event for the moved object queues that work.
+        # Outcome: one background vector sync per moved regular file.
+        def schedule_regular_file_vector_sync(entity_id: int) -> None:
+            vector_sync_scheduler.schedule_entity_vector_sync(
+                entity_id=entity_id,
+                project_id=project_id,
+            )
+
+        result = await directory_moves.move_directory(
+            source_directory=data.source_directory,
+            destination_directory=data.destination_directory,
+            project_external_id=project_external_id,
+            note_mutations=note_content_mutation_service,
+            materializer=note_content_materialization_provider,
+            entity_service=entity_service,
+            search_service=search_service,
+            read_cache=read_cache,
+            schedule_followups=schedule_followups,
+            schedule_regular_file_vector_sync=schedule_regular_file_vector_sync,
+        )
+        logger.info(
+            f"API v2 response: move_directory "
+            f"total={result.total_files}, success={result.successful_moves}, failed={result.failed_moves}"
+        )
+        return result
+
+
+## Delete directory endpoint
+
+
+@router.post("/delete-directory", response_class=Response)
+async def delete_directory(
+    data: DeleteDirectoryRequestV2,
+    project_external_id: Annotated[
+        str, Path(alias="project_id", description="Project external UUID")
+    ],
+    directory_delete_service: DirectoryDeleteServiceDep,
+    read_cache: ReadCacheDep,
+) -> Response:
+    """Delete all entities in a directory.
+
+    V2 API uses project external_id in the URL path for stable references.
+    Deletes database records first, then delegates backing-file cleanup to the
+    active runtime.
+
+    Args:
+        project_external_id: Project external ID from URL path (path alias "project_id")
+        data: Delete request with directory path
+
+    Returns:
+        JSON payload with counts and runtime file cleanup status
+    """
+    with logfire.span(
+        "api.request.knowledge.delete_directory",
+        entrypoint="api",
+        domain="knowledge",
+        action="delete_directory",
+    ):
+        logger.debug(f"API v2 request: delete_directory directory='{data.directory}'")
+
+        try:
+            result = await directory_delete_service.delete_directory(
+                project_external_id=project_external_id,
+                directory=data.directory,
+                read_cache=read_cache,
+            )
+            payload = result.to_response_payload()
+            logger.info(
+                f"API v2 response: delete_directory "
+                f"total={payload['total_files']}, "
+                f"success={payload['successful_deletes']}, "
+                f"failed={payload['failed_deletes']}, "
+                f"file_delete_status={payload['file_delete_status']}"
+            )
+            return runtime_json_response(status_code=result.http_status_code, payload=payload)
+
+        except DirectoryDeleteServiceError as error:
+            logger.error(f"Error deleting directory: {error.detail}")
+            raise HTTPException(status_code=error.status_code, detail=error.detail) from error

@@ -4,5 +4,5 @@ if not exist "%~dp0.venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-"%~dp0.venv\Scripts\python.exe" -m memweave ui --home "%~dp0work\runtime\memory home" --port 8765
+"%~dp0.venv\Scripts\python.exe" -m memweave ui --home "%USERPROFILE%\.memweave" --port 8765 --root "%~dp0."
 if errorlevel 1 pause

@@ -1,0 +1,156 @@
+"""Typed client for memory/context API operations.
+
+Encapsulates all /v2/projects/{project_id}/memory/* endpoints.
+"""
+
+from typing import Any, Optional
+
+from httpx import AsyncClient
+
+import logfire
+
+# call_* helpers live in basic_memory.mcp.tools.utils; importing that at module
+# level executes the whole tools package (fastmcp + mcp SDK) during CLI startup,
+# so each method defers the import to call time instead (#886).
+from basic_memory.schemas.memory import (
+    DEFAULT_CONTEXT_PAGE_SIZE,
+    DEFAULT_CONTEXT_RELATED_RESULTS,
+    GraphContext,
+)
+
+
+class MemoryClient:
+    """Typed client for memory context operations.
+
+    Centralizes:
+    - API path construction for /v2/projects/{project_id}/memory/*
+    - Response validation via Pydantic models
+    - Consistent error handling through call_* utilities
+
+    Usage:
+        async with get_client() as http_client:
+            client = MemoryClient(http_client, project_id)
+            context = await client.build_context("memory://specs/search")
+    """
+
+    def __init__(self, http_client: AsyncClient, project_id: str):
+        """Initialize the memory client.
+
+        Args:
+            http_client: HTTPX AsyncClient for making requests
+            project_id: Project external_id (UUID) for API calls
+        """
+        self.http_client = http_client
+        self.project_id = project_id
+        self._base_path = f"/v2/projects/{project_id}/memory"
+
+    async def build_context(
+        self,
+        path: str,
+        *,
+        depth: int = 1,
+        timeframe: Optional[str] = None,
+        page: int = 1,
+        page_size: int = DEFAULT_CONTEXT_PAGE_SIZE,
+        max_related: int = DEFAULT_CONTEXT_RELATED_RESULTS,
+        include_observations: bool = True,
+    ) -> GraphContext:
+        """Build context from a memory path.
+
+        Args:
+            path: The path to build context for (without memory:// prefix)
+            depth: How deep to traverse relations
+            timeframe: Time filter (e.g., "7d", "1 week")
+            page: Page number (1-indexed)
+            page_size: Primary results per page
+            max_related: Maximum total related items across the page
+            include_observations: Ask the server to load entity observations;
+                False skips that query for graph-shape discovery
+
+        Returns:
+            GraphContext with hierarchical results
+
+        Raises:
+            ToolError: If the request fails
+        """
+        from basic_memory.mcp.tools.utils import call_get
+
+        params: dict[str, Any] = {
+            "depth": depth,
+            "page": page,
+            "page_size": page_size,
+            "max_related": max_related,
+            "include_observations": include_observations,
+        }
+        if timeframe:
+            params["timeframe"] = timeframe
+
+        with logfire.span(
+            "mcp.client.memory.build_context",
+            client_name="memory",
+            operation="build_context",
+            page=page,
+            page_size=page_size,
+        ):
+            response = await call_get(
+                self.http_client,
+                f"{self._base_path}/{path}",
+                params=params,
+                client_name="memory",
+                operation="build_context",
+                path_template="/v2/projects/{project_id}/memory/{path}",
+            )
+        return GraphContext.model_validate(response.json())
+
+    async def recent(
+        self,
+        *,
+        timeframe: str = "7d",
+        depth: int = 1,
+        types: Optional[list[str]] = None,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> GraphContext:
+        """Get recent activity.
+
+        Args:
+            timeframe: Time filter (e.g., "7d", "1 week", "2 days ago")
+            depth: How deep to traverse relations
+            types: Filter by item types
+            page: Page number (1-indexed)
+            page_size: Results per page
+
+        Returns:
+            GraphContext with recent activity
+
+        Raises:
+            ToolError: If the request fails
+        """
+        from basic_memory.mcp.tools.utils import call_get
+
+        params: dict[str, Any] = {
+            "timeframe": timeframe,
+            "depth": depth,
+            "page": page,
+            "page_size": page_size,
+        }
+        if types:
+            # Join types as comma-separated string if provided
+            params["type"] = ",".join(types) if isinstance(types, list) else types
+
+        with logfire.span(
+            "mcp.client.memory.recent_activity",
+            client_name="memory",
+            operation="recent_activity",
+            page=page,
+            page_size=page_size,
+        ):
+            response = await call_get(
+                self.http_client,
+                f"{self._base_path}/recent",
+                params=params,
+                client_name="memory",
+                operation="recent_activity",
+                path_template="/v2/projects/{project_id}/memory/recent",
+            )
+        return GraphContext.model_validate(response.json())

@@ -1,0 +1,275 @@
+"""Portable metadata vocabulary for materialized note objects."""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Self
+from uuid import UUID
+
+from basic_memory.runtime.storage import (
+    RuntimeEntityId,
+    RuntimeNoteActorKind,
+    RuntimeNoteActorName,
+    RuntimeNoteChangeSource,
+    RuntimeNoteContentChecksum,
+    RuntimeNoteContentVersion,
+)
+
+type RuntimeNoteObjectMetadataMap = Mapping[str, str]
+
+NOTE_OBJECT_ACTOR_KIND_METADATA = "bm-actor-kind"
+# agent = a credentialed agent (for example a cloud API key) writing on a member's
+# behalf; system stays for writers the platform itself runs.
+NOTE_OBJECT_ACTOR_KIND_AGENT = "agent"
+NOTE_OBJECT_ACTOR_KIND_MCP_CLIENT = "mcp_client"
+NOTE_OBJECT_ACTOR_KIND_SYSTEM = "system"
+NOTE_OBJECT_ACTOR_NAME_METADATA = "bm-actor-name"
+NOTE_OBJECT_ACTOR_USER_PROFILE_ID_METADATA = "bm-actor-user-profile-id"
+NOTE_OBJECT_DB_CHECKSUM_METADATA = "bm-db-checksum"
+NOTE_OBJECT_DB_VERSION_METADATA = "bm-db-version"
+NOTE_OBJECT_ENTITY_ID_METADATA = "bm-entity-id"
+NOTE_OBJECT_FILE_CHECKSUM_METADATA = "bm-file-checksum"
+NOTE_OBJECT_FILE_VERSION_METADATA = "bm-file-version"
+NOTE_OBJECT_SOURCE_METADATA = "bm-note-source"
+VALID_NOTE_OBJECT_ACTOR_KINDS: frozenset[RuntimeNoteActorKind] = frozenset(
+    {
+        NOTE_OBJECT_ACTOR_KIND_AGENT,
+        NOTE_OBJECT_ACTOR_KIND_MCP_CLIENT,
+        NOTE_OBJECT_ACTOR_KIND_SYSTEM,
+    }
+)
+# Kinds that name who made a write and can be shown as its origin. system is
+# excluded: platform-run writers are identified by their change source, not by
+# a named origin.
+NOTE_OBJECT_ORIGIN_ACTOR_KINDS: frozenset[RuntimeNoteActorKind] = frozenset(
+    {
+        NOTE_OBJECT_ACTOR_KIND_AGENT,
+        NOTE_OBJECT_ACTOR_KIND_MCP_CLIENT,
+    }
+)
+# web_v2 = a note write originating from the web-v2 UI. Distinguishing it from
+# `api` lets clients tell a genuine web-UI edit apart from api/materialization
+# round-trips (e.g. the onboarding "close the loop" signal).
+# collaboration_relay = a relay service persisting a live collaboration
+# document with its service credential (issue #1445); the webhook-canonical
+# note.updated event echoes this source as the write's actor origin.
+# document_ingestion = a hosted worker accepting a deterministic document
+# extraction or ingestion-run note through the canonical note mutation path.
+# wiki_projector = the deterministic OKF projector accepting generated index
+# and log notes through that same path before materializing them as Markdown.
+# agent_runtime = a managed agent accepting a note through the canonical write
+# path; preserving it through materialization prevents recursive agent dispatch.
+VALID_NOTE_OBJECT_SOURCES: frozenset[RuntimeNoteChangeSource] = frozenset(
+    {
+        "agent_runtime",
+        "api",
+        "collaboration_relay",
+        "document_ingestion",
+        "mcp",
+        "s3_webhook",
+        "web_v2",
+        "wiki_projector",
+    }
+)
+# Named because semantic vector sync skips notes whose current accepted revision
+# the Wiki projector wrote: those generated pages are never embedded.
+NOTE_SOURCE_WIKI_PROJECTOR: RuntimeNoteChangeSource = "wiki_projector"
+# Named because the accepted-note write path special-cases relay writes: the
+# relay superseding its own prior write is never a real conflict (#1589).
+NOTE_SOURCE_COLLABORATION_RELAY: RuntimeNoteChangeSource = "collaboration_relay"
+_SAFE_ACTOR_NAME_CHARS = re.compile(r"[^A-Za-z0-9 ._()+/:-]+")
+_WHITESPACE = re.compile(r"\s+")
+_MAX_ACTOR_NAME_LENGTH = 120
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeNoteObjectMetadata:
+    """Metadata written onto a materialized note object."""
+
+    entity_id: RuntimeEntityId
+    db_version: RuntimeNoteContentVersion
+    db_checksum: RuntimeNoteContentChecksum
+    actor_user_profile_id: UUID | None = None
+    actor_kind: RuntimeNoteActorKind | None = None
+    actor_name: RuntimeNoteActorName | None = None
+    source: RuntimeNoteChangeSource | None = None
+
+    def to_storage_metadata(self) -> dict[str, str]:
+        """Convert to the string metadata shape object storage accepts."""
+        metadata = {
+            NOTE_OBJECT_ENTITY_ID_METADATA: str(self.entity_id),
+            NOTE_OBJECT_DB_VERSION_METADATA: str(self.db_version),
+            NOTE_OBJECT_DB_CHECKSUM_METADATA: self.db_checksum,
+            NOTE_OBJECT_FILE_VERSION_METADATA: str(self.db_version),
+            NOTE_OBJECT_FILE_CHECKSUM_METADATA: self.db_checksum,
+        }
+        if self.actor_user_profile_id is not None:
+            metadata[NOTE_OBJECT_ACTOR_USER_PROFILE_ID_METADATA] = str(self.actor_user_profile_id)
+        if self.actor_kind is not None:
+            metadata[NOTE_OBJECT_ACTOR_KIND_METADATA] = self.actor_kind
+        if self.actor_name is not None:
+            metadata[NOTE_OBJECT_ACTOR_NAME_METADATA] = self.actor_name
+        if self.source is not None:
+            metadata[NOTE_OBJECT_SOURCE_METADATA] = self.source
+        return metadata
+
+
+def normalize_actor_name(value: object | None) -> RuntimeNoteActorName | None:
+    """Return a storage/user-facing safe actor label, or None when empty."""
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    normalized = _WHITESPACE.sub(" ", raw)
+    normalized = _SAFE_ACTOR_NAME_CHARS.sub("", normalized).strip()
+    return normalized[:_MAX_ACTOR_NAME_LENGTH] or None
+
+
+def actor_user_profile_id_from_object_metadata(
+    metadata: RuntimeNoteObjectMetadataMap | None,
+) -> str | None:
+    """Return the actor id explicitly written onto a note object."""
+    if not metadata:
+        return None
+
+    value = metadata.get(NOTE_OBJECT_ACTOR_USER_PROFILE_ID_METADATA)
+    if value is None:
+        return None
+
+    stripped = value.strip()
+    return stripped or None
+
+
+def actor_kind_from_object_metadata(
+    metadata: RuntimeNoteObjectMetadataMap | None,
+) -> RuntimeNoteActorKind | None:
+    """Return the typed origin kind written onto a note object."""
+    if not metadata:
+        return None
+
+    value = metadata.get(NOTE_OBJECT_ACTOR_KIND_METADATA)
+    if value is None:
+        return None
+
+    stripped = value.strip()
+    if stripped in VALID_NOTE_OBJECT_ACTOR_KINDS:
+        return stripped
+    return None
+
+
+def actor_name_from_object_metadata(
+    metadata: RuntimeNoteObjectMetadataMap | None,
+) -> RuntimeNoteActorName | None:
+    """Return the user-facing origin label written onto a note object."""
+    if not metadata:
+        return None
+
+    return normalize_actor_name(metadata.get(NOTE_OBJECT_ACTOR_NAME_METADATA))
+
+
+def file_checksum_from_object_metadata(
+    metadata: RuntimeNoteObjectMetadataMap | None,
+) -> RuntimeNoteContentChecksum | None:
+    """Return the sha256 of the note markdown mirrored onto a note object (bm-file-checksum).
+
+    This is a content checksum. It is never comparable with a storage checksum such as
+    an S3 ETag.
+    """
+    if not metadata:
+        return None
+
+    value = metadata.get(NOTE_OBJECT_FILE_CHECKSUM_METADATA)
+    if value is None:
+        return None
+
+    stripped = value.strip()
+    return stripped or None
+
+
+def db_version_from_object_metadata(
+    metadata: RuntimeNoteObjectMetadataMap | None,
+) -> RuntimeNoteContentVersion | None:
+    """Return the accepted DB version mirrored onto a materialized note object."""
+    if not metadata:
+        return None
+
+    value = metadata.get(NOTE_OBJECT_DB_VERSION_METADATA)
+    if value is None:
+        return None
+
+    try:
+        version = int(value.strip())
+    except ValueError:
+        return None
+    return version if version > 0 else None
+
+
+def source_from_object_metadata(
+    metadata: RuntimeNoteObjectMetadataMap | None,
+) -> RuntimeNoteChangeSource | None:
+    """Return the original write source mirrored onto a note object."""
+    if not metadata:
+        return None
+
+    value = metadata.get(NOTE_OBJECT_SOURCE_METADATA)
+    if value is None:
+        return None
+
+    stripped = value.strip()
+    if stripped in VALID_NOTE_OBJECT_SOURCES:
+        return stripped
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeNoteObjectProvenance:
+    """Trusted actor and source metadata parsed from a materialized note object."""
+
+    actor_user_profile_id: str | None = None
+    actor_kind: RuntimeNoteActorKind | None = None
+    actor_name: RuntimeNoteActorName | None = None
+    source: RuntimeNoteChangeSource | None = None
+    # The accepted DB version mirrored onto the object (#1589): lets index-path
+    # live updates carry the monotonic version so consumers can decide
+    # echo-vs-out-of-band by arithmetic instead of checksum comparison.
+    db_version: RuntimeNoteContentVersion | None = None
+
+    @classmethod
+    def from_object_metadata(cls, metadata: RuntimeNoteObjectMetadataMap | None) -> Self:
+        actor_kind = actor_kind_from_object_metadata(metadata)
+        actor_name = actor_name_from_object_metadata(metadata) if actor_kind is not None else None
+        return cls(
+            actor_user_profile_id=actor_user_profile_id_from_object_metadata(metadata),
+            actor_kind=actor_kind,
+            actor_name=actor_name,
+            source=source_from_object_metadata(metadata),
+            db_version=db_version_from_object_metadata(metadata),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeNoteActorOrigin:
+    """User-facing origin (an MCP client or a credentialed agent) for live updates.
+
+    Built from server-written object metadata, which is trusted only after checksum
+    validation accepts it (#1589).
+    """
+
+    actor_kind: RuntimeNoteActorKind
+    actor_name: RuntimeNoteActorName
+
+    @classmethod
+    def from_actor_metadata(
+        cls,
+        *,
+        actor_kind: RuntimeNoteActorKind | None,
+        actor_name: RuntimeNoteActorName | None,
+    ) -> Self | None:
+        if actor_kind not in NOTE_OBJECT_ORIGIN_ACTOR_KINDS or not actor_name:
+            return None
+        return cls(actor_kind=actor_kind, actor_name=actor_name)

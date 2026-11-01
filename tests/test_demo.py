@@ -18,11 +18,11 @@ class DemoTests(unittest.IsolatedAsyncioTestCase):
                 output = await run_demo(home, root)
             self.assertTrue(output["data"]["restart_readback"])
             self.assertTrue(output["data"]["forgotten_verified"])
-            service = Service(home)
-            task = service.task_read(output["data"]["task_id"])
-            self.assertEqual(task["status"], "completed")
-            self.assertEqual(task["verification"], "host_reported")
-            self.assertEqual(len(service.memory_search(output["data"]["project_id"], "接续")["items"]), 1)
+            with Service(home) as service:
+                task = service.task_read(output["data"]["task_id"])
+                self.assertEqual(task["status"], "completed")
+                self.assertEqual(task["verification"], "host_reported")
+                self.assertEqual(len(service.memory_search(output["data"]["project_id"], "接续")["items"]), 1)
             self.assertIn("演示", service.vault.read(output["data"]["architecture_id"])["title"])
 
 

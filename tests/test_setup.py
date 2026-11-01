@@ -39,16 +39,53 @@ class SetupTests(unittest.TestCase):
         first = self.command("setup")["data"]
         self.assertEqual(first["state"], "installed")
         self.assertTrue((self.cursor / "skills/memweave-continuity/SKILL.md").is_file())
+        self.assertIn(
+            "MemWeave · 尚未建立任务",
+            (self.cursor / "skills/memweave-continuity/SKILL.md").read_text(encoding="utf-8"),
+        )
+        skill_text = (self.cursor / "skills/memweave-continuity/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("do not end the turn merely to report an intermediate milestone", skill_text)
         self.assertTrue((self.cursor / "rules/memweave.mdc").is_file())
-        self.assertEqual(len(json.loads((self.cursor / "hooks.json").read_text())["hooks"]), 6)
+        ignore = (self.cursor / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("/mcp.json", ignore)
+        self.assertIn("/skills/memweave-continuity/", ignore)
+        self.assertIn("/rules/memweave.mdc", ignore)
+        rule_text = (self.cursor / "rules/memweave.mdc").read_text(encoding="utf-8")
+        self.assertIn("不因完成一个子步骤或保存检查点就交回控制权", rule_text)
+        mcp = json.loads((self.cursor / "mcp.json").read_text(encoding="utf-8"))
+        self.assertNotIn("--toolset", mcp["mcpServers"]["memweave"]["args"])
+        manifest = json.loads((self.cursor / "memweave.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["toolset"], "universal")
+        installed_hooks = json.loads((self.cursor / "hooks.json").read_text())["hooks"]
+        self.assertEqual(set(installed_hooks), {"sessionStart", "sessionEnd"})
+        self.assertFalse(
+            {"preCompact", "afterMCPExecution", "afterFileEdit"} & set(installed_hooks)
+        )
         snapshot = self.snapshot()
         repeated = self.command("setup")["data"]
         self.assertEqual(repeated["state"], "up_to_date")
         self.assertEqual(snapshot, self.snapshot())
         healthy = self.command("check")["data"]
         self.assertEqual(healthy["state"], "ready")
-        self.assertEqual(healthy["tool_count"], 20)
+        self.assertEqual(healthy["tool_count"], 22)
         self.assertEqual(healthy["desktop_verification"], "unverified")
+        self.assertIn("同一项目后续会话", " ".join(healthy.get("required_actions", [])))
+        self.assertIn("不代表模型已收到", " ".join(healthy.get("required_actions", [])))
+
+    def test_setup_merges_cursor_local_ignore_without_overwriting_existing_rules(self):
+        self.cursor.mkdir()
+        ignore = self.cursor / ".gitignore"
+        ignore.write_text("custom-local-rule\n", encoding="utf-8")
+
+        self.command("setup")
+
+        content = ignore.read_text(encoding="utf-8")
+        self.assertIn("custom-local-rule\n", content)
+        self.assertIn("/mcp.json\n", content)
+        self.assertIn("/memweave.json\n", content)
+        repeated = self.command("setup")["data"]
+        self.assertEqual(repeated["state"], "up_to_date")
+        self.assertEqual(content, ignore.read_text(encoding="utf-8"))
 
     def test_merge_preserves_unrelated_servers_hooks_and_settings_and_backs_up(self):
         original = {"mcpServers": {"other": {"command": "other.exe"}}, "custom": {"keep": True}}
@@ -66,17 +103,17 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(hooks["custom"], "keep")
         backups = Path(installed["backup_directory"])
         self.assertEqual(json.loads((backups / "mcp.json").read_text()), original)
-        self.command("setup", "--toolset", "full")
+        self.command("setup")
         hooks = json.loads((self.cursor / "hooks.json").read_text())
-        self.assertEqual(len(hooks["hooks"]["stop"]), 2)
-        self.assertEqual(self.command("check")["data"]["tool_count"], 27)
+        self.assertEqual(len(hooks["hooks"]["stop"]), 1)
+        self.assertEqual(self.command("check")["data"]["tool_count"], 22)
 
     def test_modified_skill_is_preserved_and_update_conflicts_before_config_writes(self):
         self.command("setup")
         skill = self.cursor / "skills/memweave-continuity/SKILL.md"
         skill.write_text("user custom skill", encoding="utf-8")
         before = self.snapshot()
-        error = self.command("setup", "--toolset", "full", success=False)
+        error = self.command("setup", success=False)
         self.assertEqual(error["error"]["code"], "SETUP_CONFLICT")
         self.assertEqual(before, self.snapshot())
         checked = self.command("check", success=False)["data"]
@@ -101,7 +138,7 @@ class SetupTests(unittest.TestCase):
     def test_check_detects_missing_hook_and_does_not_repair_it_implicitly(self):
         self.command("setup")
         hooks = json.loads((self.cursor / "hooks.json").read_text())
-        hooks["hooks"].pop("stop")
+        hooks["hooks"].pop("sessionEnd")
         self.write_json(self.cursor / "hooks.json", hooks)
         before = self.snapshot()
         checked = self.command("check", success=False)["data"]
@@ -109,6 +146,25 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(before, self.snapshot())
         self.command("setup")
         self.assertEqual(self.command("check")["data"]["state"], "ready")
+
+    def test_setup_removes_legacy_high_frequency_hook_inventory(self):
+        self.command("setup")
+        hooks_path = self.cursor / "hooks.json"
+        manifest_path = self.cursor / "memweave.json"
+        hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy_edit = {"command": "python -m memweave hook --client cursor --event afterFileEdit"}
+        legacy_stop = {"command": "python -m memweave hook --client cursor --event stop"}
+        hooks["hooks"]["afterFileEdit"] = [legacy_edit]
+        hooks["hooks"]["stop"] = [legacy_stop]
+        manifest["hooks"]["afterFileEdit"] = [legacy_edit]
+        manifest["hooks"]["stop"] = [legacy_stop]
+        self.write_json(hooks_path, hooks)
+        self.write_json(manifest_path, manifest)
+        self.assertEqual(self.command("check", success=False)["data"]["state"], "needs_attention")
+        self.command("setup")
+        repaired = json.loads(hooks_path.read_text(encoding="utf-8"))["hooks"]
+        self.assertEqual(set(repaired), {"sessionStart", "sessionEnd"})
 
     def test_probe_uses_configured_stdio_without_creating_business_tasks(self):
         self.command("setup")
@@ -138,7 +194,7 @@ class SetupTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn(str(self.root), completed.stdout)
-            self.assertIn("20", completed.stdout)
+            self.assertIn("22", completed.stdout)
             self.assertFalse(completed.stdout.lstrip().startswith("{"))
 
     def test_update_reuses_recorded_home_and_refreshes_old_resource_version(self):

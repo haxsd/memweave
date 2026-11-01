@@ -251,20 +251,26 @@ class ProjectMap:
         return {"path": relative, "hash": source["hash"], "content": text[:max_chars],
                 "truncated": len(text) > max_chars, "generation": scan["generation"]}
 
-    def write(self, project_id: str, operation_id: str, title: str, body: str,
-              sources: list, relations: list) -> dict:
-        self._root(project_id)
-        validate_text(title, "title", 500)
-        validate_text(body, "body", 100000)
+    def _normalize_sources(self, sources: list) -> list:
         if not isinstance(sources, list) or not 1 <= len(sources) <= 100:
             raise DiagnosticError("RECORD_INVALID", "Architecture records need 1–100 source references.")
+        normalized = []
+        for source in sources:
+            if (
+                not isinstance(source, dict)
+                or not isinstance(source.get("path"), str)
+                or not isinstance(source.get("hash"), str)
+            ):
+                raise DiagnosticError("RECORD_INVALID", "Each source needs a path and hash.")
+            validate_text(source["path"], "source.path", 2000)
+            validate_text(source["hash"], "source.hash", 64)
+            normalized.append({"path": source["path"], "hash": source["hash"]})
+        return normalized
+
+    def _normalize_relations(self, relations: list) -> list:
         if not isinstance(relations, list) or len(relations) > 100:
             raise DiagnosticError("RECORD_INVALID", "relations must be a list of at most 100 relations.")
-        for source in sources:
-            if not isinstance(source, dict) or not isinstance(source.get("hash"), str):
-                raise DiagnosticError("RECORD_INVALID", "Each source needs a path and hash.")
-            validate_text(source.get("path"), "source.path", 2000)
-        normalized_relations = []
+        normalized = []
         for relation in relations:
             if not isinstance(relation, dict):
                 raise DiagnosticError("RECORD_INVALID", "Each relation must be an object.")
@@ -280,18 +286,61 @@ class ProjectMap:
             certainty = relation.get("certainty", "inferred")
             if certainty not in ("inferred", "confirmed"):
                 raise DiagnosticError("RECORD_INVALID", "Relation certainty must be inferred or confirmed.")
-            normalized_relations.append({
+            normalized.append({
                 "source": relation["source"], "target": relation["target"],
                 "relation": kind, "evidence_kind": evidence_kind, "certainty": certainty,
             })
+        return normalized
+
+    def _checked_sources(self, project_id: str, sources: list) -> list:
+        checked = []
+        for source in sources:
+            evidence = self.evidence(project_id, source["path"], 1)
+            if evidence["hash"] != source["hash"]:
+                raise DiagnosticError("SOURCE_CHANGED", "Architecture source hash is not current.")
+            checked.append({"path": evidence["path"], "hash": evidence["hash"]})
+        return checked
+
+    def _architecture(self, project_id: str, architecture_id: str) -> dict:
+        validate_text(architecture_id, "architecture_id", 100)
+        record = self.vault.read(architecture_id)
+        if record["type"] != "architecture":
+            raise DiagnosticError("SCOPE_DENIED", "Record is not architecture evidence.")
+        if record.get("project_id") != project_id:
+            raise DiagnosticError("SCOPE_DENIED", "Architecture record belongs to a different project.")
+        return record
+
+    @staticmethod
+    def _stale_reasons(record: dict, files: dict, live_hashes: dict) -> list:
+        sources = record.get("sources", [])
+        if not sources:
+            return ["missing_sources"]
+        reasons = []
+        for source in sources:
+            if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+                reasons.append("invalid_source")
+                continue
+            path = source["path"]
+            if not isinstance(source.get("hash"), str):
+                reasons.append("invalid_source")
+            elif path not in files:
+                reasons.append("source_not_scanned")
+            elif live_hashes.get(path) is None:
+                reasons.append("source_unavailable")
+            elif live_hashes[path] != source["hash"]:
+                reasons.append("source_hash_changed")
+        return sorted(set(reasons))
+
+    def write(self, project_id: str, operation_id: str, title: str, body: str,
+              sources: list, relations: list) -> dict:
+        self._root(project_id)
+        validate_text(title, "title", 500)
+        validate_text(body, "body", 100000)
+        sources = self._normalize_sources(sources)
+        normalized_relations = self._normalize_relations(relations)
 
         def build():
-            checked = []
-            for source in sources:
-                evidence = self.evidence(project_id, source["path"], 1)
-                if evidence["hash"] != source["hash"]:
-                    raise DiagnosticError("SOURCE_CHANGED", "Architecture source hash is not current.")
-                checked.append({"path": evidence["path"], "hash": evidence["hash"]})
+            checked = self._checked_sources(project_id, sources)
             record_id = "architecture_" + uuid4().hex
             record = {
                 "id": record_id, "type": "architecture", "scope": "project",
@@ -301,13 +350,102 @@ class ProjectMap:
                 "source_type": "host_reported",
             }
             return [{"record": record, "path": f"architecture/{record_id}.md", "expected": None}], {
-                "id": record_id, "revision": 1, "etag": digest(encode_record(record).encode("utf-8")),
+                "id": record_id, "revision": 1,
+                "etag": digest(encode_record(record).encode("utf-8")),
+                "path": f"architecture/{record_id}.md",
             }
 
         return self.vault.commit(operation_id, {
             "action": "project_write", "project_id": project_id, "title": title,
             "body": body, "sources": sources, "relations": relations,
         }, build)
+
+    def update(self, project_id: str, operation_id: str, architecture_id: str,
+               expected_revision: int, expected_etag: str, title: str, body: str,
+               sources: list, relations: list) -> dict:
+        self._root(project_id)
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise DiagnosticError("RECORD_INVALID", "expected_revision must be a positive integer.")
+        text_etag = expected_etag
+        validate_text(text_etag, "expected_etag", 64)
+        validate_text(title, "title", 500)
+        validate_text(body, "body", 100000)
+        title, body = title.strip(), body.strip()
+        sources = self._normalize_sources(sources)
+        normalized_relations = self._normalize_relations(relations)
+
+        def build():
+            old = self._architecture(project_id, architecture_id)
+            if old["revision"] != expected_revision or old["etag"] != expected_etag:
+                raise DiagnosticError("VERSION_CONFLICT", "Read the latest architecture revision and etag.")
+            checked = self._checked_sources(project_id, sources)
+            updated = {
+                **old, "title": title, "body": body, "sources": checked,
+                "relations": normalized_relations, "revision": old["revision"] + 1,
+                "updated_at": now(),
+            }
+            return [{"record": updated, "path": old["path"], "expected": old["etag"]}], {
+                "id": architecture_id, "revision": updated["revision"],
+                "etag": digest(encode_record(updated).encode("utf-8")),
+                "path": old["path"], "status": updated.get("status", "active"),
+            }
+
+        return self.vault.commit(operation_id, {
+            "action": "project_update", "project_id": project_id,
+            "architecture_id": architecture_id, "expected_revision": expected_revision,
+            "expected_etag": expected_etag, "title": title, "body": body,
+            "sources": sources, "relations": normalized_relations,
+        }, build)
+
+    def forget(self, project_id: str, operation_id: str, architecture_id: str,
+               expected_revision: int, expected_etag: str) -> dict:
+        self._root(project_id)
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise DiagnosticError("RECORD_INVALID", "expected_revision must be a positive integer.")
+        validate_text(expected_etag, "expected_etag", 64)
+
+        def build():
+            old = self._architecture(project_id, architecture_id)
+            if old["revision"] != expected_revision or old["etag"] != expected_etag:
+                raise DiagnosticError("VERSION_CONFLICT", "Read the latest architecture revision and etag.")
+            return [{"record": None, "id": architecture_id, "path": old["path"],
+                     "expected": old["etag"]}], {
+                "id": architecture_id, "deleted": True, "path": old["path"],
+                "previous_revision": old["revision"],
+            }
+
+        return self.vault.commit(operation_id, {
+            "action": "project_forget", "project_id": project_id,
+            "architecture_id": architecture_id, "expected_revision": expected_revision,
+            "expected_etag": expected_etag,
+        }, build)
+
+    def architecture_status(self, project_id: str) -> dict:
+        root = self._root(project_id)
+        files, scan = self._snapshot(project_id)
+        live_hashes = {}
+        records = self.vault.list_records("architecture", project_id, "project")
+        stale_ids = []
+        for record in records:
+            for source in record.get("sources", []):
+                if (
+                    isinstance(source, dict)
+                    and isinstance(source.get("path"), str)
+                    and source["path"] not in live_hashes
+                ):
+                    try:
+                        live_hashes[source["path"]] = digest(self._read(root, source["path"]))
+                    except DiagnosticError:
+                        live_hashes[source["path"]] = None
+            if self._stale_reasons(record, files, live_hashes):
+                stale_ids.append(record["id"])
+        return {
+            "total": len(records),
+            "active": sum(record.get("status") == "active" for record in records),
+            "stale": len(stale_ids),
+            "stale_record_ids": sorted(stale_ids),
+            "generation": scan["generation"] if scan else 0,
+        }
 
     def query(self, project_id: str, query: str = "", limit: int = 100,
               include_stale: bool = False, prefer_architecture: bool = False) -> dict:
@@ -347,12 +485,8 @@ class ProjectMap:
         stale_records = 0
         for record in self.vault.list_records("architecture", project_id, "project"):
             sources = record.get("sources", [])
-            stale = not sources or any(
-                not isinstance(source, dict)
-                or live_hashes.get(source.get("path")) != source.get("hash")
-                or source.get("path") not in files
-                for source in sources
-            )
+            stale_reasons = self._stale_reasons(record, files, live_hashes)
+            stale = bool(stale_reasons)
             if stale:
                 stale_records += 1
             if (stale or record.get("status") != "active") and not include_stale:
@@ -363,6 +497,9 @@ class ProjectMap:
                 "title": record.get("title", ""), "body": record.get("body", ""),
                 "path": record["path"], "status": status, "sources": sources,
                 "source_type": record.get("source_type", "host_reported"),
+                "revision": record.get("revision"), "etag": record.get("etag"),
+                "stale_reasons": stale_reasons,
+                "relations": record.get("relations", [])[:100],
             }
             for relation in record.get("relations", [])[:100]:
                 if not isinstance(relation, dict) or not all(

@@ -23,7 +23,7 @@ $registration = @{root=$projectRoot; name='my-project'; operation_id='manual-reg
 $registration | & '.\.venv\Scripts\python.exe' -m memweave call project_register --home $memoryHome
 ```
 
-两个客户端共享同一个 `$memoryHome`。登记只建立精确根目录，不创建任务或自动扫描。
+两个客户端共享同一个 `$memoryHome`。登记建立项目；同一 Git 仓库的 linked worktree 会复用该项目，不创建第二个项目、任务或自动扫描。
 
 ## 3. 配置 MCP、Skill 与 Hooks
 
@@ -55,6 +55,14 @@ Codex 必须由宿主接受项目配置，再审查并信任 Hook 定义；支�
 ```
 
 协议自检通过后，在实际客户端读取状态和 `workspace_prepare(intent="inspect")`。确认版本、工具集、根目录与记忆库，再使用真实任务观察开始、执行检查点、完成提炼和后续复用。配置检查或 SDK 成功不能代替桌面自动触发验证。
+
+接入多个项目或怀疑旧记忆库仍在生效时，运行全机巡检：
+
+```powershell
+& '.\.venv\Scripts\python.exe' -m memweave clients doctor --home $memoryHome
+```
+
+需要追加未被活动库登记的项目时重复传入 `--root`。项目级可修复问题可加 `--fix`；命令复用 `setup` 并保留备份，不会修改全局客户端配置，也不会覆盖人工修改的受管资源。修复后重新加载客户端。
 
 ## 5. 更新
 

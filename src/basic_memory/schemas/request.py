@@ -1,0 +1,180 @@
+"""Request schemas for interacting with the knowledge graph."""
+
+from typing import Any, List, Optional, Annotated, Literal
+from annotated_types import MaxLen, MinLen
+
+from pydantic import BaseModel, field_validator, model_validator
+
+from basic_memory.schemas.base import (
+    Relation,
+    Permalink,
+)
+
+
+class SearchNodesRequest(BaseModel):
+    """Search for entities in the knowledge graph.
+
+    The search looks across multiple fields:
+    - Entity title
+    - Entity types
+    - summary
+    - file content
+    - Observations
+
+    Features:
+    - Case-insensitive matching
+    - Partial word matches
+    - Returns full entity objects with relations
+    - Includes all matching entities
+    - If a category is specified, only entities with that category are returned
+
+    Example Queries:
+    - "memory" - Find entities related to memory systems
+    - "SQLite" - Find database-related components
+    - "test" - Find test-related entities
+    - "implementation" - Find concrete implementations
+    - "service" - Find service components
+
+    Note: Currently uses SQL ILIKE for matching. Wildcard (*) searches
+    and full-text search capabilities are planned for future versions.
+    """
+
+    query: Annotated[str, MinLen(1), MaxLen(200)]
+    category: Optional[str] = None
+
+
+class GetEntitiesRequest(BaseModel):
+    """Retrieve specific entities by their IDs.
+
+    Used to load complete entity details including all observations
+    and relations. Particularly useful for following relations
+    discovered through search.
+    """
+
+    permalinks: Annotated[List[Permalink], MinLen(1), MaxLen(10)]
+
+
+class CreateRelationsRequest(BaseModel):
+    relations: List[Relation]
+
+
+class EditEntityRequest(BaseModel):
+    """Request schema for editing an existing entity's content.
+
+    This allows for targeted edits without requiring the full entity content.
+    Supports various operation types for different editing scenarios.
+    """
+
+    operation: Literal[
+        "append",
+        "prepend",
+        "find_replace",
+        "replace_section",
+        "insert_before_section",
+        "insert_after_section",
+        # Frontmatter only: `metadata` is merged and the body is left byte for byte.
+        "set_metadata",
+    ]
+    content: str
+    section: Optional[str] = None
+    find_text: Optional[str] = None
+    expected_replacements: int = 1
+    # replace_section boundary control (issue #1012): True replaces the whole
+    # level-aware section including subsections; False stops at the first heading
+    # of any level, preserving them.
+    replace_subsections: bool = True
+    # Frontmatter fields to merge, independent of `operation` (issue #1011). Set/overwrite
+    # semantics: provided keys overwrite existing values, unrelated keys and the body are
+    # untouched. title/permalink are ignored — they have their own resolution paths.
+    metadata: Optional[dict[str, Any]] = None
+
+    @field_validator("section")
+    @classmethod
+    def validate_section_for_replace_section(cls, v, info):
+        """Ensure section is provided for replace_section operation."""
+        if (
+            info.data.get("operation")
+            in (
+                "replace_section",
+                "insert_before_section",
+                "insert_after_section",
+            )
+            and not v
+        ):
+            raise ValueError("section parameter is required for section-based operations")
+        return v
+
+    @field_validator("find_text")
+    @classmethod
+    def validate_find_text_for_find_replace(cls, v, info):
+        """Ensure find_text is provided for find_replace operation."""
+        if info.data.get("operation") == "find_replace" and not v:
+            raise ValueError("find_text parameter is required for find_replace operation")
+        return v
+
+    @model_validator(mode="after")
+    def validate_set_metadata(self) -> "EditEntityRequest":
+        """set_metadata changes frontmatter only, so it needs metadata and no content."""
+        if self.operation != "set_metadata":
+            return self
+        if not self.metadata:
+            raise ValueError("metadata is required for set_metadata")
+        if self.content:
+            raise ValueError("set_metadata changes frontmatter only; content must be empty")
+        # The frontmatter merge keeps a note's identity out of metadata, so these keys
+        # would be acknowledged and never applied.
+        identity_keys = sorted({"title", "permalink"} & set(self.metadata))
+        if identity_keys:
+            raise ValueError(
+                f"set_metadata cannot change {', '.join(identity_keys)}; those are the "
+                "note's identity"
+            )
+        return self
+
+
+class MoveEntityRequest(BaseModel):
+    """Request schema for moving an entity to a new file location.
+
+    This allows moving notes to different paths while maintaining project
+    consistency and optionally updating permalinks based on configuration.
+    """
+
+    identifier: Annotated[str, MinLen(1), MaxLen(200)]
+    destination_path: Annotated[str, MinLen(1), MaxLen(500)]
+    project: Optional[str] = None
+
+    @field_validator("destination_path")
+    @classmethod
+    def validate_destination_path(cls, v):
+        """Ensure destination path is relative and valid."""
+        if v.startswith("/"):
+            raise ValueError("destination_path must be relative, not absolute")
+        if ".." in v:
+            raise ValueError("destination_path cannot contain '..' path components")
+        if not v.strip():
+            raise ValueError("destination_path cannot be empty or whitespace only")
+        return v.strip()
+
+
+class MoveDirectoryRequest(BaseModel):
+    """Request schema for moving an entire directory to a new location.
+
+    This moves all entities within a directory to a new location while
+    maintaining project consistency and updating database references.
+    """
+
+    source_directory: Annotated[str, MinLen(1), MaxLen(500)]
+    destination_directory: Annotated[str, MinLen(1), MaxLen(500)]
+    project: Optional[str] = None
+
+    @field_validator("source_directory", "destination_directory")
+    @classmethod
+    def validate_directory_path(cls, v):
+        """Ensure directory path is relative and valid."""
+        if v.startswith("/"):  # pragma: no cover
+            raise ValueError("directory path must be relative, not absolute")
+        if ".." in v:  # pragma: no cover
+            raise ValueError("directory path cannot contain '..' path components")
+        if not v.strip():  # pragma: no cover
+            raise ValueError("directory path cannot be empty or whitespace only")
+        return v.strip()

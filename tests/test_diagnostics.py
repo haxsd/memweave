@@ -97,6 +97,19 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(status["hook_receipt_count"], 1)
         self.assertEqual(status["clients"]["cursor"]["desktop_verification"], "unverified")
 
+    def test_empty_optional_hook_identifiers_are_omitted(self):
+        self.service.initialize()
+        self.service.record_hook(
+            "cursor",
+            "sessionStart",
+            {"conversation_id": "session-1", "generation_id": "", "session_id": "session-1"},
+        )
+        with closing(sqlite3.connect(self.home / "index" / "memory.sqlite3")) as connection:
+            metadata = json.loads(
+                connection.execute("SELECT metadata FROM hook_receipts").fetchone()[0]
+            )
+        self.assertEqual(metadata, {"conversation_id": "session-1", "session_id": "session-1"})
+
     def test_unknown_hook_event_cannot_be_silently_recorded(self):
         self.service.initialize()
         with self.assertRaises(DiagnosticError) as caught:

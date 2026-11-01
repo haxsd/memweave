@@ -53,7 +53,20 @@ class WebTests(unittest.TestCase):
     def test_html_is_served_with_local_only_browser_policy(self):
         status, headers, body = self.request("GET", "/?token=secret", authenticated=False)
         self.assertEqual(status, 200)
-        self.assertIn("MemWeave", body.decode("utf-8"))
+        html = body.decode("utf-8")
+        self.assertIn("MemWeave", html)
+        self.assertIn("当前任务范围", html)
+        self.assertIn("用户范围 · 跨项目", html)
+        self.assertIn("Markdown 存放在 %USERPROFILE%", html)
+        self.assertIn("全局记忆状态", html)
+        self.assertIn("架构已核对", html)
+        self.assertIn("当前项目记忆状态", html)
+        self.assertIn("纠正架构", html)
+        self.assertIn("遗忘架构", html)
+        self.assertIn("重新扫描并同步当前来源哈希", html)
+        self.assertIn("当前任务接续摘要", html)
+        self.assertIn("memweave-project-id", html)
+        self.assertIn('id="workspace-v2"', html)
         self.assertIn("text/html", headers["Content-Type"])
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
@@ -92,6 +105,15 @@ class WebTests(unittest.TestCase):
         self.assertEqual(parse_qs(parsed.query)["token"], [self.server.token])
         self.assertGreaterEqual(len(self.server.token), 32)
         self.assertNotEqual(self.server.token, other.token)
+
+    def test_server_url_can_carry_a_project_scope_hint(self):
+        root = Path(self.temporary.name) / "project scope"
+        root.mkdir()
+        server = create_http_server(self.service, port=0, preferred_root=root)
+        self.addCleanup(server.server_close)
+        query = parse_qs(urlsplit(server.url).query)
+        self.assertEqual(query["project"], [str(root.resolve())])
+        self.assertEqual(query["token"], [server.token])
 
     def test_host_and_origin_are_checked_before_serving_html_or_api(self):
         port = self.server.server_port
@@ -144,6 +166,102 @@ class WebTests(unittest.TestCase):
         status, _, body = self.post("status", {"unexpected": "parameter"})
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["code"], "RECORD_INVALID")
+
+    def test_project_status_and_architecture_lifecycle_use_web_actions(self):
+        root = Path(self.temporary.name) / "project"
+        root.mkdir()
+        project = self.post("project_register", {
+            "root": str(root), "name": "web graph", "operation_id": "web-project",
+        })
+        self.assertEqual(project[0], 200)
+        project_id = project[2]["data"]["id"]
+        source_file = root / "main.py"
+        source_file.write_text("print('v1')\n", encoding="utf-8")
+        scan = self.post("project_scan", {"project_id": project_id, "operation_id": "web-scan"})
+        self.assertEqual(scan[0], 200)
+        source = self.post("evidence_read", {"project_id": project_id, "path": "main.py"})
+        self.assertEqual(source[0], 200)
+        source_hash = source[2]["data"]["hash"]
+        written = self.post("graph_write", {
+            "project_id": project_id, "operation_id": "web-architecture",
+            "title": "入口架构", "body": "main.py 是入口",
+            "sources": [{"path": "main.py", "hash": source_hash}],
+            "relations": [{
+                "source": "self", "target": "file:main.py", "relation": "describes",
+                "evidence_kind": "host_reported", "certainty": "confirmed",
+            }],
+        })
+        self.assertEqual(written[0], 200)
+        architecture = written[2]["data"]
+        status, _, body = self.post("status", {"project_id": project_id})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["data"]["project"]["architecture"]["total"], 1)
+        self.assertEqual(body["data"]["project"]["architecture"]["stale"], 0)
+
+        source_file.write_text("print('v2')\n", encoding="utf-8")
+        status, _, body = self.post("status", {"project_id": project_id})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["data"]["project"]["architecture"]["stale"], 1)
+        queried = self.post("graph_query", {
+            "project_id": project_id, "query": "入口架构", "limit": 100,
+            "include_stale": True,
+        })
+        stale_node = next(
+            item for item in queried[2]["data"]["nodes"]
+            if item["id"] == architecture["id"]
+        )
+        self.assertEqual(stale_node["revision"], 1)
+        self.assertEqual(stale_node["etag"], architecture["etag"])
+        self.assertEqual(stale_node["stale_reasons"], ["source_hash_changed"])
+        self.assertEqual(stale_node["relations"], [{
+            "source": "self", "target": "file:main.py", "relation": "describes",
+            "evidence_kind": "host_reported", "certainty": "confirmed",
+        }])
+
+        rejected = self.post("graph_update", {
+            "project_id": project_id, "operation_id": "web-architecture-stale-update",
+            "architecture_id": architecture["id"], "expected_revision": 1,
+            "expected_etag": architecture["etag"], "title": "入口架构 v2",
+            "body": "main.py 仍是入口",
+            "sources": [{"path": "main.py", "hash": source_hash}], "relations": [],
+        })
+        self.assertEqual(rejected[0], 400)
+        self.assertEqual(rejected[2]["error"]["code"], "SOURCE_CHANGED")
+
+        self.post("project_scan", {"project_id": project_id, "operation_id": "web-rescan"})
+        refreshed = self.post("evidence_read", {"project_id": project_id, "path": "main.py"})
+        updated = self.post("graph_update", {
+            "project_id": project_id, "operation_id": "web-architecture-update",
+            "architecture_id": architecture["id"], "expected_revision": 1,
+            "expected_etag": architecture["etag"], "title": "入口架构 v2",
+            "body": "main.py 仍是入口",
+            "sources": [{"path": "main.py", "hash": refreshed[2]["data"]["hash"]}],
+            "relations": stale_node["relations"],
+        })
+        self.assertEqual(updated[0], 200)
+        updated_node = updated[2]["data"]
+        self.assertEqual(updated_node["revision"], 2)
+        status, _, body = self.post("status", {"project_id": project_id})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["data"]["project"]["architecture"]["stale"], 0)
+
+        forgotten = self.post("graph_forget", {
+            "project_id": project_id, "operation_id": "web-architecture-forget",
+            "architecture_id": architecture["id"], "expected_revision": 2,
+            "expected_etag": updated_node["etag"],
+        })
+        self.assertEqual(forgotten[0], 200)
+        self.assertTrue(forgotten[2]["data"]["deleted"])
+        status, _, body = self.post("status", {"project_id": project_id})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["data"]["project"]["architecture"]["total"], 0)
+        queried = self.post("graph_query", {
+            "project_id": project_id, "query": "", "limit": 100,
+            "include_stale": True,
+        })
+        self.assertFalse(any(
+            item["type"] == "architecture" for item in queried[2]["data"]["nodes"]
+        ))
 
     def test_maximum_json_body_is_accepted(self):
         body = b"{}" + b" " * (262144 - 2)

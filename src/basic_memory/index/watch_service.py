@@ -1,0 +1,505 @@
+"""Local filesystem watcher for event-based indexing."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Protocol
+
+from loguru import logger
+from pydantic import BaseModel, Field
+from rich.console import Console
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from watchfiles import awatch
+from watchfiles.main import Change, FileChange
+
+from basic_memory import db
+from basic_memory.config import BasicMemoryConfig, ConfigManager, ProjectMode, WATCH_STATUS_JSON
+from basic_memory.ignore_utils import load_gitignore_patterns
+from basic_memory.index.local_project import (
+    LocalProjectIndexRuntimeFactory,
+    LocalProjectIndexRuntimeProvider,
+    run_local_project_index_for_project,
+)
+from basic_memory.index.local_runtime import LocalWatchEventIndexRuntimeFactory
+from basic_memory.index.local_watch import (
+    LocalWatchEventIndexRequest,
+    local_project_root,
+    local_watch_filter_roots,
+    local_watch_path_is_observable,
+    local_watch_path_is_under_project,
+    local_watch_project_change_batches,
+    plan_local_watch_event_index_status_update,
+    run_local_watch_event_indexing,
+)
+from basic_memory.index.storage_events import StorageEventIndexRuntime
+from basic_memory.models import Project
+from basic_memory.repository import ProjectRepository
+from basic_memory.utils import generate_permalink, shell_command
+
+
+class WatchEvent(BaseModel):
+    """One user-visible local watcher event."""
+
+    timestamp: datetime
+    path: str
+    action: str
+    status: str
+    checksum: str | None = None
+    error: str | None = None
+
+
+class WatchServiceState(BaseModel):
+    """Serializable local watcher status."""
+
+    running: bool = False
+    start_time: datetime = Field(default_factory=datetime.now)
+    pid: int = Field(default_factory=os.getpid)
+    error_count: int = 0
+    last_error: datetime | None = None
+    last_scan: datetime | None = None
+    indexed_files: int = 0
+    recent_events: list[WatchEvent] = Field(default_factory=list)
+
+    def add_event(
+        self,
+        *,
+        path: str,
+        action: str,
+        status: str,
+        checksum: str | None = None,
+        error: str | None = None,
+    ) -> WatchEvent:
+        event = WatchEvent(
+            timestamp=datetime.now(),
+            path=path,
+            action=action,
+            status=status,
+            checksum=checksum,
+            error=error,
+        )
+        self.recent_events.insert(0, event)
+        self.recent_events = self.recent_events[:100]
+        return event
+
+    def record_error(self, error: str) -> None:
+        self.error_count += 1
+        self.last_error = datetime.now()
+        self.add_event(path="", action="index", status="error", error=error)
+
+
+class WatchEventIndexRuntimeFactory(Protocol):
+    """Build event-index runtime dependencies for one watched project."""
+
+    async def runtime_for_project(self, project: Project) -> StorageEventIndexRuntime: ...
+
+
+class WatchService:
+    """Watch local project files and emit normalized storage events into indexing."""
+
+    def __init__(
+        self,
+        app_config: BasicMemoryConfig,
+        project_repository: ProjectRepository,
+        session_maker: async_sessionmaker[AsyncSession],
+        quiet: bool = False,
+        event_index_runtime_factory: WatchEventIndexRuntimeFactory | None = None,
+        constrained_project: str | None = None,
+        project_index_runtime_factory: LocalProjectIndexRuntimeProvider | None = None,
+        initial_projects: Sequence[Project] = (),
+    ) -> None:
+        self.app_config = app_config
+        self.project_repository = project_repository
+        self.session_maker = session_maker
+        self.state = WatchServiceState()
+        self.status_path = app_config.data_dir_path / WATCH_STATUS_JSON
+        self.status_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ignore_patterns_cache: dict[Path, set[str]] = {}
+        self._sorted_watch_filter_roots: tuple[Path, ...] | None = None
+        self._event_index_runtime_factory = (
+            event_index_runtime_factory or LocalWatchEventIndexRuntimeFactory()
+        )
+        self._project_index_runtime_factory = (
+            project_index_runtime_factory or LocalProjectIndexRuntimeFactory()
+        )
+        # Startup already schedules these projects' initial scans. Only projects
+        # added later need a catch-up pass after their filesystem watch is attached.
+        # Track by project identity, not root: a path change rewrites config before
+        # the files move, so rescanning the new root would index every old path as
+        # deleted (`bm project move`).
+        self._indexed_project_ids = {project.external_id for project in initial_projects}
+        self._catch_up_in_progress = False
+        self.constrained_project = constrained_project
+        self.console = Console(quiet=quiet)
+
+    async def _schedule_restart(self, stop_event: asyncio.Event) -> None:
+        """Schedule a watch cycle restart so project config changes are observed."""
+        waited_for_catch_up = False
+        while True:
+            await asyncio.sleep(self.app_config.watch_project_reload_interval)
+            # Trigger: a newly watched project is still being indexed or draining
+            #   the batches collected while it was scanned.
+            # Why: watchfiles discards its pending batches when stop is set, and
+            #      the catch-up scan is the only consumer step long enough to
+            #      collect a meaningful backlog.
+            # Outcome: give the catch-up one full interval to drain. Then reload
+            #          anyway, so a project with continuous writes cannot defer
+            #          config reloads forever.
+            if not self._catch_up_in_progress or waited_for_catch_up:
+                stop_event.set()
+                return
+            waited_for_catch_up = True
+
+    def _get_ignore_patterns(self, project_path: Path) -> set[str]:
+        """Return cached ignore patterns for one project root."""
+        if project_path not in self._ignore_patterns_cache:
+            self._ignore_patterns_cache[project_path] = load_gitignore_patterns(project_path)
+        return self._ignore_patterns_cache[project_path]
+
+    async def _watch_projects_cycle(
+        self,
+        projects: Sequence[Project],
+        stop_event: asyncio.Event,
+    ) -> None:
+        """Run one watchfiles cycle and route batches into project-local indexing."""
+        project_paths = [project.path for project in projects]
+        projects_by_id = {project.external_id: project for project in projects}
+        self._indexed_project_ids.intersection_update(projects_by_id)
+        new_projects = {
+            external_id: project
+            for external_id, project in projects_by_id.items()
+            if external_id not in self._indexed_project_ids
+        }
+        catch_up_needs_drain = bool(new_projects)
+        watch_unfiltered = bool(new_projects)
+        self._catch_up_in_progress = catch_up_needs_drain
+        previous_filter_roots = self._sorted_watch_filter_roots
+        self._sorted_watch_filter_roots = local_watch_filter_roots(projects)
+
+        watcher = awatch(
+            *project_paths,
+            debounce=self.app_config.index_delay,
+            # Ignored activity can keep awatch from yielding either changes or a
+            # timeout forever. Observe raw batches until this cycle ends so the
+            # post-attach scan can start even while hidden files keep changing.
+            watch_filter=None if watch_unfiltered else self.filter_changes,
+            recursive=True,
+            stop_event=stop_event,
+            yield_on_timeout=bool(new_projects),
+            rust_timeout=(
+                min(1000, max(1, self.app_config.watch_project_reload_interval * 500))
+                if new_projects
+                else None
+            ),
+        )
+        try:
+            async for changes in watcher:
+                quiet_batch = not changes
+                if watch_unfiltered:
+                    changes = {
+                        (change, path)
+                        for change, path in changes
+                        if self.filter_changes(change, path)
+                    }
+                # awatch installs its watches before yielding changes or a timeout.
+                # Scanning earlier leaves the same gap between a scan and attach.
+                # Stay in this consumer so catch-up cannot overlap a watch batch.
+                caught_up_now = bool(new_projects)
+                for external_id, project in new_projects.items():
+                    if not ConfigManager().config.is_locally_syncable(project.name, project.path):
+                        continue
+                    try:
+                        result = await run_local_project_index_for_project(
+                            project, runtime_factory=self._project_index_runtime_factory
+                        )
+                        if not stop_event.is_set():
+                            self._indexed_project_ids.add(external_id)
+                        self.state.last_scan = datetime.now()
+                        logger.info(
+                            "Indexed a newly watched project",
+                            project=project.name,
+                            enqueued_files=result.enqueued_files,
+                        )
+                    except Exception as exc:
+                        logger.exception(f"New project index failed for {project.name}: {exc}")
+                        self.state.record_error(str(exc))
+                    await self.write_status()
+                new_projects.clear()
+                if not changes:
+                    # Trigger: the timeout that released the catch-up arrived before
+                    #   the scan started, so it proves nothing about files queued
+                    #   during the scan.
+                    # Why: the reload must not stop the watcher until those batches
+                    #      have been handed to indexing.
+                    # Outcome: clear the catch-up guard only after a later quiet batch.
+                    if caught_up_now:
+                        continue
+                    if catch_up_needs_drain and quiet_batch:
+                        catch_up_needs_drain = False
+                        self._catch_up_in_progress = False
+                    continue
+                ignore_patterns_by_project_root = {
+                    local_project_root(project): self._get_ignore_patterns(
+                        local_project_root(project)
+                    )
+                    for project in projects
+                }
+                project_changes = local_watch_project_change_batches(
+                    projects=projects,
+                    changes=changes,
+                    ignore_patterns_by_project_root=ignore_patterns_by_project_root,
+                )
+                change_handlers = [
+                    self._handle_changes_isolated(batch.project, set(batch.changes))
+                    for batch in project_changes
+                ]
+                await asyncio.gather(*change_handlers)
+        finally:
+            self._catch_up_in_progress = False
+            try:
+                await watcher.aclose()
+            finally:
+                self._sorted_watch_filter_roots = previous_filter_roots
+
+    async def _select_projects_to_watch(self) -> list[Project]:
+        """Return locally syncable projects that this watcher instance owns."""
+        async with db.scoped_session(self.session_maker) as session:
+            projects = await self.project_repository.get_active_projects(session)
+
+        if self.constrained_project:
+            constrained_permalink = generate_permalink(self.constrained_project)
+            projects = [
+                project for project in projects if project.permalink == constrained_permalink
+            ]
+
+        current_config = ConfigManager().config
+        skipped = [
+            project.name
+            for project in projects
+            if not current_config.is_locally_syncable(project.name, project.path)
+        ]
+        if skipped:
+            projects = [project for project in projects if project.name not in skipped]
+            logger.debug(f"Skipping projects that are not locally syncable: {skipped}")
+
+        return list(projects)
+
+    async def run(self) -> None:  # pragma: no cover
+        """Run the local event-index watcher until stopped."""
+        self.state.running = True
+        self.state.start_time = datetime.now()
+        await self.write_status()
+
+        logger.info(
+            "Event-index watch service started",
+            f"debounce_ms={self.app_config.index_delay}",
+            f"pid={os.getpid()}",
+        )
+
+        try:
+            while self.state.running:
+                self._ignore_patterns_cache.clear()
+                projects = await self._select_projects_to_watch()
+
+                if not projects:
+                    logger.warning(
+                        "No projects to watch; sleeping before retry "
+                        f"(constrained_project={self.constrained_project!r})"
+                    )
+                    await asyncio.sleep(self.app_config.watch_project_reload_interval)
+                    continue
+
+                logger.debug(
+                    f"Starting event-index watch cycle for directories: "
+                    f"{[project.path for project in projects]}"
+                )
+                stop_event = asyncio.Event()
+                timer_task = asyncio.create_task(self._schedule_restart(stop_event))
+
+                try:
+                    await self._watch_projects_cycle(projects, stop_event)
+                except Exception as exc:
+                    logger.exception("Event-index watch service error during cycle", error=str(exc))
+                    self.state.record_error(str(exc))
+                    await self.write_status()
+                    await asyncio.sleep(5)
+                finally:
+                    if not timer_task.done():
+                        timer_task.cancel()
+                        try:
+                            await timer_task
+                        except asyncio.CancelledError:
+                            pass
+
+        except Exception as exc:
+            logger.exception("Event-index watch service error", error=str(exc))
+            self.state.record_error(str(exc))
+            await self.write_status()
+            raise
+
+        finally:
+            logger.info(
+                "Event-index watch service stopped",
+                f"runtime_seconds={int((datetime.now() - self.state.start_time).total_seconds())}",
+            )
+            self.state.running = False
+            await self.write_status()
+
+    def filter_changes(self, change: Change, path: str) -> bool:
+        """Return whether a watchfiles path should become a storage event."""
+        project_roots = self._sorted_watch_filter_roots
+        if project_roots is None:
+            project_roots = local_watch_filter_roots(
+                entry for entry in self.app_config.projects.values() if entry.path
+            )
+        return local_watch_path_is_observable(project_roots=project_roots, path=path)
+
+    async def write_status(self) -> None:
+        """Persist current watcher state for status endpoints."""
+        self.status_path.write_text(self.state.model_dump_json(indent=2))
+
+    def is_project_path(self, project: Project, path: Path | str) -> bool:
+        """Return whether a path belongs under a watched project root."""
+        return local_watch_path_is_under_project(
+            project_root=local_project_root(project),
+            path=path,
+        )
+
+    def _project_is_configured(self, project: Project) -> bool:
+        """Return whether a project still exists in local config.
+
+        Re-reads current config (via ConfigManager's mtime-validated cache) rather
+        than the startup snapshot captured in self.app_config: a project deleted
+        after the watcher started must not be re-indexed by background sync.
+        """
+        current_projects = ConfigManager().config.projects
+        return project.name in current_projects or project.permalink in current_projects
+
+    async def _handle_changes_isolated(self, project: Project, changes: set[FileChange]) -> None:
+        """Process one project's batch, containing failures to that project.
+
+        Trigger: handle_changes raised (move maintenance, runtime build, indexing).
+        Why: change_handlers are awaited with asyncio.gather, which would otherwise
+             propagate a single project's error and drop every project's batch for
+             this watch cycle.
+        Outcome: log + record the error and continue so other projects still index.
+        """
+        try:
+            await self.handle_changes(project, changes)
+        except Exception as exc:
+            logger.exception(
+                f"Event-index batch failed for project {project.name}: {exc}",
+            )
+            self.state.record_error(str(exc))
+            await self.write_status()
+
+    async def handle_changes(self, project: Project, changes: set[FileChange]) -> None:
+        """Normalize one project's watchfiles batch and process it through indexing."""
+        if not self._project_is_configured(project):
+            logger.info(
+                f"Skipping event-index batch for deleted project: "
+                f"{project.name}, change_count={len(changes)}"
+            )
+            return
+
+        if not changes:
+            self.state.last_scan = datetime.now()
+            await self.write_status()
+            return
+
+        start_time = time.time()
+        project_root = local_project_root(project)
+        warn_unreadable_new_directories(
+            project,
+            changes,
+            # Current config, not the startup snapshot: `bm project set-cloud` can change
+            # the mode while this watch cycle still runs (same reason as
+            # _project_is_configured above).
+            local_index_available=ConfigManager().config.get_project_mode(project.name)
+            == ProjectMode.LOCAL,
+        )
+        request = LocalWatchEventIndexRequest.from_project_changes(
+            project=project,
+            changes=changes,
+            ignore_patterns=self._get_ignore_patterns(project_root),
+        )
+        result = await run_local_watch_event_indexing(
+            request,
+            runtime=await self._event_index_runtime_factory.runtime_for_project(project),
+        )
+
+        self.state.last_scan = datetime.now()
+        status_update = plan_local_watch_event_index_status_update(
+            project_prefix=request.project_prefix,
+            result=result,
+        )
+        self.state.indexed_files += status_update.indexed_files_increment
+        if status_update.record_last_error:
+            self.state.error_count += status_update.error_count_increment
+            self.state.last_error = datetime.now()
+        self.state.add_event(
+            path=status_update.path,
+            action=status_update.action,
+            status=status_update.status,
+            error=status_update.error,
+        )
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.info(
+            "Event-index file change processing completed, "
+            f"processed_files={result.processed}, "
+            f"failed_files={result.failed}, "
+            f"skipped_files={result.skipped}, "
+            f"total_indexed_files={self.state.indexed_files}, "
+            f"duration_ms={duration_ms}"
+        )
+        await self.write_status()
+
+
+def warn_unreadable_new_directories(
+    project: Project, changes: set[FileChange], *, local_index_available: bool
+) -> None:
+    """Log a warning for each newly created directory in a batch that cannot be read.
+
+    Trigger: a directory reported as added cannot be listed (for example, created
+    by another user with permissions the watcher's user lacks).
+    Why: on Linux the watcher adds a watch on a new directory when it appears, and
+    when that fails the notify library discards the error. Files written into the
+    directory then produce no events and are never indexed, with nothing logged.
+    Outcome: a warning naming the directory. For a local project it also names the
+    command that indexes it once its permissions are fixed; a cloud project's local
+    copy is watched too, but the local reindex refuses cloud projects.
+    """
+    # A name starting with "-" would be read as an option; "--" ends option parsing.
+    name_args = ("--", project.name) if project.name.startswith("-") else (project.name,)
+    remedy = (
+        f"Once its permissions are fixed, run "
+        f"`{shell_command('bm', 'project', 'index', *name_args)}`."
+        if local_index_available
+        else "Fix its permissions so the watcher can read it."
+    )
+    for change, path in changes:
+        if change != Change.added:
+            continue
+        directory = Path(path)
+        try:
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            with os.scandir(directory):
+                pass
+        except OSError as exc:
+            # Loguru formats the message with str.format when arguments are passed, so the
+            # path and project name go in as arguments: a directory named "{foo}" embedded
+            # in the message itself would raise KeyError and drop the whole batch.
+            logger.warning(
+                "New directory cannot be read, so the file watcher cannot watch it and "
+                "files written into it will not be indexed: {} ({}). {}",
+                directory,
+                exc.strerror,
+                remedy,
+                project=project.name,
+                path=str(directory),
+            )

@@ -1,0 +1,235 @@
+"""V2 routes for memory:// URI operations.
+
+This router uses external_id UUIDs for stable, API-friendly routing.
+V1 uses string-based project names which are less efficient and less stable.
+"""
+
+from typing import Annotated, Optional
+
+from fastapi import APIRouter, HTTPException, Path, Query, status
+from loguru import logger
+
+import logfire
+from basic_memory import db
+from basic_memory.read_cache import ReadCacheOperation
+from basic_memory.read_cache.policy import RECENT_ACTIVITY_READ_CACHE_TTL_SECONDS
+from basic_memory.read_cache.routes import cached_read, content_group
+from basic_memory.deps import (
+    ContextServiceV2ExternalDep,
+    EntityRepositoryV2ExternalDep,
+    SessionMakerDep,
+)
+from basic_memory.schemas.base import TimeFrame, parse_timeframe
+from basic_memory.schemas.memory import (
+    DEFAULT_CONTEXT_PAGE_SIZE,
+    DEFAULT_CONTEXT_RELATED_RESULTS,
+    GraphContext,
+    MAX_CONTEXT_DEPTH,
+    MAX_CONTEXT_PAGE_SIZE,
+    MAX_CONTEXT_RELATED_RESULTS,
+    MAX_RECENT_ACTIVITY_PAGE_SIZE,
+    normalize_memory_url,
+)
+from basic_memory.schemas.search import SearchItemType
+from basic_memory.services.exceptions import AmbiguousIdentifierError
+from basic_memory.api.v2.utils import to_graph_context
+
+# Note: No prefix here - it's added during registration as /v2/{project_id}/memory
+router = APIRouter(tags=["memory"])
+
+
+@router.get(
+    "/memory/recent",
+    response_model=GraphContext,
+    dependencies=[
+        cached_read(
+            ReadCacheOperation.recent_activity,
+            group=content_group,
+            ttl_seconds=RECENT_ACTIVITY_READ_CACHE_TTL_SECONDS,
+        )
+    ],
+)
+async def recent(
+    context_service: ContextServiceV2ExternalDep,
+    entity_repository: EntityRepositoryV2ExternalDep,
+    session_maker: SessionMakerDep,
+    project_id: str = Path(..., description="Project external UUID"),
+    type: Annotated[list[SearchItemType] | None, Query()] = None,
+    depth: int = Query(1, ge=1, le=MAX_CONTEXT_DEPTH),
+    timeframe: TimeFrame = "7d",
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_CONTEXT_PAGE_SIZE, ge=1, le=MAX_RECENT_ACTIVITY_PAGE_SIZE),
+    max_related: int = Query(
+        DEFAULT_CONTEXT_RELATED_RESULTS,
+        ge=0,
+        le=MAX_CONTEXT_RELATED_RESULTS,
+    ),
+) -> GraphContext:
+    """Get recent activity context for a project.
+
+    Args:
+        project_id: Project external UUID from URL path
+        context_service: Context service scoped to project
+        entity_repository: Entity repository scoped to project
+        type: Types of items to include (entities, relations, observations)
+        depth: How many levels of related entities to include
+        timeframe: Time window for recent activity (e.g., "7d", "1 week")
+        page: Page number for pagination
+        page_size: Number of items per page
+        max_related: Maximum related entities to include per item
+
+    Returns:
+        GraphContext with recent activity and related entities
+    """
+    with logfire.span(
+        "api.request.memory.recent_activity",
+        entrypoint="api",
+        domain="memory",
+        action="recent_activity",
+        page=page,
+        page_size=page_size,
+    ):
+        types = (
+            [SearchItemType.ENTITY, SearchItemType.RELATION, SearchItemType.OBSERVATION]
+            if not type
+            else type
+        )
+
+        logger.debug(
+            f"V2 Getting recent context for project {project_id}: `{types}` depth: `{depth}` timeframe: `{timeframe}` page: `{page}` page_size: `{page_size}` max_related: `{max_related}`"
+        )
+        since = parse_timeframe(timeframe)
+        limit = page_size
+        offset = (page - 1) * page_size
+
+        with logfire.span(
+            "api.memory.recent_activity.build_context",
+            domain="memory",
+            action="recent_activity",
+            phase="build_context",
+            page=page,
+            page_size=page_size,
+        ):
+            context = await context_service.build_context(
+                types=types,
+                depth=depth,
+                since=since,
+                limit=limit,
+                offset=offset,
+                max_related=max_related,
+            )
+        with logfire.span(
+            "api.memory.recent_activity.shape_response",
+            domain="memory",
+            action="recent_activity",
+            phase="shape_response",
+            result_count=len(context.results),
+        ):
+            async with db.scoped_session(session_maker) as session:
+                recent_context = await to_graph_context(
+                    context,
+                    entity_repository=entity_repository,
+                    session=session,
+                    page=page,
+                    page_size=page_size,
+                )
+        logger.debug(f"V2 Recent context: {recent_context.model_dump_json()}")
+        return recent_context
+
+
+# get_memory_context needs to be declared last so other paths can match
+
+
+@router.get("/memory/{uri:path}", response_model=GraphContext)
+async def get_memory_context(
+    context_service: ContextServiceV2ExternalDep,
+    entity_repository: EntityRepositoryV2ExternalDep,
+    session_maker: SessionMakerDep,
+    uri: str,
+    project_id: str = Path(..., description="Project external UUID"),
+    depth: int = Query(1, ge=1, le=MAX_CONTEXT_DEPTH),
+    timeframe: Optional[TimeFrame] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_CONTEXT_PAGE_SIZE, ge=1, le=MAX_CONTEXT_PAGE_SIZE),
+    max_related: int = Query(
+        DEFAULT_CONTEXT_RELATED_RESULTS,
+        ge=0,
+        le=MAX_CONTEXT_RELATED_RESULTS,
+    ),
+    include_observations: bool = Query(True),
+) -> GraphContext:
+    """Get rich context from memory:// URI.
+
+    V2 supports both legacy path-based URIs and new ID-based URIs:
+    - Legacy: memory://path/to/note
+    - ID-based: memory://id/123 or memory://123
+
+    Args:
+        project_id: Project external UUID from URL path
+        context_service: Context service scoped to project
+        entity_repository: Entity repository scoped to project
+        uri: Memory URI path (e.g., "id/123", "123", or "path/to/note")
+        depth: How many levels of related entities to include
+        timeframe: Optional time window for filtering related content
+        page: Page number for pagination
+        page_size: Number of primary items per page
+        max_related: Maximum total related entities to include
+        include_observations: Load each entity's observations. Graph-shape callers
+            (compact discovery) pass False so the observation query never runs.
+
+    Returns:
+        GraphContext with the entity and its related context
+    """
+    with logfire.span(
+        "api.request.memory.build_context",
+        entrypoint="api",
+        domain="memory",
+        action="build_context",
+        page=page,
+        page_size=page_size,
+    ):
+        logger.debug(
+            f"V2 Getting context for project {project_id}, URI: `{uri}` depth: `{depth}` timeframe: `{timeframe}` page: `{page}` page_size: `{page_size}` max_related: `{max_related}`"
+        )
+        memory_url = normalize_memory_url(uri)
+
+        since = parse_timeframe(timeframe) if timeframe else None
+        limit = page_size
+        offset = (page - 1) * page_size
+
+        with logfire.span(
+            "api.memory.build_context.build_context",
+            domain="memory",
+            action="build_context",
+            phase="build_context",
+            page=page,
+            page_size=page_size,
+        ):
+            try:
+                context = await context_service.build_context(
+                    memory_url,
+                    depth=depth,
+                    since=since,
+                    limit=limit,
+                    offset=offset,
+                    max_related=max_related,
+                    include_observations=include_observations,
+                )
+            except AmbiguousIdentifierError as exc:
+                # A title URL that names several notes has no single context to build.
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        with logfire.span(
+            "api.memory.build_context.shape_response",
+            domain="memory",
+            action="build_context",
+            phase="shape_response",
+            result_count=len(context.results),
+        ):
+            async with db.scoped_session(session_maker) as session:
+                return await to_graph_context(
+                    context,
+                    entity_repository=entity_repository,
+                    session=session,
+                    page=page,
+                    page_size=page_size,
+                )

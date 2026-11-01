@@ -42,7 +42,11 @@ class CodexSetupTests(unittest.TestCase):
         self.assertTrue(config["features"]["hooks"])
         self.assertTrue((self.root / ".agents/skills/memweave-continuity/SKILL.md").is_file())
         hooks = json.loads((self.root / ".codex/hooks.json").read_text(encoding="utf-8"))
-        self.assertTrue({"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "Interrupt"}.issubset(hooks["hooks"]))
+        self.assertEqual(
+            set(hooks["hooks"]),
+            {"SessionStart", "Interrupt", "SessionEnd"},
+        )
+        self.assertFalse({"UserPromptSubmit", "PostToolUse", "PreCompact"} & set(hooks["hooks"]))
         self.assertTrue(installed["required_actions"])
         self.assertEqual((self.root / "AGENTS.md").read_text(), original)
         checked = self.command("check", "--probe")
@@ -75,6 +79,31 @@ class CodexSetupTests(unittest.TestCase):
         repeated = self.command("setup")
         self.assertEqual(repeated["state"], "up_to_date")
         self.assertEqual(before, self.snapshot())
+
+    def test_codex_setup_removes_legacy_high_frequency_hook_group(self):
+        self.command("setup")
+        hooks_path = self.root / ".codex/hooks.json"
+        manifest_path = self.root / ".codex/memweave.json"
+        hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy = {"hooks": [{
+            "type": "command",
+            "command": "python -m memweave hook --client codex --event PostToolUse",
+        }]}
+        legacy_stop = {"hooks": [{
+            "type": "command",
+            "command": "python -m memweave hook --client codex --event Stop",
+        }]}
+        hooks["hooks"]["PostToolUse"] = [legacy]
+        manifest["hooks"]["PostToolUse"] = [legacy]
+        hooks["hooks"]["Stop"] = [legacy_stop]
+        manifest["hooks"]["Stop"] = [legacy_stop]
+        hooks_path.write_text(json.dumps(hooks), encoding="utf-8")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(self.command("check", success=False)["state"], "needs_attention")
+        self.command("setup")
+        repaired = json.loads(hooks_path.read_text(encoding="utf-8"))["hooks"]
+        self.assertEqual(set(repaired), {"SessionStart", "Interrupt", "SessionEnd"})
 
     def test_modified_skill_is_reported_and_not_overwritten(self):
         self.command("setup")

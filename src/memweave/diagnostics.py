@@ -180,6 +180,10 @@ class Diagnostics:
         metadata = {}
         for field in ("conversation_id", "session_id", "generation_id", "event_id", "turn_id", "tool_use_id"):
             if field in payload:
+                if payload[field] is None:
+                    continue
+                if isinstance(payload[field], str) and not payload[field].strip():
+                    continue
                 validate_text(payload[field], field, 256)
                 metadata[field] = payload[field]
         if not (metadata.get("conversation_id") or metadata.get("session_id")):

@@ -1,0 +1,621 @@
+"""Utilities for file operations."""
+
+import asyncio
+import hashlib
+import os
+import shlex
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+import re
+import unicodedata
+import secrets
+import stat
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+
+import aiofiles
+import yaml
+import frontmatter
+from loguru import logger
+
+from basic_memory.utils import FilePath
+
+if TYPE_CHECKING:  # pragma: no cover
+    from basic_memory.config import BasicMemoryConfig
+
+
+@dataclass
+class FileMetadata:
+    """File metadata for cloud-compatible file operations.
+
+    This dataclass provides a cloud-agnostic way to represent file metadata,
+    enabling S3FileService to return metadata from head_object responses
+    instead of mock stat_result with zeros.
+    """
+
+    size: int
+    created_at: datetime
+    modified_at: datetime
+
+
+class FileError(Exception):
+    """Base exception for file operations."""
+
+    pass
+
+
+class FileWriteError(FileError):
+    """Raised when file operations fail."""
+
+    pass
+
+
+class ParseError(FileError):
+    """Raised when parsing file content fails."""
+
+    pass
+
+
+async def compute_checksum(content: Union[str, bytes]) -> str:
+    """
+    Compute SHA-256 checksum of content.
+
+    Args:
+        content: Content to hash (either text string or bytes)
+
+    Returns:
+        SHA-256 hex digest
+
+    Raises:
+        FileError: If checksum computation fails
+    """
+    try:
+        if isinstance(content, str):
+            content = content.encode()
+        return hashlib.sha256(content).hexdigest()
+    except Exception as e:  # pragma: no cover
+        logger.error(f"Failed to compute checksum: {e}")
+        raise FileError(f"Failed to compute checksum: {e}")
+
+
+# UTF-8 BOM character that can appear at the start of files
+UTF8_BOM = "\ufeff"
+
+
+def strip_bom(content: str) -> str:
+    """Strip UTF-8 BOM from the start of content if present.
+
+    BOM (Byte Order Mark) characters can be present in files created on Windows
+    or copied from certain sources. They should be stripped before processing
+    frontmatter. See issue #452.
+
+    Args:
+        content: Content that may start with BOM
+
+    Returns:
+        Content with BOM removed if present
+    """
+    if content and content.startswith(UTF8_BOM):
+        return content[1:]
+    return content
+
+
+async def write_file_atomic(path: FilePath, content: str) -> None:
+    """
+    Write file with atomic operation using temporary file.
+
+    Uses aiofiles for true async I/O (non-blocking).
+
+    Args:
+        path: Target file path (Path or string)
+        content: Content to write
+
+    Raises:
+        FileWriteError: If write operation fails
+    """
+    # Convert string to Path if needed
+    path_obj = Path(path) if isinstance(path, str) else path
+    temp_path: Path | None = None
+
+    try:
+        temp_path, target_mode = _create_atomic_temp_path(path_obj)
+        # Trigger: callers hand us normalized Python text, but the final bytes are allowed
+        #          to use the host platform's native newline convention during the write.
+        # Why: preserving CRLF on Windows keeps local files aligned with editors like
+        #      Obsidian, while FileService now hashes the persisted file bytes instead of
+        #      the pre-write string.
+        # Outcome: this async write stays editor-friendly across platforms without
+        #          reintroducing checksum drift in sync or move detection.
+        async with aiofiles.open(temp_path, mode="w", encoding="utf-8") as f:
+            await f.write(content)
+
+        if target_mode is not None:
+            temp_path.chmod(target_mode)
+        # Atomic rename (this is fast, doesn't need async)
+        temp_path.replace(path_obj)
+        logger.debug("Wrote file atomically", path=str(path_obj), content_length=len(content))
+    except Exception as e:  # pragma: no cover
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        logger.error("Failed to write file", path=str(path_obj), error=str(e))
+        raise FileWriteError(f"Failed to write file {path}: {e}")
+
+
+async def write_file_atomic_bytes(path: FilePath, content: bytes) -> None:
+    """Write bytes atomically without text newline translation."""
+    path_obj = Path(path) if isinstance(path, str) else path
+    temp_path: Path | None = None
+
+    try:
+        temp_path, target_mode = _create_atomic_temp_path(path_obj)
+        async with aiofiles.open(temp_path, mode="wb") as f:
+            await f.write(content)
+
+        if target_mode is not None:
+            temp_path.chmod(target_mode)
+        temp_path.replace(path_obj)
+        logger.debug("Wrote file atomically", path=str(path_obj), content_length=len(content))
+    except Exception as e:  # pragma: no cover
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        logger.error("Failed to write file", path=str(path_obj), error=str(e))
+        raise FileWriteError(f"Failed to write file {path}: {e}")
+
+
+def _create_atomic_temp_path(target: Path) -> tuple[Path, int | None]:
+    """Reserve a collision-free staging file beside an atomic-write target."""
+    for _attempt in range(10):
+        staging_path = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            descriptor = os.open(
+                staging_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o666,
+            )
+        except FileExistsError:  # pragma: no cover - random collision defense
+            continue
+        os.close(descriptor)
+        try:
+            target_mode = stat.S_IMODE(target.stat().st_mode)
+        except FileNotFoundError:
+            target_mode = None
+        except Exception:
+            staging_path.unlink(missing_ok=True)
+            raise
+        return staging_path, target_mode
+    raise FileWriteError(f"Failed to reserve atomic staging file for {target}")
+
+
+async def format_markdown_builtin(path: Path) -> Optional[str]:
+    """
+    Format a markdown file using the built-in mdformat formatter.
+
+    Uses mdformat with GFM (GitHub Flavored Markdown) support for consistent
+    formatting without requiring Node.js or external tools.
+
+    Args:
+        path: Path to the markdown file to format
+
+    Returns:
+        Formatted content if successful, None if formatting failed.
+    """
+    try:
+        import mdformat
+    except ImportError:  # pragma: no cover
+        logger.warning(
+            "mdformat not installed, skipping built-in formatting",
+            path=str(path),
+        )
+        return None
+
+    try:
+        # Read original content
+        async with aiofiles.open(path, mode="r", encoding="utf-8") as f:
+            content = await f.read()
+
+        # Format using mdformat with GFM and frontmatter extensions
+        # mdformat is synchronous, so we run it in a thread executor
+        loop = asyncio.get_event_loop()
+        formatted_content = await loop.run_in_executor(
+            None,
+            lambda: mdformat.text(
+                content,
+                extensions={"gfm", "frontmatter"},  # GFM + YAML frontmatter support
+                options={"wrap": "no"},  # Don't wrap lines
+            ),
+        )
+
+        # Only write if content changed
+        if formatted_content != content:
+            # Trigger: mdformat may rewrite markdown content, then the host platform
+            #          decides the newline bytes for the follow-up async text write.
+            # Why: we want formatter output to preserve native newlines instead of
+            #      forcing LF, and the authoritative checksum comes from rereading the
+            #      stored file bytes later in FileService.
+            # Outcome: formatting remains compatible with local editors on Windows while
+            #          checksum-based sync logic stays anchored to on-disk bytes.
+            async with aiofiles.open(path, mode="w", encoding="utf-8") as f:
+                await f.write(formatted_content)
+
+        logger.debug(
+            "Formatted file with mdformat",
+            path=str(path),
+            changed=formatted_content != content,
+        )
+        return formatted_content
+
+    except Exception as e:  # pragma: no cover
+        logger.warning(
+            "mdformat formatting failed",
+            path=str(path),
+            error=str(e),
+        )
+        return None
+
+
+async def format_file(
+    path: Path,
+    config: "BasicMemoryConfig",
+    is_markdown: bool = False,
+) -> Optional[str]:
+    """
+    Format a file using configured formatter.
+
+    By default, uses the built-in mdformat formatter for markdown files (pure Python,
+    no Node.js required). External formatters like Prettier can be configured via
+    formatter_command or per-extension formatters.
+
+    Args:
+        path: File to format
+        config: Configuration with formatter settings
+        is_markdown: Whether this is a markdown file (caller should use FileService.is_markdown)
+
+    Returns:
+        Formatted content if successful, None if formatting was skipped or failed.
+        Failures are logged as warnings but don't raise exceptions.
+    """
+    if not config.format_on_save:
+        return None
+
+    extension = path.suffix.lstrip(".")
+    formatter = config.formatters.get(extension) or config.formatter_command
+
+    # Use built-in mdformat for markdown files when no external formatter configured
+    if not formatter:
+        if is_markdown:
+            return await format_markdown_builtin(path)
+        else:
+            logger.debug("No formatter configured for extension", extension=extension)
+            return None
+
+    # Use external formatter
+    try:
+        # Split the configured template first, then substitute into each token.
+        # Substituting into the command string and splitting afterwards makes the
+        # path's own spaces into argument boundaries: with the documented
+        # `npx prettier --write {file}`, a note at `~/My Notes/a.md` would run
+        # against `~/My` and `Notes/a.md` and format neither. A path containing a
+        # quote would also make shlex.split raise on the whole command.
+        args = [token.replace("{file}", str(path)) for token in shlex.split(formatter)]
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=config.formatter_timeout,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            logger.warning(
+                "Formatter timed out",
+                path=str(path),
+                timeout=config.formatter_timeout,
+            )
+            return None
+
+        if proc.returncode != 0:
+            logger.warning(
+                "Formatter exited with non-zero status",
+                path=str(path),
+                returncode=proc.returncode,
+                stderr=stderr.decode("utf-8", errors="replace") if stderr else "",
+            )
+            # Still try to read the file - formatter may have partially worked
+            # or the file may be unchanged
+
+        # Read formatted content
+        async with aiofiles.open(path, mode="r", encoding="utf-8") as f:
+            formatted_content = await f.read()
+
+        logger.debug(
+            "Formatted file successfully",
+            path=str(path),
+            formatter=args[0] if args else formatter,
+        )
+        return formatted_content
+
+    except FileNotFoundError:
+        # Formatter executable not found
+        logger.warning(
+            "Formatter executable not found",
+            command=shlex.split(formatter)[0] if formatter.strip() else "",
+            path=str(path),
+        )
+        return None
+    except Exception as e:  # pragma: no cover
+        logger.warning(
+            "Formatter failed",
+            path=str(path),
+            error=str(e),
+        )
+        return None
+
+
+# A frontmatter fence is a line containing exactly `---`, optionally followed by
+# trailing horizontal whitespace. Anchoring to a full line (rather than a bare
+# substring/`startswith`) prevents single-line content like
+# `---\nstatus: active\n---\nBody` — where `\n` is a literal backslash-n, not a
+# newline — from being misread as frontmatter. See issue #972.
+_FENCE_RE = re.compile(r"^---[ \t]*$")
+
+
+def _split_frontmatter(content: str) -> Optional[tuple[str, str]]:
+    """Split content into (yaml_block, body) when it opens with a line-anchored fence.
+
+    The opening fence must be the very first line and the closing fence must be a
+    later line, each matching exactly `---` (with optional trailing whitespace).
+
+    Returns:
+        A `(yaml_block, body)` tuple when a complete fenced block is present, or
+        ``None`` when the content does not open with a frontmatter fence.
+
+    Raises:
+        ParseError: If the content opens with a fence but has no closing fence.
+    """
+    lines = content.splitlines(keepends=True)
+
+    # Skip leading blank lines: a document may begin with whitespace before the
+    # opening fence (e.g. a heredoc/dedented string starting with a newline). This
+    # does NOT relax line-anchoring — the opening fence must still be the first
+    # non-blank line, all on its own, so a single-line `---\\nstatus...` (literal
+    # backslash-n) is still rejected. See issue #972.
+    start = 0
+    while start < len(lines) and lines[start].strip() == "":
+        start += 1
+
+    if start >= len(lines) or not _FENCE_RE.match(lines[start].rstrip("\r\n")):
+        return None
+
+    # Find the closing fence on its own line somewhere after the opening fence.
+    for index in range(start + 1, len(lines)):
+        if _FENCE_RE.match(lines[index].rstrip("\r\n")):
+            yaml_block = "".join(lines[start + 1 : index])
+            body = "".join(lines[index + 1 :])
+            return yaml_block, body
+
+    raise ParseError("Invalid frontmatter format")
+
+
+def has_frontmatter(content: str) -> bool:
+    """
+    Check if content contains valid YAML frontmatter.
+
+    Frontmatter requires `---` fences on their own lines; an inline `---` (such as
+    a single-line string that merely starts with the characters `---`) is not
+    frontmatter.
+
+    Args:
+        content: Content to check
+
+    Returns:
+        True if content has line-anchored frontmatter fences, False otherwise
+    """
+    if not content:
+        return False
+
+    # Strip BOM before checking for frontmatter markers
+    content = strip_bom(content)
+    try:
+        return _split_frontmatter(content) is not None
+    except ParseError:
+        # An opening fence with no closing fence is not usable frontmatter.
+        return False
+
+
+def parse_frontmatter(content: str) -> Dict[str, Any]:
+    """
+    Parse YAML frontmatter from content.
+
+    Args:
+        content: Content with YAML frontmatter
+
+    Returns:
+        Dictionary of frontmatter values
+
+    Raises:
+        ParseError: If frontmatter is invalid or parsing fails
+    """
+    try:
+        # Strip BOM before parsing frontmatter
+        content = strip_bom(content)
+        split = _split_frontmatter(content)
+        if split is None:
+            raise ParseError("Content has no frontmatter")
+        yaml_block, _ = split
+
+        # Parse YAML
+        try:
+            frontmatter = yaml.safe_load(yaml_block)
+            # Handle empty frontmatter (None from yaml.safe_load)
+            if frontmatter is None:
+                return {}
+            if not isinstance(frontmatter, dict):
+                raise ParseError("Frontmatter must be a YAML dictionary")
+            return frontmatter
+
+        except yaml.YAMLError as e:
+            raise ParseError(f"Invalid YAML in frontmatter: {e}")
+
+    except Exception as e:  # pragma: no cover
+        if not isinstance(e, ParseError):
+            logger.error(f"Failed to parse frontmatter: {e}")
+            raise ParseError(f"Failed to parse frontmatter: {e}")
+        raise
+
+
+def remove_frontmatter(content: str, *, strip: bool = True) -> str:
+    """
+    Remove YAML frontmatter from content.
+
+    Args:
+        content: Content with frontmatter
+        strip: When True (default), strip surrounding whitespace from the returned
+            body — the historical behavior. Pass False to get the body exactly as
+            it appears after the closing fence; frontmatter-only rewrites must not
+            reflow the note body (issue #1090 review).
+
+    Returns:
+        Content with frontmatter removed, or the original content when there is
+        no frontmatter: no fences, or a fenced block that is not a YAML mapping.
+
+    Raises:
+        ParseError: If content opens with a fence that is never closed
+    """
+    # Strip BOM before processing
+    content = strip_bom(content)
+    split = _split_frontmatter(content)
+    # Trigger: content does not open with a line-anchored fence, or the fenced
+    #   block is not a YAML mapping (a letterhead between horizontal rules, a
+    #   bare scalar, a list).
+    # Why: inline `---` is ordinary content, not frontmatter (issue #972), and a
+    #   fenced block that no frontmatter parser would accept is body text; the
+    #   indexer treats it that way and search must not strip it (#1451).
+    # Outcome: return the content untouched (stripped to preserve prior behavior)
+    if split is None or not _is_frontmatter_mapping(split[0]):
+        return content.strip() if strip else content
+    _, body = split
+    return body.strip() if strip else body
+
+
+def _is_frontmatter_mapping(yaml_block: str) -> bool:
+    """Whether a fenced block is what every frontmatter reader here accepts: a YAML
+    mapping, or empty. The same rule `parse_frontmatter` enforces by raising."""
+    try:
+        loaded = yaml.safe_load(yaml_block)
+    except yaml.YAMLError:
+        return False
+    return loaded is None or isinstance(loaded, dict)
+
+
+def dump_frontmatter(post: frontmatter.Post) -> str:
+    """
+    Serialize frontmatter.Post to markdown with Obsidian-compatible YAML format.
+
+    This function ensures that:
+    1. Tags are formatted as YAML lists instead of JSON arrays
+    2. String values are properly quoted to handle special characters (colons, etc.)
+
+    Good (Obsidian compatible):
+    ---
+    title: "L2 Governance Core (Split: Core)"
+    tags:
+    - system
+    - overview
+    - reference
+    ---
+
+    Bad (causes parsing errors):
+    ---
+    title: L2 Governance Core (Split: Core)  # Unquoted colon breaks YAML
+    tags: ["system", "overview", "reference"]
+    ---
+
+    Args:
+        post: frontmatter.Post object to serialize
+
+    Returns:
+        String containing markdown with properly formatted YAML frontmatter
+    """
+    if not post.metadata:
+        # No frontmatter, just return content
+        return post.content
+
+    # Serialize YAML with block style for lists
+    # SafeDumper automatically quotes values with special characters (colons, etc.)
+    yaml_str = yaml.dump(
+        post.metadata,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        Dumper=yaml.SafeDumper,
+    )
+
+    # Construct the final markdown with frontmatter
+    if post.content:
+        return f"---\n{yaml_str}---\n\n{post.content}"
+    else:
+        return f"---\n{yaml_str}---\n"
+
+
+def sanitize_for_filename(text: str, replacement: str = "-") -> str:
+    """
+    Sanitize string to be safe for use as a note title
+    Replaces path separators and other problematic characters
+    with hyphens.
+    """
+    # replace both POSIX and Windows path separators
+    text = re.sub(r"[/\\]", replacement, text)
+
+    # replace some other problematic chars
+    text = re.sub(r'[<>:"|?*]', replacement, text)
+
+    # compress multiple, repeated replacements
+    text = re.sub(f"{re.escape(replacement)}+", replacement, text)
+
+    # Strip trailing periods — they cause "hi-everyone..md" double-dot filenames
+    # when ".md" is appended, which triggers path traversal false positives.
+    # Trailing periods are also invalid on Windows filesystems.
+    text = text.strip(".")
+
+    return text.strip(replacement)
+
+
+def sanitize_for_directory(directory: str) -> str:
+    """
+    Sanitize directory path to be safe for use in file system paths.
+    Removes leading/trailing whitespace, compresses multiple slashes,
+    and removes special characters except for /, -, and _.
+    """
+    if not directory:
+        return ""
+
+    sanitized = directory.strip()
+
+    if sanitized.startswith("./"):
+        sanitized = sanitized[2:]
+
+    # ensure no special characters (except for a few that are allowed).
+    # Combining marks (category M*) stay: an NFD name spells "é" as "e" plus U+0301,
+    # and Linux keeps NFD paths as given, so dropping the mark turned "café" into
+    # "cafe" (#1796).
+    sanitized = "".join(
+        c
+        for c in sanitized
+        if c.isalnum()
+        or unicodedata.category(c).startswith("M")
+        or c in (".", " ", "-", "_", "\\", "/")
+    ).rstrip()
+
+    # compress multiple, repeated instances of path separators
+    sanitized = re.sub(r"[\\/]+", "/", sanitized)
+
+    # trim any leading/trailing path separators
+    sanitized = sanitized.strip("\\/")
+
+    return sanitized

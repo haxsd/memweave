@@ -13,6 +13,21 @@ from memweave.diagnostics import Diagnostics, DiagnosticError, validate_text
 
 
 MAX_RECORD_BYTES = 262144
+RECORD_DIRECTORIES = (
+    "projects", "tasks", "work_units", "phases", "checkpoints", "knowledge",
+    "architecture", "records", "users"
+)
+RECORD_DIRECTORY_BY_PREFIX = {
+    "project": "projects",
+    "task": "tasks",
+    "work_unit": "work_units",
+    "phase": "phases",
+    "checkpoint": "checkpoints",
+    "memory": "knowledge",
+    "architecture": "architecture",
+}
+TASK_STATUSES = ("active", "queued", "current", "completed", "cancelled")
+WORK_UNIT_STATUSES = ("pending", "running", "blocked", "completed", "cancelled")
 
 
 def now() -> str:
@@ -23,9 +38,69 @@ def digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def contract_digest(goal, acceptance):
+    payload = json.dumps(
+        {"goal": str(goal), "acceptance": [str(item) for item in acceptance]},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return digest(payload)
+
+
 def encode_record(record: dict) -> str:
     metadata = {key: value for key, value in record.items() if key not in ("body", "path", "etag")}
     return "---\n" + json.dumps(metadata, ensure_ascii=False, indent=2) + "\n---\n" + record.get("body", "")
+
+
+def _validate_metadata(record: dict) -> dict:
+    if not isinstance(record, dict):
+        raise ValueError("Invalid metadata")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", record["id"]):
+        raise ValueError("Invalid record id")
+    if type(record["revision"]) is not int or record["revision"] < 1:
+        raise ValueError("Invalid revision")
+    if record["type"] not in (
+        "project", "task", "work_unit", "phase", "checkpoint", "memory", "architecture"
+    ):
+        raise ValueError("Invalid record type")
+    if record["scope"] not in ("user", "project", "task"):
+        raise ValueError("Invalid scope")
+    if record["scope"] != "user" and not isinstance(record.get("project_id"), str):
+        raise ValueError("Project scope requires project_id")
+    if not isinstance(record.get("title"), str) or not record["title"].strip():
+        raise ValueError("Missing title")
+    if record["type"] == "project" and not isinstance(record.get("root"), str):
+        raise ValueError("Missing project root")
+    if record["type"] == "task" and (
+        record.get("status") not in TASK_STATUSES
+        or not isinstance(record.get("goal"), str)
+        or not isinstance(record.get("acceptance"), list)
+        or any(not isinstance(item, str) for item in record["acceptance"])
+    ):
+        raise ValueError("Invalid task metadata")
+    if record["type"] == "work_unit" and (
+        record.get("scope") != "task"
+        or not isinstance(record.get("task_id"), str)
+        or record.get("status") not in WORK_UNIT_STATUSES
+        or not isinstance(record.get("owner"), str)
+    ):
+        raise ValueError("Invalid work unit metadata")
+    if record["type"] == "phase" and (
+        record.get("scope") != "task"
+        or not isinstance(record.get("task_id"), str)
+        or record.get("status") != "completed"
+        or not isinstance(record.get("summary"), str)
+    ):
+        raise ValueError("Invalid phase metadata")
+    if record["type"] == "checkpoint" and (
+        record.get("scope") != "task"
+        or not isinstance(record.get("task_id"), str)
+        or type(record.get("sequence")) is not int
+        or record["sequence"] < 1
+    ):
+        raise ValueError("Invalid checkpoint metadata")
+    return record
 
 
 def decode_record(content: bytes) -> dict:
@@ -36,30 +111,7 @@ def decode_record(content: bytes) -> dict:
         if not text.startswith("---\n"):
             raise ValueError("Missing frontmatter")
         header, body = text[4:].split("\n---\n", 1)
-        record = json.loads(header)
-        if not isinstance(record, dict):
-            raise ValueError("Invalid metadata")
-        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", record["id"]):
-            raise ValueError("Invalid record id")
-        if type(record["revision"]) is not int or record["revision"] < 1:
-            raise ValueError("Invalid revision")
-        if record["type"] not in ("project", "task", "memory", "architecture"):
-            raise ValueError("Invalid record type")
-        if record["scope"] not in ("user", "project", "task"):
-            raise ValueError("Invalid scope")
-        if record["scope"] != "user" and not isinstance(record.get("project_id"), str):
-            raise ValueError("Project scope requires project_id")
-        if not isinstance(record.get("title"), str) or not record["title"].strip():
-            raise ValueError("Missing title")
-        if record["type"] == "project" and not isinstance(record.get("root"), str):
-            raise ValueError("Missing project root")
-        if record["type"] == "task" and (
-            record.get("status") not in ("active", "completed", "cancelled")
-            or not isinstance(record.get("goal"), str)
-            or not isinstance(record.get("acceptance"), list)
-            or any(not isinstance(item, str) for item in record["acceptance"])
-        ):
-            raise ValueError("Invalid task metadata")
+        record = _validate_metadata(json.loads(header))
         record["body"] = body
         return record
     except (UnicodeDecodeError, ValueError, KeyError, TypeError, RecursionError) as error:
@@ -85,14 +137,7 @@ class Vault:
         self.diagnostics.initialize()
         with self.locked():
             with self.diagnostics._connect(writable=True) as connection:
-                connection.execute(
-                    "CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, type TEXT NOT NULL, "
-                    "scope TEXT NOT NULL, project_id TEXT, path TEXT UNIQUE NOT NULL, "
-                    "metadata TEXT NOT NULL, etag TEXT NOT NULL)"
-                )
-                connection.execute(
-                    "CREATE INDEX IF NOT EXISTS record_scope ON records(type, project_id, scope)"
-                )
+                connection.execute("DROP TABLE IF EXISTS records")
                 connection.execute(
                     "CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request_hash TEXT NOT NULL, "
                     "state TEXT NOT NULL, changes TEXT NOT NULL, result TEXT NOT NULL, created_at TEXT NOT NULL)"
@@ -131,16 +176,31 @@ class Vault:
             raise DiagnosticError("RECORD_INVALID", "Record is not a bounded regular file.")
         return digest(target.read_bytes())
 
-    def read(self, record_id: str) -> dict:
-        with self.diagnostics._connect() as connection:
-            if connection.execute(
-                "SELECT 1 FROM operations WHERE state != 'completed' LIMIT 1"
-            ).fetchone():
-                raise DiagnosticError("RECOVERY_REQUIRED", "An interrupted write needs memweave recover.")
-            row = connection.execute("SELECT * FROM records WHERE id = ?", (record_id,)).fetchone()
-            if row is None:
-                raise DiagnosticError("RECORD_NOT_FOUND", "Record not found in this memory home.")
-            relative = row["path"]
+    def _find_record_path(self, record_id: str) -> str | None:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", record_id):
+            return None
+        preferred = next((
+            directory for prefix, directory in sorted(
+                RECORD_DIRECTORY_BY_PREFIX.items(), key=lambda item: len(item[0]), reverse=True
+            )
+            if record_id.startswith(prefix + "_")
+        ), None)
+        directories = [preferred, *RECORD_DIRECTORIES] if preferred else list(RECORD_DIRECTORIES)
+        seen = set()
+        for directory in directories:
+            if directory is None or directory in seen:
+                continue
+            seen.add(directory)
+            relative = f"{directory}/{record_id}.md"
+            try:
+                target = self.target(relative)
+            except DiagnosticError:
+                continue
+            if target.is_file():
+                return Path(relative).as_posix()
+        return None
+
+    def _read_relative(self, relative: str) -> dict:
         target = self.target(relative)
         try:
             if not target.is_file() or target.stat().st_size > MAX_RECORD_BYTES:
@@ -151,49 +211,167 @@ class Vault:
         except OSError as error:
             raise DiagnosticError("SOURCE_CHANGED", "Record is unreadable; preserve it and inspect the file.") from error
         record = decode_record(content)
-        if record["id"] != record_id:
-            raise DiagnosticError("RECORD_INVALID", "Record identity changed; rebuild or repair the file.")
-        record.update(path=relative, etag=digest(content))
+        record.update(path=Path(relative).as_posix(), etag=digest(content))
         return record
 
-    def list_records(self, record_type: str, project_id: str | None = None, scope: str | None = None) -> list[dict]:
-        clauses = ["type = ?"]
-        parameters = [record_type]
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            parameters.append(project_id)
-        if scope is not None:
-            clauses.append("scope = ?")
-            parameters.append(scope)
-        with self.diagnostics._connect() as connection:
-            ids = [row[0] for row in connection.execute(
-                "SELECT id FROM records WHERE " + " AND ".join(clauses) + " ORDER BY id LIMIT 1001",
-                parameters,
-            )]
-        records = []
-        for record_id in ids[:1000]:
-            record = self.read(record_id)
-            if record["type"] != record_type:
+    def _record_paths(self, record_type: str | None = None):
+        if record_type == "memory":
+            directories = ("knowledge", "records", "users")
+        elif record_type is None:
+            directories = RECORD_DIRECTORIES
+        else:
+            directory = RECORD_DIRECTORY_BY_PREFIX.get(record_type)
+            directories = (directory,) if directory is not None else ()
+        for directory in directories:
+            root = self.home / directory
+            if not root.is_dir():
                 continue
-            if project_id is not None and record.get("project_id") != project_id:
-                continue
-            if scope is not None and record.get("scope") != scope:
-                continue
-            records.append(record)
-        return records
+            for target in sorted(root.glob("*.md")):
+                try:
+                    relative = target.relative_to(self.home).as_posix()
+                    self.target(relative)
+                except (OSError, ValueError, DiagnosticError):
+                    continue
+                yield relative
 
-    def _index(self, connection, relative: str, content: str | None, record_id: str) -> None:
-        if content is None:
-            connection.execute("DELETE FROM records WHERE id = ?", (record_id,))
-            connection.execute("INSERT OR IGNORE INTO tombstones VALUES (?)", (record_id,))
-            return
-        record = decode_record(content.encode("utf-8"))
-        metadata = {key: value for key, value in record.items() if key != "body"}
-        connection.execute(
-            "INSERT OR REPLACE INTO records VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (record["id"], record["type"], record["scope"], record.get("project_id"),
-             relative, json.dumps(metadata, ensure_ascii=False), digest(content.encode("utf-8"))),
-        )
+    def counts(self) -> dict:
+        counts = {}
+        for directory in RECORD_DIRECTORIES:
+            root = self.home / directory
+            if not root.is_dir():
+                continue
+            record_type = {
+                "projects": "project",
+                "tasks": "task",
+                "work_units": "work_unit",
+                "phases": "phase",
+                "checkpoints": "checkpoint",
+                "knowledge": "memory",
+                "architecture": "architecture",
+                "records": "memory",
+                "users": "memory",
+            }[directory]
+            count = sum(1 for target in root.glob("*.md") if target.is_file())
+            counts[record_type] = counts.get(record_type, 0) + count
+        return counts
+
+    def read(self, record_id: str) -> dict:
+        with self.locked():
+            self._recover_locked()
+            with self.diagnostics._connect() as connection:
+                deleted = connection.execute(
+                    "SELECT 1 FROM tombstones WHERE id = ?", (record_id,)
+                ).fetchone()
+            relative = self._find_record_path(record_id)
+            if relative is None or deleted is not None:
+                raise DiagnosticError("RECORD_NOT_FOUND", "Record not found in this memory home.")
+            record = self._read_relative(relative)
+            if record["id"] != record_id:
+                raise DiagnosticError("RECORD_INVALID", "Record identity changed; rebuild or repair the file.")
+            return record
+
+    def read_path(self, relative: str) -> dict:
+        """Read one current Markdown record by its vault-relative path."""
+        with self.locked():
+            self._recover_locked()
+            record = self._read_relative(relative)
+            with self.diagnostics._connect() as connection:
+                if connection.execute("SELECT 1 FROM tombstones WHERE id = ?", (record["id"],)).fetchone():
+                    raise DiagnosticError("RECORD_DELETED", "Record was explicitly forgotten.")
+            return record
+
+    def _read_metadata_relative(self, relative: str) -> dict:
+        """Read frontmatter only; the record body is neither loaded nor returned."""
+        target = self.target(relative)
+        try:
+            if not target.is_file() or target.stat().st_size > MAX_RECORD_BYTES:
+                raise DiagnosticError("RECORD_INVALID", "Record exceeds the 256 KiB limit.")
+            header = bytearray()
+            with target.open("rb") as stream:
+                if stream.readline() not in (b"---\n", b"---\r\n"):
+                    raise ValueError("Missing frontmatter")
+                while len(header) <= 128 * 1024:
+                    line = stream.readline()
+                    if line in (b"---\n", b"---\r\n"):
+                        break
+                    if not line:
+                        raise ValueError("Unterminated frontmatter")
+                    header.extend(line)
+                else:
+                    raise ValueError("Frontmatter is too large")
+            record = _validate_metadata(json.loads(header.decode("utf-8-sig")))
+            record["path"] = Path(relative).as_posix()
+            return record
+        except DiagnosticError:
+            raise
+        except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError, RecursionError) as error:
+            raise DiagnosticError(
+                "RECORD_INVALID", "Invalid Markdown record; preserve it and repair its metadata."
+            ) from error
+
+    def file_etag(self, relative: str) -> str:
+        """Calculate one record etag without retaining its body."""
+        with self.locked():
+            self._recover_locked()
+            target = self.target(relative)
+            if not target.is_file() or target.stat().st_size > MAX_RECORD_BYTES:
+                raise DiagnosticError("RECORD_INVALID", "Record exceeds the 256 KiB limit.")
+            value = hashlib.sha256()
+            with target.open("rb") as stream:
+                while chunk := stream.read(65536):
+                    value.update(chunk)
+            return value.hexdigest()
+
+    def list_records(self, record_type: str, project_id: str | None = None, scope: str | None = None) -> list[dict]:
+        with self.locked():
+            self._recover_locked()
+            with self.diagnostics._connect() as connection:
+                deleted = {row[0] for row in connection.execute("SELECT id FROM tombstones")}
+            records = []
+            seen = set()
+            for relative in self._record_paths(record_type):
+                record = self._read_relative(relative)
+                if record["id"] in deleted:
+                    continue
+                if record["id"] in seen:
+                    raise DiagnosticError("RECORD_INVALID", "Duplicate record identity.")
+                seen.add(record["id"])
+                if record["type"] != record_type:
+                    continue
+                if project_id is not None and record.get("project_id") != project_id:
+                    continue
+                if scope is not None and record.get("scope") != scope:
+                    continue
+                records.append(record)
+            records.sort(key=lambda item: item["id"])
+            return records[:1000]
+
+    def list_record_metadata(
+        self, record_type: str, project_id: str | None = None, scope: str | None = None
+    ) -> list[dict]:
+        """List matching frontmatter without loading task bodies into the context path."""
+        with self.locked():
+            self._recover_locked()
+            with self.diagnostics._connect() as connection:
+                deleted = {row[0] for row in connection.execute("SELECT id FROM tombstones")}
+            records = []
+            seen = set()
+            for relative in self._record_paths(record_type):
+                record = self._read_metadata_relative(relative)
+                if record["id"] in deleted:
+                    continue
+                if record["id"] in seen:
+                    raise DiagnosticError("RECORD_INVALID", "Duplicate record identity.")
+                seen.add(record["id"])
+                if record["type"] != record_type:
+                    continue
+                if project_id is not None and record.get("project_id") != project_id:
+                    continue
+                if scope is not None and record.get("scope") != scope:
+                    continue
+                records.append(record)
+            records.sort(key=lambda item: item["id"])
+            return records[:4000]
 
     def _apply_change(self, change: dict) -> None:
         target = self.target(change["path"])
@@ -232,7 +410,8 @@ class Vault:
                 self._apply_change(change)
         with self.diagnostics._connect(writable=True) as connection:
             for change in changes:
-                self._index(connection, change["path"], change["after"], change["id"])
+                if change["after"] is None:
+                    connection.execute("INSERT OR IGNORE INTO tombstones VALUES (?)", (change["id"],))
             connection.execute(
                 "UPDATE operations SET state = 'completed', changes = '[]' WHERE id = ?", (operation_id,)
             )
@@ -303,8 +482,6 @@ class Vault:
                 preserved.append((relative, content, change["id"]))
             output = {"operation_id": operation_id, "abandoned": True, "preserved_external": True}
             with self.diagnostics._connect(writable=True) as connection:
-                for relative, content, record_id in preserved:
-                    self._index(connection, relative, content, record_id)
                 connection.execute("UPDATE operations SET state = 'completed', changes = '[]', result = ? WHERE id = ?",
                                    (json.dumps(output), operation_id))
             return output
@@ -332,11 +509,9 @@ class Vault:
                 with self.diagnostics._connect() as connection:
                     if record and connection.execute("SELECT 1 FROM tombstones WHERE id = ?", (record_id,)).fetchone():
                         raise DiagnosticError("RECORD_DELETED", "Deleted record identities cannot be recreated.")
-                    indexed = connection.execute(
-                        "SELECT id, path FROM records WHERE id = ? OR path = ?", (record_id, relative)
-                    ).fetchall()
-                    if any(row["id"] != record_id or row["path"] != relative for row in indexed):
-                        raise DiagnosticError("VERSION_CONFLICT", "Record identity and path must remain paired.")
+                existing_path = self._find_record_path(record_id)
+                if existing_path is not None and existing_path != relative:
+                    raise DiagnosticError("VERSION_CONFLICT", "Record identity and path must remain paired.")
                 after = encode_record(record) if record else None
                 if after is not None:
                     decode_record(after.encode("utf-8"))
@@ -358,7 +533,7 @@ class Vault:
             seen = set()
             with self.diagnostics._connect() as connection:
                 deleted = {row[0] for row in connection.execute("SELECT id FROM tombstones")}
-            for directory in ("projects", "tasks", "knowledge", "architecture", "records", "users"):
+            for directory in RECORD_DIRECTORIES:
                 root = self.home / directory
                 if not root.exists():
                     continue
@@ -378,8 +553,4 @@ class Vault:
                         records.append((relative, content.decode("utf-8"), record["id"]))
                     except (DiagnosticError, OSError) as error:
                         errors.append({"path": str(target.relative_to(self.home)), "error": str(error)})
-            with self.diagnostics._connect(writable=True) as connection:
-                connection.execute("DELETE FROM records")
-                for relative, content, record_id in records:
-                    self._index(connection, relative, content, record_id)
             return {"indexed": len(records), "errors": errors}

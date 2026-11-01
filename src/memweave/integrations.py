@@ -8,26 +8,38 @@ from pathlib import Path
 from memweave.diagnostics import DiagnosticError
 
 
-def server_command(home: Path, toolset: str = "core") -> dict:
-    if toolset not in ("core", "full"):
-        raise DiagnosticError("RECORD_INVALID", "toolset must be core or full.")
+CURSOR_HOOK_EVENTS = ("sessionStart", "sessionEnd")
+CODEX_HOOK_EVENTS = ("SessionStart", "Interrupt", "SessionEnd")
+CURSOR_LEGACY_HOOK_EVENTS = (
+    "stop", "preCompact", "afterMCPExecution", "afterFileEdit",
+)
+CODEX_LEGACY_HOOK_EVENTS = (
+    "Stop", "UserPromptSubmit", "PostToolUse", "PreCompact",
+)
+
+
+def server_command(home: Path, toolset: str | None = None, *, diagnostic: bool = False) -> dict:
+    """Return the one configured MCP entry; toolset is accepted only for legacy callers."""
+    if toolset not in (None, "core", "full", "universal"):
+        raise DiagnosticError("RECORD_INVALID", "Tool selection is not a user-facing mode.")
+    args = ["-m", "memweave", "serve", "--home", str(home.expanduser().resolve())]
+    if diagnostic:
+        args.append("--diagnostic")
     return {
         "command": str(Path(sys.executable).absolute()),
-        "args": ["-m", "memweave", "serve", "--home", str(home.expanduser().resolve())]
-                + (["--toolset", "full"] if toolset == "full" else []),
+        "args": args,
         "env": {"PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"},
     }
 
 
-def client_configuration(client: str, kind: str, home: Path, toolset: str = "core", *, root=None) -> str:
-    server = server_command(home, toolset)
+def client_configuration(client: str, kind: str, home: Path, toolset: str | None = None, *, root=None) -> str:
+    server = server_command(home)
     if kind == "hooks":
         if client == "codex":
             if root is None or not Path(root).is_absolute():
                 raise DiagnosticError("RECORD_INVALID", "Codex Hooks require an absolute --root.")
             hooks = {}
-            for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "PreCompact",
-                          "Stop", "Interrupt", "SessionEnd"):
+            for event in CODEX_HOOK_EVENTS:
                 arguments = [
                     server["command"], "-X", "utf8", "-m", "memweave", "hook",
                     "--home", str(home.expanduser().resolve()), "--client", "codex",
@@ -40,7 +52,7 @@ def client_configuration(client: str, kind: str, home: Path, toolset: str = "cor
                     "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand " + encoded,
                     "timeout": 3 if event in ("Interrupt", "SessionEnd") else 10,
                 }
-                if event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
+                if event == "SessionStart":
                     entry["additionalContextLimit"] = 5000
                 group = {"hooks": [entry]}
                 if event == "SessionStart":
@@ -48,7 +60,7 @@ def client_configuration(client: str, kind: str, home: Path, toolset: str = "cor
                 hooks[event] = [group]
             return json.dumps({"hooks": hooks}, ensure_ascii=False, indent=2)
         hooks = {}
-        for event in ("sessionStart", "sessionEnd", "preCompact", "afterMCPExecution", "afterFileEdit", "stop"):
+        for event in CURSOR_HOOK_EVENTS:
             arguments = [
                 server["command"], "-X", "utf8", "-m", "memweave", "hook",
                 "--home", str(home.expanduser().resolve()),
@@ -61,8 +73,6 @@ def client_configuration(client: str, kind: str, home: Path, toolset: str = "cor
             else:
                 command = shlex.join(arguments)
             hooks[event] = [{"command": command}]
-            if event == "stop":
-                hooks[event][0]["loop_limit"] = 1
         return json.dumps({"version": 1, "hooks": hooks}, ensure_ascii=False, indent=2)
     if client == "cursor":
         return json.dumps({"mcpServers": {"memweave": server}}, ensure_ascii=False, indent=2)

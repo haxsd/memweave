@@ -44,16 +44,94 @@ class CodexHookTests(unittest.TestCase):
         return self.hook("PostToolUse", tool_name="mcp__memweave__memweave_" + name,
                          tool_input=parameters, tool_response={"structuredContent": {"status": "ok", "data": response}})
 
-    def test_start_context_uses_codex_protocol_without_auto_resuming_old_task(self):
-        self.call("memory_write", project_id=self.project["id"], title="policy", body="PROJECT_POLICY_VISIBLE",
+    def test_start_context_uses_codex_protocol_and_auto_resumes_unique_task(self):
+        self.call("memory_write", project_id=self.project["id"], title="policy",
+                  body="PROJECT_POLICY_VISIBLE verify change regression",
                   sources=[{"type": "user", "reference": "explicit"}], operation_id="knowledge")
         self.task()
         response = self.hook("SessionStart", source="startup")
         output = response["hookSpecificOutput"]
         self.assertEqual(output["hookEventName"], "SessionStart")
         self.assertIn("PROJECT_POLICY_VISIBLE", output["additionalContext"])
-        self.assertNotIn("verify change", output["additionalContext"])
-        self.assertIn(".agents/skills/memweave-continuity", output["additionalContext"])
+        self.assertIn("verify change", output["additionalContext"])
+        self.assertIn("唯一 current 任务", output["additionalContext"])
+        self.assertIn("memweave-continuity", output["additionalContext"])
+
+    def test_new_session_restores_current_checkpoint_and_never_resumes_queued_task(self):
+        task = self.task()
+        self.call(
+            "task_checkpoint", task_id=task["id"], expected_revision=task["revision"],
+            expected_etag=task["etag"], findings="root cause located",
+            progress="regression still failing", next_step="NEXT_RESUME_ACTION",
+            operation_id="resume-checkpoint",
+        )
+        restored = self.hook("SessionStart", source="startup", session_id="new-session")
+        text = restored["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(task["id"], text)
+        self.assertIn("NEXT_RESUME_ACTION", text)
+        second = self.call(
+            "task_open", project_id=self.project["id"], title="second task", goal="SECOND_TASK_GOAL",
+            acceptance=["second acceptance"], operation_id="second-task",
+        )
+        self.assertEqual(second["status"], "queued")
+        resumed = self.hook("SessionStart", source="startup", session_id="third-session")
+        context = resumed["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("唯一 current 任务", context)
+        self.assertIn(task["id"], context)
+        self.assertIn("NEXT_RESUME_ACTION", context)
+        self.assertNotIn(second["id"], context)
+
+    def test_parent_project_hook_does_not_inject_into_nested_memweave_project(self):
+        nested = self.root / "nested"
+        nested.mkdir()
+        (nested / ".codex").mkdir()
+        (nested / ".codex" / "memweave.json").write_text(
+            json.dumps({"root": str(nested)}), encoding="utf-8"
+        )
+        self.task()
+        response = self.hook("SessionStart", source="startup", cwd=str(nested))
+        self.assertEqual(response, {})
+
+    def test_user_prompt_recalls_by_user_wording_deduplicates_and_does_not_persist_prompt(self):
+        self.call(
+            "memory_write", project_id=self.project["id"], title="任务接续方法",
+            body=(
+                "切换工具前保存检查点，恢复时读取当前任务、最新进展和下一步。\n"
+                "Retrieval cues: resume previous work in another client, where left off"
+            ),
+            sources=[{"type": "user", "reference": "task continuity"}],
+            operation_id="prompt-recall",
+        )
+        prompt = "resume previous work in another client PRIVATE_PROMPT_TOKEN_9f3a"
+        first = self.hook("UserPromptSubmit", prompt=prompt, turn_id="turn-2")
+        text = first["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("任务接续方法", text)
+        self.assertIn("切换工具前保存检查点", text)
+        self.assertIn("可能不适用", text)
+        self.assertEqual(self.hook("UserPromptSubmit", prompt=prompt, turn_id="turn-3"), {})
+        with self.service.vault.diagnostics._connect() as connection:
+            dump = "\n".join(connection.iterdump())
+        self.assertNotIn("PRIVATE_PROMPT_TOKEN_9f3a", dump)
+
+    def test_paraphrased_question_without_lexical_match_does_not_inject_recent_background(self):
+        self.call(
+            "memory_write", project_id=self.project["id"], title="任务接续方法",
+            body="切换工具前保存检查点，恢复时读取当前任务和下一步。",
+            sources=[{"type": "user", "reference": "explicit"}],
+            operation_id="continuity",
+        )
+        self.call(
+            "memory_write", project_id=self.project["id"], title="验收候选知识",
+            body="候选知识经核对并明确启用后，才进入常规检索与上下文。",
+            sources=[{"type": "host", "reference": "validation"}],
+            operation_id="acceptance",
+        )
+        response = self.hook(
+            "UserPromptSubmit", prompt="怎样在新窗口知道旧线程做到哪里", turn_id="turn-2"
+        )
+        text = response.get("hookSpecificOutput", {}).get("additionalContext", "")
+        self.assertNotIn("任务接续方法", text)
+        self.assertNotIn("recent background", text)
 
     def test_real_work_without_task_prompts_capture_once_without_fabricating_records(self):
         self.hook("PostToolUse", tool_name="apply_patch",
@@ -67,6 +145,8 @@ class CodexHookTests(unittest.TestCase):
         self.assertEqual(self.call("task_list", project_id=self.project["id"])["items"], [])
 
     def test_task_checkpoint_and_consolidation_are_requested_from_actual_state(self):
+        self.service.start()
+        self.addCleanup(self.service.close)
         task = self.task()
         self.observe("task_open", {"project_id": self.project["id"]}, task)
         response = self.hook("Stop", stop_hook_active=False)
@@ -104,6 +184,8 @@ class CodexHookTests(unittest.TestCase):
         self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
 
     def test_completed_task_prompts_review_then_stops_after_real_review(self):
+        self.service.start()
+        self.addCleanup(self.service.close)
         task = self.task()
         self.observe("task_open", {}, task)
         closed = self.call(

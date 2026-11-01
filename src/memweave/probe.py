@@ -18,7 +18,7 @@ def probe_data(response) -> dict:
 async def run_probe(home: Path) -> dict:
     if not Diagnostics(home).status()["data"]["initialized"]:
         raise DiagnosticError("NOT_INITIALIZED", "Run memweave init before the probe.")
-    parameters = StdioServerParameters(**server_command(home, toolset="full"))
+    parameters = StdioServerParameters(**server_command(home, diagnostic=True))
     operation_id = "stdio-" + uuid4().hex
     marker = "MemWeave · 织忆 · restart readback"
     try:

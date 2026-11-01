@@ -1,0 +1,176 @@
+"""API composition root for Basic Memory.
+
+This container owns reading ConfigManager and environment variables for the
+API entrypoint. Downstream modules receive config/dependencies explicitly
+rather than reading globals.
+
+Design principles:
+- Only this module reads ConfigManager directly
+- Runtime mode (cloud/local/test) is resolved here
+- Factories for services are provided, not singletons
+"""
+
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, AsyncSession
+
+from basic_memory import db
+from basic_memory.config import BasicMemoryConfig, ConfigManager
+from basic_memory.read_cache.redis import RedisReadCache
+from basic_memory.runtime.mode import RuntimeMode, resolve_runtime_mode
+
+if TYPE_CHECKING:  # pragma: no cover
+    from basic_memory.index.watch_coordinator import WatchCoordinator
+
+
+@dataclass
+class ApiContainer:
+    """Composition root for the API entrypoint.
+
+    Holds resolved configuration and runtime context.
+    Created once at app startup, then used to wire dependencies.
+    """
+
+    config: BasicMemoryConfig
+    mode: RuntimeMode
+
+    # --- Database ---
+    # Cached database connections (set during lifespan startup)
+    engine: AsyncEngine | None = None
+    session_maker: async_sessionmaker[AsyncSession] | None = None
+
+    # --- Optional semantic read cache ---
+    # Hosts inject a namespace-bound implementation. Standalone MCP may install
+    # one for its in-process ASGI path; unconfigured callers receive None.
+    read_cache: RedisReadCache | None = None
+
+    @classmethod
+    def create(cls) -> "ApiContainer":  # pragma: no cover
+        """Create container by reading ConfigManager.
+
+        This is the single point where API reads global config.
+        """
+        config = ConfigManager().config
+        mode = resolve_runtime_mode(
+            is_test_env=config.is_test_env,
+        )
+        return cls(config=config, mode=mode)
+
+    # --- Runtime Mode Properties ---
+
+    @property
+    def should_watch_files(self) -> bool:
+        """Whether local file watching should be started.
+
+        Watching is enabled when:
+        - index_changes is True in config
+        - Not in test mode (tests manage their own watcher lifecycle)
+        - Not in cloud mode (cloud handles storage events differently)
+        """
+        return self.config.index_changes and not self.mode.is_test and not self.mode.is_cloud
+
+    @property
+    def watch_skip_reason(self) -> str | None:  # pragma: no cover
+        """Reason why local watching is skipped, or None if it should run.
+
+        Useful for logging why local watching was disabled.
+        """
+        if self.mode.is_test:
+            return "Test environment detected"
+        if self.mode.is_cloud:
+            return "Cloud mode enabled"
+        if not self.config.index_changes:
+            return "Local file watching disabled"
+        return None
+
+    def create_watch_coordinator(self) -> "WatchCoordinator":  # pragma: no cover
+        """Create a WatchCoordinator with this container's settings.
+
+        Returns:
+            WatchCoordinator configured for this runtime environment
+        """
+        # Deferred import to avoid circular dependency
+        from basic_memory.index.watch_coordinator import WatchCoordinator
+
+        return WatchCoordinator(
+            config=self.config,
+            should_watch=self.should_watch_files,
+            skip_reason=self.watch_skip_reason,
+            read_cache=self.read_cache,
+        )
+
+    # --- Database Factory ---
+
+    async def init_database(  # pragma: no cover
+        self,
+    ) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
+        """Initialize and cache database connections.
+
+        Returns:
+            Tuple of (engine, session_maker)
+        """
+        engine, session_maker = await db.get_or_create_db(self.config.database_path)
+        self.engine = engine
+        self.session_maker = session_maker
+        return engine, session_maker
+
+    async def shutdown_database(self) -> None:  # pragma: no cover
+        """Clean up database connections."""
+        await db.shutdown_db()
+
+
+# Module-level container instance (set by lifespan)
+# This allows deps.py to access the container without reading ConfigManager
+_container: ApiContainer | None = None
+
+
+def get_container() -> ApiContainer:
+    """Get the current API container.
+
+    Raises:
+        RuntimeError: If container hasn't been initialized
+    """
+    if _container is None:
+        raise RuntimeError("API container not initialized. Call set_container() first.")
+    return _container
+
+
+def resolve_container() -> ApiContainer:
+    """Return the lifespan-installed container, or a fresh one off-lifespan.
+
+    The CLI/MCP local ASGI flow serves requests without running the API
+    lifespan, so no container is installed there. Creating a fresh container
+    keeps the ConfigManager read inside the composition root. The fresh
+    container is deliberately not cached in the module global: ConfigManager
+    already caches config with mtime invalidation, and a cached container here
+    would go stale when the CLI or tests rewrite the config file.
+    """
+    if _container is not None:
+        return _container
+    return ApiContainer.create()
+
+
+def set_container(container: ApiContainer) -> None:
+    """Set the API container (called by lifespan)."""
+    global _container
+    _container = container
+
+
+def has_installed_container() -> bool:
+    """Whether an MCP or API host has installed its container for this process."""
+    return _container is not None
+
+
+@contextmanager
+def installed_container(container: ApiContainer) -> Iterator[None]:
+    """Temporarily expose a container to off-lifespan ASGI requests."""
+    global _container
+    previous = _container
+    _container = container
+    try:
+        yield
+    finally:
+        _container = previous

@@ -1,0 +1,417 @@
+"""Directory service for managing file directories and tree structure."""
+
+import fnmatch
+import logging
+import os
+from datetime import datetime
+from typing import Dict, List, Optional, Sequence, assert_never
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from basic_memory import db
+from basic_memory.models import Entity
+from basic_memory.repository import EntityRepository
+from basic_memory.schemas.directory import (
+    DEFAULT_DIRECTORY_PAGE_SIZE,
+    MAX_DIRECTORY_PAGE_SIZE,
+    DirectoryListResponse,
+    DirectoryNode,
+    DirectorySortOrder,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _required_file_updated_at(node: DirectoryNode) -> datetime:
+    """Return the timestamp required by an explicit updated-time sort."""
+    if node.updated_at is None:
+        raise ValueError(f"File directory node '{node.directory_path}' is missing updated_at")
+    return node.updated_at
+
+
+def _stored_file_format(entity: Entity) -> str | None:
+    """Return the format the indexer stored for a non-Markdown file entity.
+
+    Markdown notes are skipped because their metadata is user frontmatter, where a
+    ``format`` key means whatever the author meant, not the file's format.
+    """
+    if entity.is_markdown or entity.entity_metadata is None:
+        return None
+    return entity.entity_metadata.get("format")
+
+
+def _file_identity_key(node: DirectoryNode) -> tuple[str, str, str]:
+    """Order files deterministically by display title, path, then stable identity."""
+    return (
+        (node.title or node.name).casefold(),
+        node.directory_path.casefold(),
+        node.external_id or "",
+    )
+
+
+class DirectoryService:
+    """Service for working with directory trees."""
+
+    def __init__(
+        self,
+        entity_repository: EntityRepository,
+        session_maker: async_sessionmaker[AsyncSession],
+    ):
+        """Initialize the directory service.
+
+        Args:
+            entity_repository: Directory repository for data access.
+        """
+        self.entity_repository = entity_repository
+        self.session_maker = session_maker
+
+    async def get_directory_tree(self) -> DirectoryNode:
+        """Build a hierarchical directory tree from indexed files."""
+
+        # Get all files from DB (flat list)
+        async with db.scoped_session(self.session_maker) as session:
+            entity_rows = await self.entity_repository.find_all(session)
+
+        # Create a root directory node
+        root_node = DirectoryNode(name="Root", directory_path="/", type="directory")
+
+        # Map to store directory nodes by path for easy lookup
+        dir_map: Dict[str, DirectoryNode] = {root_node.directory_path: root_node}
+
+        # First pass: create all directory nodes
+        for file in entity_rows:
+            # Process directory path components
+            parts = [p for p in file.file_path.split("/") if p]
+
+            # Create directory structure
+            current_path = "/"
+            for i, part in enumerate(parts[:-1]):  # Skip the filename
+                parent_path = current_path
+                # Build the directory path
+                current_path = (
+                    f"{current_path}{part}" if current_path == "/" else f"{current_path}/{part}"
+                )
+
+                # Create directory node if it doesn't exist
+                if current_path not in dir_map:
+                    dir_node = DirectoryNode(
+                        name=part, directory_path=current_path, type="directory"
+                    )
+                    dir_map[current_path] = dir_node
+
+                    # Add to parent's children
+                    if parent_path in dir_map:
+                        dir_map[parent_path].children.append(dir_node)
+
+        # Second pass: add file nodes to their parent directories
+        for file in entity_rows:
+            file_name = os.path.basename(file.file_path)
+            parent_dir = os.path.dirname(file.file_path)
+            directory_path = "/" if parent_dir == "" else f"/{parent_dir}"
+
+            # Create file node
+            file_node = DirectoryNode(
+                name=file_name,
+                file_path=file.file_path,  # Original path from DB (no leading slash)
+                directory_path=f"/{file.file_path}",  # Path with leading slash
+                type="file",
+                title=file.title,
+                permalink=file.permalink,
+                external_id=file.external_id,  # UUID for v2 API
+                entity_id=file.id,
+                note_type=file.note_type,
+                content_type=file.content_type,
+                format=_stored_file_format(file),
+                updated_at=file.updated_at,
+            )
+
+            # Add to parent directory's children
+            if directory_path in dir_map:
+                dir_map[directory_path].children.append(file_node)
+            else:
+                # If parent directory doesn't exist (should be rare), add to root
+                dir_map["/"].children.append(file_node)  # pragma: no cover
+
+        # Return the root node with its children
+        return root_node
+
+    async def get_directory_structure(self) -> DirectoryNode:
+        """Build a hierarchical directory structure without file details.
+
+        Optimized method for folder navigation that only returns directory nodes,
+        no file metadata. Much faster than get_directory_tree() for large knowledge bases.
+
+        Returns:
+            DirectoryNode tree containing only folders (type="directory")
+        """
+        # Get unique directories without loading entities
+        async with db.scoped_session(self.session_maker) as session:
+            directories = await self.entity_repository.get_distinct_directories(session)
+
+        # Create a root directory node
+        root_node = DirectoryNode(name="Root", directory_path="/", type="directory")
+
+        # Map to store directory nodes by path for easy lookup
+        dir_map: Dict[str, DirectoryNode] = {"/": root_node}
+
+        # Build tree with just folders
+        for dir_path in directories:
+            parts = [p for p in dir_path.split("/") if p]
+            current_path = "/"
+
+            for i, part in enumerate(parts):
+                parent_path = current_path
+                # Build the directory path
+                current_path = (
+                    f"{current_path}{part}" if current_path == "/" else f"{current_path}/{part}"
+                )
+
+                # Create directory node if it doesn't exist
+                if current_path not in dir_map:
+                    dir_node = DirectoryNode(
+                        name=part, directory_path=current_path, type="directory"
+                    )
+                    dir_map[current_path] = dir_node
+
+                    # Add to parent's children
+                    if parent_path in dir_map:
+                        dir_map[parent_path].children.append(dir_node)
+
+        return root_node
+
+    async def list_directory(
+        self,
+        dir_name: str = "/",
+        depth: int = 1,
+        file_name_glob: Optional[str] = None,
+        sort: DirectorySortOrder | None = None,
+        page: int = 1,
+        page_size: int = DEFAULT_DIRECTORY_PAGE_SIZE,
+    ) -> DirectoryListResponse:
+        """List directory contents with filtering and depth control.
+
+        Args:
+            dir_name: Directory path to list (default: root "/")
+            depth: Recursion depth (1 = immediate children only)
+            file_name_glob: Glob pattern for filtering file names
+            sort: Optional title or updated-time ordering for files
+            page: One-indexed result page
+            page_size: Number of nodes per page
+
+        Returns:
+            Bounded page of DirectoryNode objects matching the criteria
+        """
+        if page < 1:
+            raise ValueError(f"page must be >= 1, got {page}")
+        if page_size < 1:
+            raise ValueError(f"page_size must be >= 1, got {page_size}")
+        if page_size > MAX_DIRECTORY_PAGE_SIZE:
+            raise ValueError(f"page_size must be <= {MAX_DIRECTORY_PAGE_SIZE}, got {page_size}")
+
+        # Normalize directory path
+        # Strip ./ prefix if present (handles relative path notation)
+        if dir_name.startswith("./"):
+            dir_name = dir_name[2:]  # Remove "./" prefix
+
+        # Ensure path starts with "/"
+        if not dir_name.startswith("/"):
+            dir_name = f"/{dir_name}"
+
+        # Remove trailing slashes except for root
+        if dir_name != "/" and dir_name.endswith("/"):
+            dir_name = dir_name.rstrip("/")
+
+        # Optimize: Query only entities in the target directory
+        # instead of loading the entire tree
+        dir_prefix = dir_name.lstrip("/")
+        async with db.scoped_session(self.session_maker) as session:
+            entity_rows = await self.entity_repository.find_by_directory_prefix(session, dir_prefix)
+
+        # Build a partial tree from only the relevant entities
+        root_tree = self._build_directory_tree_from_entities(entity_rows, dir_name)
+
+        # Find the target directory node
+        target_node = self._find_directory_node(root_tree, dir_name)
+        if not target_node:
+            return DirectoryListResponse(  # pragma: no cover
+                nodes=[],
+                page=page,
+                page_size=page_size,
+                total=0,
+                has_more=False,
+            )
+
+        # Collect nodes with depth and glob filtering
+        result: list[DirectoryNode] = []
+        self._collect_nodes_recursive(target_node, result, depth, file_name_glob, 0)
+
+        if sort is None:
+            # Omitting sort is a compatibility contract: existing callers retain the
+            # historical folders-first filename order.
+            result.sort(
+                key=lambda node: (
+                    0 if node.type == "directory" else 1,
+                    node.name.casefold(),
+                    node.directory_path.casefold(),
+                    node.directory_path,
+                )
+            )
+        else:
+            directories = [node for node in result if node.type == "directory"]
+            files = [node for node in result if node.type == "file"]
+
+            # Directories are implicit projections of file paths, so they have no
+            # canonical updated_at. Title sorting applies the selected direction to
+            # folder names; updated sorting keeps the folder group name-ascending.
+            directories.sort(
+                key=lambda node: (
+                    node.name.casefold(),
+                    node.directory_path.casefold(),
+                    node.directory_path,
+                ),
+                reverse=sort == "title_desc",
+            )
+
+            match sort:
+                case "title_asc" | "title_desc":
+                    files.sort(key=_file_identity_key, reverse=sort == "title_desc")
+                case "updated_asc" | "updated_desc":
+                    # Stable secondary ordering prevents equal timestamps from moving
+                    # between pages when repository row order changes.
+                    files.sort(key=_file_identity_key)
+                    files.sort(
+                        key=_required_file_updated_at,
+                        reverse=sort == "updated_desc",
+                    )
+                case _ as unreachable:  # pragma: no cover - closed type is exhaustive
+                    assert_never(unreachable)
+
+            result = [*directories, *files]
+
+        total = len(result)
+        start = (page - 1) * page_size
+        end = start + page_size
+        # Directory nodes in the collection still reference their complete child trees.
+        # Returning those trees would bypass the page bound when the response is serialized.
+        nodes = [node.model_copy(update={"children": []}) for node in result[start:end]]
+        return DirectoryListResponse(
+            nodes=nodes,
+            page=page,
+            page_size=page_size,
+            total=total,
+            has_more=end < total,
+        )
+
+    def _build_directory_tree_from_entities(
+        self, entity_rows: Sequence[Entity], root_path: str
+    ) -> DirectoryNode:
+        """Build a directory tree from a subset of entities.
+
+        Args:
+            entity_rows: Sequence of entity objects to build tree from
+            root_path: Root directory path for the tree
+
+        Returns:
+            DirectoryNode representing the tree root
+        """
+        # Create a root directory node
+        root_node = DirectoryNode(name="Root", directory_path=root_path, type="directory")
+
+        # Map to store directory nodes by path for easy lookup
+        dir_map: Dict[str, DirectoryNode] = {root_path: root_node}
+
+        # First pass: create all directory nodes
+        for file in entity_rows:
+            # Process directory path components
+            parts = [p for p in file.file_path.split("/") if p]
+
+            # Create directory structure
+            current_path = "/"
+            for i, part in enumerate(parts[:-1]):  # Skip the filename
+                parent_path = current_path
+                # Build the directory path
+                current_path = (
+                    f"{current_path}{part}" if current_path == "/" else f"{current_path}/{part}"
+                )
+
+                # Create directory node if it doesn't exist
+                if current_path not in dir_map:
+                    dir_node = DirectoryNode(
+                        name=part, directory_path=current_path, type="directory"
+                    )
+                    dir_map[current_path] = dir_node
+
+                    # Add to parent's children
+                    if parent_path in dir_map:
+                        dir_map[parent_path].children.append(dir_node)
+
+        # Second pass: add file nodes to their parent directories
+        for file in entity_rows:
+            file_name = os.path.basename(file.file_path)
+            parent_dir = os.path.dirname(file.file_path)
+            directory_path = "/" if parent_dir == "" else f"/{parent_dir}"
+
+            # Create file node
+            file_node = DirectoryNode(
+                name=file_name,
+                file_path=file.file_path,
+                directory_path=f"/{file.file_path}",
+                type="file",
+                title=file.title,
+                permalink=file.permalink,
+                external_id=file.external_id,  # UUID for v2 API
+                entity_id=file.id,
+                note_type=file.note_type,
+                content_type=file.content_type,
+                format=_stored_file_format(file),
+                updated_at=file.updated_at,
+            )
+
+            # Add to parent directory's children
+            if directory_path in dir_map:
+                dir_map[directory_path].children.append(file_node)
+            elif root_path in dir_map:  # pragma: no cover
+                # Fallback to root if parent not found
+                dir_map[root_path].children.append(file_node)  # pragma: no cover
+
+        return root_node
+
+    def _find_directory_node(
+        self, root: DirectoryNode, target_path: str
+    ) -> Optional[DirectoryNode]:
+        """Find a directory node by path in the tree."""
+        if root.directory_path == target_path:
+            return root
+
+        for child in root.children:  # pragma: no cover
+            if child.type == "directory":  # pragma: no cover
+                found = self._find_directory_node(child, target_path)  # pragma: no cover
+                if found:  # pragma: no cover
+                    return found  # pragma: no cover
+
+        return None  # pragma: no cover
+
+    def _collect_nodes_recursive(
+        self,
+        node: DirectoryNode,
+        result: List[DirectoryNode],
+        max_depth: int,
+        file_name_glob: Optional[str],
+        current_depth: int,
+    ) -> None:
+        """Recursively collect nodes with depth and glob filtering."""
+        if current_depth >= max_depth:
+            return
+
+        for child in node.children:
+            # The glob gates inclusion in the results only. Recursion below must not
+            # be gated by it: directory names rarely match file globs (e.g. "test"
+            # vs "*.md"), and pruning here would hide every file beneath them.
+            if not file_name_glob or fnmatch.fnmatch(child.name, file_name_glob):
+                result.append(child)
+
+            # Recurse into subdirectories if we haven't reached max depth
+            if child.type == "directory" and current_depth < max_depth:
+                self._collect_nodes_recursive(
+                    child, result, max_depth, file_name_glob, current_depth + 1
+                )

@@ -75,6 +75,23 @@ class VaultTests(unittest.TestCase):
         self.assertEqual(self.create(), {"id": "memory_one"})
         self.assertEqual(restored.recover()["recovered"], 0)
 
+    def test_read_and_list_recover_a_pending_write_after_writer_exit(self):
+        self.create()
+        with patch.object(self.vault, "_apply_change", side_effect=RuntimeError("writer exit")):
+            with self.assertRaises(RuntimeError):
+                self.vault.commit("pending-update", {"update": True}, lambda: (
+                    [{
+                        "record": {**self.record(body="recovered content"), "revision": 2},
+                        "path": "records/memory_one.md",
+                        "expected": self.vault.read("memory_one")["etag"],
+                    }],
+                    {"id": "memory_one"},
+                ))
+        restarted = Vault(self.vault.home)
+        self.assertEqual(restarted.read("memory_one")["body"], "recovered content")
+        self.assertEqual([item["id"] for item in restarted.list_records("memory")], ["memory_one"])
+        self.assertEqual(restarted.recovery_status()["items"], [])
+
     def test_recovery_conflict_preserves_external_content(self):
         self.create()
         old = self.vault.read("memory_one")

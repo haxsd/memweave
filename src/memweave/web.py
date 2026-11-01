@@ -6,7 +6,8 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
-from urllib.parse import urlsplit
+from pathlib import Path
+from urllib.parse import urlencode, urlsplit
 
 from memweave.diagnostics import DiagnosticError
 
@@ -17,12 +18,17 @@ MAX_BODY_BYTES = 256 * 1024
 class LocalHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, service, port):
+    def __init__(self, service, port, preferred_root=None):
         self.service = service
         self.token = secrets.token_urlsafe(32)
         super().__init__(("127.0.0.1", port), LocalRequestHandler)
         self.timeout = 0.5
-        self.url = f"http://127.0.0.1:{self.server_port}/?token={self.token}"
+        parameters = {"token": self.token}
+        if preferred_root is not None:
+            root = Path(preferred_root).expanduser()
+            if root.is_dir():
+                parameters["project"] = str(root.resolve())
+        self.url = f"http://127.0.0.1:{self.server_port}/?{urlencode(parameters)}"
 
     def handle_error(self, request, client_address):
         pass
@@ -211,12 +217,12 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
             self._respond(200, output)
 
 
-def create_http_server(service, port=0):
-    return LocalHTTPServer(service, port)
+def create_http_server(service, port=0, preferred_root=None):
+    return LocalHTTPServer(service, port, preferred_root)
 
 
-def serve_ui(service, port=8765, open_browser=True):
-    with create_http_server(service, port) as server:
+def serve_ui(service, port=8765, open_browser=True, preferred_root=None):
+    with create_http_server(service, port, preferred_root) as server:
         print(server.url, flush=True)
         if open_browser:
             webbrowser.open(server.url)

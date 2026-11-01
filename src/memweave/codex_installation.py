@@ -13,7 +13,9 @@ from memweave.diagnostics import DiagnosticError, Diagnostics
 from memweave.installation import (
     ProjectFiles, apply_plan, fingerprint, json_bytes, probe_installation, selected_home,
 )
-from memweave.integrations import client_configuration, server_command
+from memweave.integrations import (
+    CODEX_HOOK_EVENTS, CODEX_LEGACY_HOOK_EVENTS, client_configuration, server_command,
+)
 from memweave.services import Service
 
 
@@ -21,10 +23,8 @@ MANIFEST = ".codex/memweave.json"
 CONFIG = ".codex/config.toml"
 HOOKS = ".codex/hooks.json"
 SKILL = ".agents/skills/memweave-continuity/SKILL.md"
-EVENTS = {
-    "SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse",
-    "PreCompact", "Stop", "Interrupt",
-}
+EVENTS = set(CODEX_HOOK_EVENTS)
+LEGACY_EVENTS = set(CODEX_LEGACY_HOOK_EVENTS)
 REQUIRED_ACTIONS = [
     "在 Codex 中确认本项目可信，使项目级 .codex/config.toml 可以加载。",
     "在支持 Hooks 的 Codex 中通过 /hooks 审查并信任本次 Hook 定义；更新定义后需重新审查。",
@@ -32,10 +32,10 @@ REQUIRED_ACTIONS = [
 ]
 
 
-def report(project, home, toolset, **fields):
+def report(project, home, toolset=None, **fields):
     return dict(
         version=__version__, client="codex", root=str(project.root), home=str(home),
-        toolset=toolset, tool_count=20 if toolset == "core" else 27,
+        toolset="universal", tool_count=22,
         protocol_verification="not_run", desktop_verification="unverified",
         hook_trust="requires_host_review", required_actions=list(REQUIRED_ACTIONS), **fields,
     )
@@ -52,7 +52,7 @@ def manifest_data(project):
     if (
         manifest.get("format") != 1 or manifest.get("client") != "codex"
         or manifest.get("root") != str(project.root)
-        or manifest.get("toolset") not in ("core", "full")
+        or manifest.get("toolset") not in (None, "core", "full", "universal")
         or not isinstance(manifest.get("version"), str)
         or not isinstance(manifest.get("home"), str)
         or not Path(manifest["home"]).is_absolute()
@@ -62,7 +62,7 @@ def manifest_data(project):
         or resources[SKILL].get("managed") is not True
         or not isinstance(resources[SKILL].get("sha256"), str)
         or not re.fullmatch(r"[a-f0-9]{64}", resources[SKILL]["sha256"])
-        or not isinstance(hooks, dict) or set(hooks) != EVENTS
+        or not isinstance(hooks, dict) or not set(hooks).issubset(EVENTS | LEGACY_EVENTS)
         or any(not isinstance(groups, list) or not groups for groups in hooks.values())
         or any(not isinstance(group, dict) or not isinstance(group.get("hooks"), list)
                or not group["hooks"] or any(
@@ -113,8 +113,8 @@ def hook_data(project):
     return configuration
 
 
-def generated_hooks(project, home, toolset):
-    return json.loads(client_configuration("codex", "hooks", home, toolset, root=project.root))["hooks"]
+def generated_hooks(project, home, toolset=None):
+    return json.loads(client_configuration("codex", "hooks", home, root=project.root))["hooks"]
 
 
 def merged_ignore(project, relative, lines):
@@ -132,7 +132,7 @@ def merged_ignore(project, relative, lines):
 def installation_plan(project, home, toolset, manifest):
     config = read_config(project)
     servers = table(config, "mcp_servers")
-    server = server_command(home, toolset)
+    server = server_command(home)
     if servers.get("memweave") not in (None, server, manifest.get("server")):
         raise DiagnosticError("SETUP_CONFLICT", "Existing MemWeave MCP differs; preserve or merge it first.")
     if owns_hook(config.get("hooks", {})):
@@ -144,7 +144,7 @@ def installation_plan(project, home, toolset, manifest):
         features["hooks"] = True
     configuration = hook_data(project)
     hooks = configuration["hooks"]
-    generated = generated_hooks(project, home, toolset)
+    generated = generated_hooks(project, home)
     for event, groups in generated.items():
         previous = manifest.get("hooks", {}).get(event, [])
         retained = []
@@ -155,9 +155,19 @@ def installation_plan(project, home, toolset, manifest):
                 raise DiagnosticError("SETUP_CONFLICT", f"Modified or unknown MemWeave Hook: {event}.")
             retained.append(group)
         hooks[event] = retained + groups
-    for event, groups in hooks.items():
-        if event not in generated and owns_hook(groups):
-            raise DiagnosticError("SETUP_CONFLICT", f"Unexpected MemWeave Hook event: {event}.")
+    previous = manifest.get("hooks", {})
+    for event in set(hooks) - set(generated):
+        retained = []
+        for group in hooks[event]:
+            if group in previous.get(event, []):
+                continue
+            if owns_hook(group):
+                raise DiagnosticError("SETUP_CONFLICT", f"Unexpected MemWeave Hook event: {event}.")
+            retained.append(group)
+        if retained:
+            hooks[event] = retained
+        else:
+            hooks.pop(event, None)
     skill = files("memweave").joinpath("skills", "memweave-continuity", "SKILL.md").read_bytes()
     current = project.read(SKILL)
     previous_hash = manifest.get("resources", {}).get(SKILL, {}).get("sha256")
@@ -176,7 +186,7 @@ def installation_plan(project, home, toolset, manifest):
         ),
         MANIFEST: json_bytes(dict(
             format=1, client="codex", version=__version__, root=str(project.root),
-            home=str(home), toolset=toolset, server=server, hooks=generated,
+            home=str(home), toolset="universal", server=server, hooks=generated,
             resources={SKILL: dict(sha256=fingerprint(skill), managed=True)},
         )),
     }
@@ -184,7 +194,7 @@ def installation_plan(project, home, toolset, manifest):
             if project.read(relative) != content}
 
 
-def setup_codex(root, home=None, toolset="core"):
+def setup_codex(root, home=None, toolset=None):
     project = ProjectFiles(root, directory=".")
     selected = selected_home(home, {})
     try:
@@ -218,7 +228,6 @@ def check_codex(root, home=None, probe=False):
     project = ProjectFiles(root, directory=".")
     checks = []
     selected = selected_home(home, {})
-    toolset = "core"
 
     def check(name, passed, message):
         checks.append(dict(name=name, state="ok" if passed else "error", message=message,
@@ -227,20 +236,17 @@ def check_codex(root, home=None, probe=False):
     try:
         manifest = manifest_data(project)
         selected = selected_home(home, manifest)
-        toolset = manifest.get("toolset", "core")
         config = read_config(project)
         servers = config.get("mcp_servers", {})
         if not isinstance(servers, Mapping):
             raise DiagnosticError("CONFIG_INVALID", "Codex mcp_servers must be a table.")
         existing = servers.get("memweave")
-        if not manifest and isinstance(existing, Mapping) and "--toolset" in existing.get("args", []):
-            toolset = "full"
-        server = server_command(selected, toolset)
-        check("mcp", existing == server, "MCP 必须匹配当前安装的解释器、参数、记忆库和工具集。")
+        server = server_command(selected)
+        check("mcp", existing == server, "MCP 必须匹配当前安装的解释器、参数、记忆库和通用工具面。")
         features = config.get("features", {})
         check("features", isinstance(features, Mapping) and features.get("hooks") is True, "项目已启用 Hooks。")
         check("inline_hooks", not owns_hook(config.get("hooks", {})), "没有重复的内联 MemWeave Hooks。")
-        expected = generated_hooks(project, selected, toolset)
+        expected = generated_hooks(project, selected)
         hooks = hook_data(project)["hooks"]
         check("hooks", all(
             all(group in hooks.get(event, []) for group in groups) for event, groups in expected.items()
@@ -253,6 +259,7 @@ def check_codex(root, home=None, probe=False):
         if manifest:
             check("manifest", manifest["version"] == __version__ and manifest["server"] == server
                   and manifest["hooks"] == expected and manifest["home"] == str(selected)
+                  and manifest.get("toolset") == "universal"
                   and manifest["resources"][SKILL]["sha256"] == fingerprint(skill),
                   "安装清单与当前版本和配置一致。")
         else:
@@ -261,19 +268,19 @@ def check_codex(root, home=None, probe=False):
         check("memory_home", status["initialized"] and status["task_memory"] == "available", "记忆库已初始化。")
         if status["initialized"] and status["task_memory"] == "available":
             prepared = Service(selected).workspace_prepare(str(project.root), intent="inspect")
-            check("project", prepared["state"] == "ready", "精确项目根目录已登记。")
+            check("project", prepared["state"] == "ready", "项目根目录或同仓库 worktree 已登记。")
     except (DiagnosticError, ValueError, KeyError, TypeError, AttributeError, OSError) as error:
         check("configuration", False, str(error) if isinstance(error, DiagnosticError) else "Invalid configuration.")
-    output = report(project, selected, toolset, state="ready" if all(
+    output = report(project, selected, state="ready" if all(
         item["state"] == "ok" for item in checks
     ) else "needs_attention", checks=checks)
     if probe and output["state"] == "ready":
         try:
             verified = asyncio.run(probe_installation(server, project.root))
-            valid = (verified["version"] == __version__ and verified["toolset"] == toolset
+            valid = (verified["version"] == __version__ and verified["toolset"] == "universal"
                      and verified["tool_count"] == output["tool_count"]
                      and Path(verified["home"]) == selected)
-            check("protocol", valid, "已验证配置中的 stdio 服务版本、工具集、根目录和记忆库。")
+            check("protocol", valid, "已验证配置中的 stdio 服务版本、通用工具面、根目录和记忆库。")
             if valid:
                 output.update(protocol_verification="sdk_stdio", active_task_count=verified["active_task_count"])
         except Exception:

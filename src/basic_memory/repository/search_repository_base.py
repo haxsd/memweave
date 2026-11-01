@@ -1,0 +1,1875 @@
+"""Abstract base class for search repository implementations."""
+
+import hashlib
+import time
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Literal, Optional, cast
+
+import logfire as logfire
+from loguru import logger
+from sqlalchemy import Executable, Result, inspect, text
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from basic_memory import db
+from basic_memory.config import BasicMemoryConfig
+from basic_memory.models.search import SEARCH_INDEX_ROW_KEY_PREDICATE
+from basic_memory.repository import semantic_vector_sync
+from basic_memory.repository.embedding_provider import (
+    EmbeddingProvider,
+    embedding_provider_identity,
+)
+from basic_memory.repository.embedding_provider_factory import (
+    configured_embedding_provider_identity,
+)
+from basic_memory.repository.rerank_provider import RerankProvider
+from basic_memory.repository.search_filters import FtsBackend
+from basic_memory.repository.search_index_row import SearchIndexKey, SearchIndexRow
+from basic_memory.repository.search_query import PreparedSearchQuery
+from basic_memory.repository.search_reader import (
+    BUILT_IN_VECTOR_INDEX_NAMES,
+    VECTOR_HYDRATION_BATCH_SIZE,
+    Reranking,
+    SearchReader,
+    SemanticSearch,
+    VectorRetrieval,
+    vector_eligible,
+)
+from basic_memory.repository.search_scope import ProjectScope
+from basic_memory.repository.script_ngrams import build_script_ngrams
+from basic_memory.repository.search_trace import SearchTraceCollector
+from basic_memory.repository.semantic_chunking import (
+    SemanticSourceRow,
+    VectorChunkRecord,
+    build_entity_fingerprint,
+    build_vector_chunk_records,
+    split_text_into_chunks,
+)
+from basic_memory.repository.semantic_errors import (
+    SemanticDependenciesMissingError,
+    SemanticSearchDisabledError,
+    SemanticVectorIndexExtensionError,
+)
+from basic_memory.repository.semantic_vector_index import (
+    SemanticVectorIndex,
+    SemanticVectorIndexReconciler,
+    VectorDeletion,
+    VectorKey,
+    VectorRecord,
+)
+from basic_memory.repository.semantic_vector_sync import (
+    EmbeddingPersistenceResult as _EmbeddingPersistenceResult,
+    EntitySyncRuntime as _EntitySyncRuntime,
+    EntityVectorShardPlan as _EntityVectorShardPlan,
+    PendingEmbeddingJob as _PendingEmbeddingJob,
+    PreparedEntityVectorSync as _PreparedEntityVectorSync,
+    StagedVectorDeletion as _StagedVectorDeletion,
+    VectorChunkState,
+)
+from basic_memory.runtime.vector_sync import VectorSyncBatchResult
+from basic_memory.schemas.search import (
+    SearchItemType,
+    SearchRetrievalMode,
+)
+from basic_memory.temporal import TemporalFilter
+from basic_memory.utils import ensure_timezone_aware
+
+# --- Semantic sync constants ---
+
+OVERSIZED_ENTITY_VECTOR_SHARD_SIZE = semantic_vector_sync.OVERSIZED_ENTITY_VECTOR_SHARD_SIZE
+_SQLITE_MAX_PREPARE_WINDOW = semantic_vector_sync.SQLITE_MAX_PREPARE_WINDOW
+
+type StoredEmbeddingStatus = Literal["pending", "ready"]
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkManifestRow:
+    """One persisted vector-chunk manifest row."""
+
+    entity_id: int
+    chunk_key: str
+    chunk_text: str
+    source_hash: str
+    source_type: str
+    source_row_id: int
+    chunk_index: int
+    entity_fingerprint: str
+    embedding_model: str
+    vector_index: str
+    embedding_status: StoredEmbeddingStatus
+    updated_at: datetime
+
+    @classmethod
+    def from_mapping(cls, row: Mapping[str, Any]) -> "ChunkManifestRow":
+        """Hydrate one portable manifest row from SQLite or PostgreSQL."""
+        raw_status = str(row["embedding_status"])
+        match raw_status:
+            case "pending":
+                embedding_status: StoredEmbeddingStatus = "pending"
+            case "ready":
+                embedding_status = "ready"
+            case _:
+                raise ValueError(f"Unknown vector chunk embedding status: {raw_status!r}")
+
+        return cls(
+            entity_id=int(row["entity_id"]),
+            chunk_key=str(row["chunk_key"]),
+            chunk_text=str(row["chunk_text"]),
+            source_hash=str(row["source_hash"]),
+            source_type=str(row["source_type"]),
+            source_row_id=int(row["source_row_id"]),
+            chunk_index=int(row["chunk_index"]),
+            entity_fingerprint=str(row["entity_fingerprint"]),
+            embedding_model=str(row["embedding_model"]),
+            vector_index=str(row["vector_index"]),
+            embedding_status=embedding_status,
+            updated_at=row["updated_at"],
+        )
+
+    def __post_init__(self) -> None:
+        """Restore a timezone-aware datetime from either backend's raw value."""
+        updated_at = self.updated_at
+        if isinstance(updated_at, str):
+            updated_at = datetime.fromisoformat(updated_at)
+        object.__setattr__(self, "updated_at", ensure_timezone_aware(updated_at))
+
+
+async def purge_stale_search_index_rows(
+    session_maker: async_sessionmaker[AsyncSession],
+    project_id: int,
+) -> int:
+    """Reconciliation sweep: delete search_index rows whose backing row is gone.
+
+    search_index is derived, eventually consistent state; this sweep converges
+    DB-only divergence (#1214/#1226) that file-checksum change detection cannot
+    see. Plain project-scoped DELETEs - no locks, no file re-parse. The SQL text
+    is identical on SQLite FTS5 and Postgres (precedent: migration 2d26b287813b).
+    """
+    statements = (
+        "DELETE FROM search_index WHERE project_id = :project_id "
+        "AND entity_id NOT IN (SELECT id FROM entity WHERE project_id = :project_id)",
+        "DELETE FROM search_index WHERE project_id = :project_id "
+        "AND type = 'observation' "
+        "AND id NOT IN (SELECT id FROM observation WHERE project_id = :project_id)",
+        "DELETE FROM search_index WHERE project_id = :project_id "
+        "AND type = 'relation' "
+        "AND id NOT IN (SELECT id FROM relation WHERE project_id = :project_id)",
+    )
+    purged = 0
+    async with db.scoped_session(session_maker) as session:
+        for statement in statements:
+            result = cast(
+                CursorResult[Any],
+                await session.execute(text(statement), {"project_id": project_id}),
+            )
+            purged += max(result.rowcount or 0, 0)
+    logger.info("Purged stale search index rows", project_id=project_id, purged=purged)
+    return purged
+
+
+class SearchRepositoryBase(ABC):
+    """Abstract base class for backend-specific search repository implementations.
+
+    This class defines the common interface that all search repositories must implement,
+    regardless of whether they use SQLite FTS5 or Postgres tsvector for full-text search.
+
+    Indexing, vector-manifest writes, and embedding orchestration live here. Reading
+    is delegated to ``SearchReader``, built per call from this repository's current
+    state so the reader sees the same semantic capability the repository has.
+
+    Concrete implementations:
+    - SQLiteSearchRepository: Uses FTS5 virtual tables with MATCH queries
+    - PostgresSearchRepository: Uses tsvector/tsquery with GIN indexes
+    """
+
+    # --- Subclass-populated attributes ---
+    _semantic_enabled: bool
+    _app_config: BasicMemoryConfig
+    _semantic_vector_k: int
+    _semantic_min_similarity: float
+    _embedding_provider: Optional[EmbeddingProvider]
+    # Class-level defaults: a repo with no reranker configured (or a lightweight
+    # test double that bypasses __init__) safely skips reranking.
+    _rerank_provider: Optional[RerankProvider] = None
+    _reranker_candidates: int = 20
+    _reranker_max_document_chars: int = 0
+    _semantic_embedding_sync_batch_size: int
+    _vector_dimensions: int
+    _vector_tables_initialized: bool
+    _semantic_vector_index: SemanticVectorIndex
+    _semantic_vector_index_name: str = ""
+    # Runs compiled full-text statements for this repository's engine.
+    _fts: FtsBackend
+
+    def __init__(self, session_maker: async_sessionmaker[AsyncSession], project_id: int):
+        """Initialize with session maker and project_id filter.
+
+        Args:
+            session_maker: SQLAlchemy session maker
+            project_id: Project ID to filter all operations by
+
+        Raises:
+            ValueError: If project_id is None or invalid
+        """
+        if project_id is None or project_id <= 0:  # pragma: no cover
+            raise ValueError("A valid project_id is required for SearchRepository")
+
+        self.session_maker = session_maker
+        self.project_id = project_id
+        # Every statement this repository compiles reads exactly one project.
+        self.scope = ProjectScope.single(project_id)
+
+    async def semantic_effectively_enabled(self) -> bool:
+        """Return whether semantic retrieval can actually run for this repository.
+
+        Configuration is the default signal. Backends with a startup runtime
+        fallback (SQLite degrades to keyword-only search when sqlite-vec cannot
+        load, #711) override this with a runtime probe so per-request instances
+        honor the degraded state instead of trusting still-enabled config.
+        """
+        return self._semantic_enabled
+
+    @property
+    def configured_embedding_model(self) -> str:
+        """Return the configured persisted embedding identity without loading a model."""
+        return configured_embedding_provider_identity(self._app_config)
+
+    @property
+    def configured_vector_index(self) -> str:
+        """Return the configured vector-index identity."""
+        return self._semantic_vector_index_name
+
+    @property
+    def configured_min_similarity(self) -> float:
+        """Return the configured vector similarity floor."""
+        return self._semantic_min_similarity
+
+    @property
+    def configured_reranker_model(self) -> str | None:
+        """Return the configured reranker identity without invoking it."""
+        return self._rerank_provider.model_name if self._rerank_provider is not None else None
+
+    @property
+    def configured_reranker_candidates(self) -> int:
+        """Return the fixed maximum reranker pool size."""
+        return self._reranker_candidates
+
+    # ------------------------------------------------------------------
+    # Abstract methods — FTS and schema (backend-specific)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def init_search_index(self) -> None:
+        """Create or recreate the search index.
+
+        Backend-specific implementations:
+        - SQLite: CREATE VIRTUAL TABLE using FTS5
+        - Postgres: CREATE TABLE with tsvector column and GIN indexes
+        """
+        pass
+
+    async def search(
+        self,
+        search_text: Optional[str] = None,
+        permalink: Optional[str] = None,
+        permalink_match: Optional[str] = None,
+        title: Optional[str] = None,
+        note_types: Optional[List[str]] = None,
+        after_date: Optional[datetime] = None,
+        search_item_types: Optional[List[SearchItemType]] = None,
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[Dict[str, Any]] = None,
+        file_path_prefix: Optional[str] = None,
+        temporal: Optional[TemporalFilter] = None,
+        retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
+        min_similarity: Optional[float] = None,
+        limit: int = 10,
+        offset: int = 0,
+        allow_relaxed: bool = False,
+        session: AsyncSession | None = None,
+        *,
+        candidate_keys: Sequence[SearchIndexKey] | None = None,
+        trace: SearchTraceCollector | None = None,
+    ) -> List[SearchIndexRow]:
+        """Search this repository's project.
+
+        The reader owns retrieval. This method owns what only the repository knows:
+        whether its semantic stack is enabled and its vector tables exist. See
+        ``SearchReader.search`` for ``candidate_keys`` and ``allow_relaxed``.
+        """
+        query = PreparedSearchQuery(
+            search_text=search_text,
+            permalink=permalink,
+            permalink_match=permalink_match,
+            title=title,
+            note_types=note_types,
+            search_item_types=search_item_types,
+            categories=categories,
+            after_date=after_date,
+            metadata_filters=metadata_filters,
+            file_path_prefix=file_path_prefix,
+            temporal=temporal,
+            retrieval_mode=retrieval_mode,
+            min_similarity=min_similarity,
+        )
+        reader = await self._reader_for(query)
+        return await reader.search(
+            query,
+            limit=limit,
+            offset=offset,
+            allow_relaxed=allow_relaxed,
+            session=session,
+            candidate_keys=candidate_keys,
+            trace=trace,
+        )
+
+    async def count(
+        self,
+        search_text: Optional[str] = None,
+        permalink: Optional[str] = None,
+        permalink_match: Optional[str] = None,
+        title: Optional[str] = None,
+        note_types: Optional[List[str]] = None,
+        after_date: Optional[datetime] = None,
+        search_item_types: Optional[List[SearchItemType]] = None,
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[Dict[str, Any]] = None,
+        file_path_prefix: Optional[str] = None,
+        temporal: Optional[TemporalFilter] = None,
+        retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
+        min_similarity: Optional[float] = None,
+        allow_relaxed: bool = False,
+    ) -> int:
+        """Count full-text matches with the same filters as ``search``."""
+        query = PreparedSearchQuery(
+            search_text=search_text,
+            permalink=permalink,
+            permalink_match=permalink_match,
+            title=title,
+            note_types=note_types,
+            search_item_types=search_item_types,
+            categories=categories,
+            after_date=after_date,
+            metadata_filters=metadata_filters,
+            file_path_prefix=file_path_prefix,
+            temporal=temporal,
+            retrieval_mode=retrieval_mode,
+            min_similarity=min_similarity,
+        )
+        return await SearchReader(self.scope, self._fts).count(query, allow_relaxed=allow_relaxed)
+
+    # --- Reader construction ---
+
+    def _reranking(self) -> Reranking | None:
+        """The configured cross-encoder, or None when this repository does not rerank."""
+        if self._rerank_provider is None:
+            return None
+        return Reranking(
+            provider=self._rerank_provider,
+            candidates=self._reranker_candidates,
+            max_document_chars=self._reranker_max_document_chars,
+        )
+
+    def _semantic_search(self) -> SemanticSearch:
+        """Vector and hybrid retrieval over this repository's live semantic stack.
+
+        Valid once ``_ensure_vector_tables`` has bound the adapter. Read from the
+        current attributes on every call because the semantic flag can flip at
+        runtime (#711) and tests retune thresholds between searches.
+        """
+        assert self._embedding_provider is not None
+        vector = VectorRetrieval(
+            index=self._semantic_vector_index,
+            index_name=self._semantic_vector_index_name,
+            embedding_provider=self._embedding_provider,
+            embedding_model=self._embedding_model_key(),
+            vector_k=self._semantic_vector_k,
+            min_similarity=self._semantic_min_similarity,
+        )
+        return SemanticSearch(self.session_maker, self.scope, self._fts, vector, self._reranking())
+
+    async def _reader_for(self, query: PreparedSearchQuery) -> SearchReader:
+        """Build the reader for one call from this repository's current state."""
+        # Trigger: the query asks for vector or hybrid retrieval and has text to embed.
+        # Why: whether semantic search is enabled and whether the vector tables and
+        # adapter exist is repository lifecycle; the reader only reads.
+        # Outcome: the semantic gate raises its typed error before any retrieval
+        # runs, and the reader receives the bound adapter.
+        if query.retrieval_mode != SearchRetrievalMode.FTS and vector_eligible(query):
+            self._assert_semantic_available()
+            await self._ensure_vector_tables()
+            return SearchReader(self.scope, self._fts, self._semantic_search())
+        return SearchReader(self.scope, self._fts)
+
+    # ------------------------------------------------------------------
+    # Abstract methods — semantic search (backend-specific DB operations)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def _ensure_vector_tables(self) -> None:
+        """Create backend-specific vector chunk and embedding tables."""
+        pass
+
+    async def record_entity_vector_deferrals(
+        self,
+        *,
+        unfinished_entity_ids: set[int],
+        completed_entity_ids: set[int],
+        pass_started_at: datetime,
+    ) -> None:
+        """Persist which entities a vector sync pass left unfinished.
+
+        "Unfinished" covers every terminal state that leaves work owed, not just
+        a deferred shard. A failed entity is dropped from both the synced and the
+        deferred set, so nothing marked it -- and a multi-chunk note whose later
+        flush failed keeps its earlier `ready` rows, which is enough to satisfy
+        the retrieval predicate and read as fully embedded (#1440 review). The
+        column keeps its `deferred` name; its meaning is "the last pass did not
+        finish this entity".
+
+        The single writer of `entity.vector_sync_deferred_at`, called from the one
+        place that decides deferral. Readiness reads the column instead of trying
+        to infer completeness from the manifest, which cannot show it: the chunks
+        a shard did not schedule have no row, so an entity looks fully embedded
+        after its first shard (#1440 review).
+        """
+        if not unfinished_entity_ids and not completed_entity_ids:
+            return
+
+        # Chunked at the same bound vector hydration uses. `reindex_vectors`
+        # hands every entity in the project to one batch, so an unchunked IN list
+        # is one bind per entity and blows the driver's parameter cap on a large
+        # project -- asyncpg stops at 32767. That would raise *after* the
+        # embedding work succeeded, failing the `bm reindex` that #1414 tells
+        # users to run, on exactly the projects indexing matters most for.
+        #
+        # Every chunk shares one transaction, so a failure part-way through rolls
+        # back all of them rather than leaving some entities marked and others
+        # not. Losing the whole update is safe: the markers are derived state, so
+        # the next sync pass recomputes and rewrites them. A half-applied update
+        # would not be -- readiness would report a mix of stale and current
+        # markers with nothing to reconcile them.
+        #
+        # Trigger: a newer pass over the same entity can finish, and mark it deferred,
+        #          while this pass is still running.
+        # Why: clearing that marker here would drop the only signal that the newer
+        #      source still has unembedded shards (#1733).
+        # Outcome: a completed entity's marker is cleared only when it was set before
+        #          this pass started. Marking unfinished stays unconditional, because
+        #          over-marking is safe: the next pass clears it.
+        statements = (
+            (
+                sorted(unfinished_entity_ids),
+                "vector_sync_deferred_at = :deferred_at",
+                "",
+                {"deferred_at": datetime.now(timezone.utc)},
+            ),
+            (
+                sorted(completed_entity_ids),
+                "vector_sync_deferred_at = NULL",
+                " AND (vector_sync_deferred_at IS NULL"
+                " OR vector_sync_deferred_at < :pass_started_at)",
+                {"pass_started_at": pass_started_at},
+            ),
+        )
+        async with db.scoped_session(self.session_maker) as session:
+            for entity_ids, assignment, marker_guard, marker_params in statements:
+                for start in range(0, len(entity_ids), VECTOR_HYDRATION_BATCH_SIZE):
+                    chunk = entity_ids[start : start + VECTOR_HYDRATION_BATCH_SIZE]
+                    placeholders = ", ".join(f":entity_id_{index}" for index in range(len(chunk)))
+                    params: dict[str, object] = {"project_id": self.project_id, **marker_params}
+                    params.update(
+                        {f"entity_id_{index}": entity_id for index, entity_id in enumerate(chunk)}
+                    )
+                    await session.execute(
+                        text(
+                            f"UPDATE entity SET {assignment} "
+                            f"WHERE project_id = :project_id AND id IN ({placeholders})"
+                            f"{marker_guard}"
+                        ),
+                        params,
+                    )
+            await session.commit()
+
+    async def _write_embeddings(
+        self,
+        session: AsyncSession,
+        jobs: list[tuple[int, str]],
+        embeddings: list[list[float]],
+    ) -> None:
+        """Legacy storage hook retained for focused pre-adapter test repositories."""
+        raise NotImplementedError
+
+    async def _persist_embeddings(
+        self,
+        jobs: Sequence[_PendingEmbeddingJob],
+        embeddings: list[list[float]],
+    ) -> _EmbeddingPersistenceResult:
+        """Write vectors through the adapter, then make their manifest rows ready."""
+        if not jobs:
+            return _EmbeddingPersistenceResult()
+        if len(jobs) != len(embeddings):
+            raise RuntimeError("Embedding provider returned an unexpected number of vectors.")
+
+        for job in jobs:
+            expected_source_hash = hashlib.sha256(job.chunk_text.encode("utf-8")).hexdigest()
+            if job.source_hash != expected_source_hash:
+                raise RuntimeError(
+                    f"Embedding job source hash does not match its chunk text: {job.chunk_row_id}"
+                )
+
+        job_pairs = [(job.chunk_row_id, job.chunk_text) for job in jobs]
+
+        # Compatibility: focused orchestration tests and third-party subclasses
+        # from before the adapter contract may still override the private writer.
+        # Real repositories always configure `_semantic_vector_index` and take the
+        # manifest-safe path below.
+        if not hasattr(self, "_semantic_vector_index"):
+            async with db.scoped_session(self.session_maker) as session:
+                await self._prepare_vector_session(session)
+                await self._write_embeddings(session, job_pairs, embeddings)
+                await session.commit()
+            return _EmbeddingPersistenceResult(
+                persisted_row_ids=frozenset(row_id for row_id, _chunk_text in job_pairs)
+            )
+
+        row_ids = [row_id for row_id, _chunk_text in job_pairs]
+        lookup_params = {f"row_id_{index}": row_id for index, row_id in enumerate(row_ids)}
+        lookup_placeholders = ", ".join(f":row_id_{index}" for index in range(len(row_ids)))
+        async with db.scoped_session(self.session_maker) as session:
+            connection = await session.connection()
+            dialect_name = connection.dialect.name
+            external_vector_index = (
+                self._semantic_vector_index_name not in BUILT_IN_VECTOR_INDEX_NAMES
+            )
+            lock_external_write = external_vector_index and dialect_name in {"postgresql", "sqlite"}
+            if external_vector_index:
+                await self._lock_external_vector_write(session)
+            if external_vector_index and dialect_name == "sqlite":
+                # SQLite has no SELECT FOR UPDATE. A conditional no-op write takes
+                # the database write lock before extension I/O, serializing a newer
+                # manifest generation behind this adapter write and ready commit.
+                lookup_statement = (
+                    "UPDATE search_vector_chunks SET source_hash = source_hash "
+                    f"WHERE project_id = :project_id AND id IN ({lookup_placeholders}) "
+                    "RETURNING id, entity_id, chunk_key, source_hash"
+                )
+            else:
+                lock_clause = (
+                    " FOR UPDATE" if external_vector_index and dialect_name == "postgresql" else ""
+                )
+                lookup_statement = (
+                    "SELECT id, entity_id, chunk_key, source_hash FROM search_vector_chunks "
+                    f"WHERE project_id = :project_id AND id IN ({lookup_placeholders})"
+                    f"{lock_clause}"
+                )
+            result = await session.execute(
+                text(lookup_statement),
+                {**lookup_params, "project_id": self.project_id},
+            )
+            rows_by_id = {int(row["id"]): row for row in result.mappings().all()}
+
+            missing_jobs = [job for job in jobs if job.chunk_row_id not in rows_by_id]
+            superseded_row_ids: set[int] = set()
+            missing_current_row_ids: list[int] = []
+            if missing_jobs:
+                entity_ids = sorted({job.entity_id for job in missing_jobs})
+                source_rows_by_entity = await self._fetch_prepare_window_source_rows(
+                    session,
+                    entity_ids,
+                )
+                current_generations = {
+                    (entity_id, record["chunk_key"], record["source_hash"])
+                    for entity_id, source_rows in source_rows_by_entity.items()
+                    for record in self._build_chunk_records(source_rows)
+                }
+                for job in missing_jobs:
+                    generation = (job.entity_id, job.chunk_key, job.source_hash)
+                    if generation in current_generations:
+                        missing_current_row_ids.append(job.chunk_row_id)
+                    else:
+                        superseded_row_ids.add(job.chunk_row_id)
+
+            if missing_current_row_ids:
+                raise RuntimeError(
+                    "Vector manifest rows disappeared before write: "
+                    f"{sorted(missing_current_row_ids)}"
+                )
+
+            current_jobs: list[tuple[_PendingEmbeddingJob, list[float]]] = []
+            for job, embedding in zip(jobs, embeddings, strict=True):
+                row = rows_by_id.get(job.chunk_row_id)
+                if row is None:
+                    continue
+                if int(row["entity_id"]) != job.entity_id or str(row["chunk_key"]) != job.chunk_key:
+                    raise RuntimeError(
+                        f"Vector manifest row identity changed before write: {job.chunk_row_id}"
+                    )
+                if str(row["source_hash"]) != job.source_hash:
+                    superseded_row_ids.add(job.chunk_row_id)
+                    continue
+                current_jobs.append((job, embedding))
+            if not current_jobs:
+                return _EmbeddingPersistenceResult(superseded_row_ids=frozenset(superseded_row_ids))
+
+            params: dict[str, object] = {}
+            generation_predicates: list[str] = []
+            records = [
+                VectorRecord(
+                    key=VectorKey(
+                        entity_id=job.entity_id,
+                        chunk_key=job.chunk_key,
+                    ),
+                    source_hash=job.source_hash,
+                    values=tuple(embedding),
+                )
+                for job, embedding in current_jobs
+            ]
+            for index, (job, _embedding) in enumerate(current_jobs):
+                params[f"row_id_{index}"] = job.chunk_row_id
+                params[f"source_hash_{index}"] = job.source_hash
+                generation_predicates.append(
+                    f"(id = :row_id_{index} AND source_hash = :source_hash_{index})"
+                )
+
+            persistence = _EmbeddingPersistenceResult(
+                persisted_row_ids=frozenset(job.chunk_row_id for job, _embedding in current_jobs),
+                superseded_row_ids=frozenset(superseded_row_ids),
+            )
+
+            if lock_external_write:
+                # Constraint: extension adapters use stable logical keys outside
+                # the authoritative SQL database. Hold its manifest lock across
+                # adapter I/O so a newer prepare cannot advance this generation
+                # before the external write and ready transition complete.
+                await self._semantic_vector_index.upsert(self.project_id, records)
+                await self._mark_embedding_jobs_ready(
+                    session,
+                    params=params,
+                    generation_predicates=generation_predicates,
+                )
+                await session.commit()
+                return persistence
+
+        # Built-in adapters share the authoritative database. They verify and lock
+        # each record's source_hash inside the same transaction as their vector write.
+        await self._semantic_vector_index.upsert(self.project_id, records)
+        async with db.scoped_session(self.session_maker) as session:
+            await self._mark_embedding_jobs_ready(
+                session,
+                params=params,
+                generation_predicates=generation_predicates,
+            )
+            await session.commit()
+        return persistence
+
+    async def _mark_embedding_jobs_ready(
+        self,
+        session: AsyncSession,
+        *,
+        params: dict[str, object],
+        generation_predicates: list[str],
+    ) -> None:
+        """Publish only the source generations written by the adapter."""
+        await session.execute(
+            text(
+                "UPDATE search_vector_chunks SET embedding_status = 'ready', "
+                f"updated_at = {self._timestamp_now_expr()} "
+                "WHERE project_id = :project_id "
+                "AND vector_index = :vector_index "
+                "AND embedding_model = :embedding_model "
+                "AND (" + " OR ".join(generation_predicates) + ")"
+            ),
+            {
+                **params,
+                "project_id": self.project_id,
+                "vector_index": self._semantic_vector_index_name,
+                "embedding_model": self._embedding_model_key(),
+            },
+        )
+
+    async def _delete_entity_chunks(
+        self,
+        session: AsyncSession,
+        entity_id: int,
+        *,
+        expected_deletions: Sequence[_StagedVectorDeletion] | None = None,
+    ) -> list[_StagedVectorDeletion]:
+        """Stage an entity deletion by making its manifest rows non-searchable."""
+        return await self._stage_vector_deletions(
+            session,
+            entity_id=entity_id,
+            expected_deletions=expected_deletions,
+        )
+
+    async def _delete_stale_chunks(
+        self,
+        session: AsyncSession,
+        stale_ids: list[int],
+        entity_id: int,
+        *,
+        expected_deletions: Sequence[_StagedVectorDeletion] | None = None,
+    ) -> list[_StagedVectorDeletion]:
+        """Stage stale chunk deletion by making manifest rows non-searchable."""
+        if not stale_ids:
+            return []
+        return await self._stage_vector_deletions(
+            session,
+            entity_id=entity_id,
+            row_ids=stale_ids,
+            expected_deletions=expected_deletions,
+        )
+
+    async def _stage_vector_deletions(
+        self,
+        session: AsyncSession,
+        *,
+        entity_id: int,
+        row_ids: Sequence[int] | None = None,
+        expected_deletions: Sequence[_StagedVectorDeletion] | None = None,
+    ) -> list[_StagedVectorDeletion]:
+        """Durably stage and return the exact manifest generations to delete."""
+        params: dict[str, object] = {
+            "project_id": self.project_id,
+            "entity_id": entity_id,
+        }
+        generation_clause = ""
+        if expected_deletions is not None:
+            if not expected_deletions:
+                return []
+            predicates: list[str] = []
+            for index, deletion in enumerate(expected_deletions):
+                params[f"row_id_{index}"] = deletion.row_id
+                params[f"source_hash_{index}"] = deletion.source_hash
+                params[f"vector_index_{index}"] = deletion.vector_index
+                predicates.append(
+                    f"(id = :row_id_{index} "
+                    f"AND source_hash = :source_hash_{index} "
+                    f"AND vector_index = :vector_index_{index})"
+                )
+            generation_clause = " AND (" + " OR ".join(predicates) + ")"
+        elif row_ids is not None:
+            if not row_ids:
+                return []
+            placeholders: list[str] = []
+            for index, row_id in enumerate(row_ids):
+                params[f"row_id_{index}"] = row_id
+                placeholders.append(f":row_id_{index}")
+            generation_clause = " AND id IN (" + ", ".join(placeholders) + ")"
+
+        result = await session.execute(
+            text(
+                "UPDATE search_vector_chunks SET embedding_status = 'pending' "
+                "WHERE project_id = :project_id AND entity_id = :entity_id"
+                + generation_clause
+                + " RETURNING id, chunk_key, source_hash, vector_index"
+            ),
+            params,
+        )
+        staged = [
+            _StagedVectorDeletion(
+                row_id=int(row["id"]),
+                chunk_key=str(row["chunk_key"]),
+                source_hash=str(row["source_hash"]),
+                vector_index=str(row["vector_index"]),
+            )
+            for row in result.mappings().all()
+        ]
+        self._assert_manifest_vector_ownership(deletion.vector_index for deletion in staged)
+        return staged
+
+    async def _finalize_prepared_vector_deletions(
+        self,
+        prepared: _PreparedEntityVectorSync,
+    ) -> None:
+        """Delete staged adapter records, then remove their SQL manifest rows.
+
+        The prepare transaction commits `pending` first. If an external delete
+        fails, those rows remain non-searchable and the next sync retries the
+        idempotent delete instead of losing cleanup intent.
+        """
+        if not prepared.staged_deletions:
+            return
+        if not hasattr(self, "_semantic_vector_index"):
+            return
+
+        params: dict[str, object] = {
+            "project_id": self.project_id,
+            "entity_id": prepared.entity_id,
+        }
+        predicates: list[str] = []
+        for index, deletion in enumerate(prepared.staged_deletions):
+            params[f"row_id_{index}"] = deletion.row_id
+            params[f"source_hash_{index}"] = deletion.source_hash
+            params[f"vector_index_{index}"] = deletion.vector_index
+            predicates.append(
+                f"(id = :row_id_{index} "
+                f"AND source_hash = :source_hash_{index} "
+                f"AND vector_index = :vector_index_{index})"
+            )
+        generation_clause = " OR ".join(predicates)
+        deletions = [
+            VectorDeletion(
+                key=VectorKey(
+                    entity_id=prepared.entity_id,
+                    chunk_key=deletion.chunk_key,
+                ),
+                source_hash=deletion.source_hash,
+            )
+            for deletion in prepared.staged_deletions
+        ]
+
+        external_vector_index = self._semantic_vector_index_name not in BUILT_IN_VECTOR_INDEX_NAMES
+        if external_vector_index:
+            async with db.scoped_session(self.session_maker) as session:
+                connection = await session.connection()
+                if connection.dialect.name == "sqlite":
+                    lock_statement = (
+                        "UPDATE search_vector_chunks SET source_hash = source_hash "
+                        "WHERE project_id = :project_id AND entity_id = :entity_id "
+                        "AND embedding_status = 'pending' AND ("
+                        + generation_clause
+                        + ") RETURNING id, chunk_key, source_hash, vector_index"
+                    )
+                else:
+                    lock_statement = (
+                        "SELECT id, chunk_key, source_hash, vector_index "
+                        "FROM search_vector_chunks "
+                        "WHERE project_id = :project_id AND entity_id = :entity_id "
+                        "AND embedding_status = 'pending' AND ("
+                        + generation_clause
+                        + ") FOR UPDATE"
+                    )
+                result = await session.execute(text(lock_statement), params)
+                rows = result.mappings().all()
+                self._assert_manifest_vector_ownership(row["vector_index"] for row in rows)
+                current_generations = {(int(row["id"]), str(row["source_hash"])) for row in rows}
+                current_deletions = [
+                    deletion
+                    for deletion, staged in zip(
+                        deletions,
+                        prepared.staged_deletions,
+                        strict=True,
+                    )
+                    if (staged.row_id, staged.source_hash) in current_generations
+                ]
+                if not current_deletions:
+                    return
+                await self._semantic_vector_index.delete(self.project_id, current_deletions)
+                await session.execute(
+                    text(
+                        "DELETE FROM search_vector_chunks "
+                        "WHERE project_id = :project_id AND entity_id = :entity_id "
+                        "AND embedding_status = 'pending' AND (" + generation_clause + ")"
+                    ),
+                    params,
+                )
+                await session.commit()
+            return
+
+        await self._semantic_vector_index.delete(self.project_id, deletions)
+        if self._semantic_vector_index_name in BUILT_IN_VECTOR_INDEX_NAMES:
+            return
+        async with db.scoped_session(self.session_maker) as session:
+            await session.execute(
+                text(
+                    "DELETE FROM search_vector_chunks "
+                    "WHERE project_id = :project_id AND entity_id = :entity_id "
+                    "AND embedding_status = 'pending' AND (" + generation_clause + ")"
+                ),
+                params,
+            )
+            await session.commit()
+
+    # ------------------------------------------------------------------
+    # Shared index / delete operations
+    # ------------------------------------------------------------------
+
+    async def purge_stale_search_rows(self) -> int:
+        return await purge_stale_search_index_rows(self.session_maker, self.project_id)
+
+    async def index_item(
+        self, search_index_row: SearchIndexRow, session: AsyncSession | None = None
+    ) -> None:
+        """Index or update a single item.
+
+        This implementation is shared across backends as it uses standard SQL INSERT.
+        A caller-owned ``session`` keeps the write inside the caller's transaction.
+        """
+
+        async with db.scoped_session(self.session_maker, session) as session:
+            # Replace only the row this address owns *for this kind*. Keying the
+            # replacement on the permalink alone let a relation whose authored type
+            # spells an observation's address evict that observation -- silently on
+            # SQLite, whose FTS5 table carries no unique index to object (#1437).
+            await session.execute(
+                text(f"DELETE FROM search_index WHERE {SEARCH_INDEX_ROW_KEY_PREDICATE}"),
+                {
+                    "permalink": search_index_row.permalink,
+                    "type": search_index_row.type,
+                    "project_id": self.project_id,
+                },
+            )
+
+            # When using text() raw SQL, always serialize JSON to string
+            # Both SQLite (TEXT) and Postgres (JSONB) accept JSON strings in raw SQL
+            # The database driver/column type will handle conversion
+            insert_data = search_index_row.to_insert(serialize_json=True)
+            insert_data["project_id"] = self.project_id
+            insert_data["script_ngrams"] = build_script_ngrams(
+                search_index_row.title,
+                search_index_row.content_stems,
+                search_index_row.content_snippet,
+            )
+
+            # Insert new record
+            await session.execute(
+                text("""
+                    INSERT INTO search_index (
+                        id, title, content_stems, content_snippet, script_ngrams, permalink, file_path, type, metadata,
+                        from_id, to_id, relation_type,
+                        entity_id, category,
+                        created_at, updated_at,
+                        project_id
+                    ) VALUES (
+                        :id, :title, :content_stems, :content_snippet, :script_ngrams, :permalink, :file_path, :type, :metadata,
+                        :from_id, :to_id, :relation_type,
+                        :entity_id, :category,
+                        :created_at, :updated_at,
+                        :project_id
+                    )
+                """),
+                insert_data,
+            )
+            logger.debug(f"indexed row {search_index_row}")
+
+    async def bulk_index_items(
+        self, search_index_rows: List[SearchIndexRow], session: AsyncSession | None = None
+    ) -> None:
+        """Index multiple items in a single batch operation.
+
+        This implementation is shared across backends as it uses standard SQL INSERT.
+
+        Note: This method assumes that any existing records for the entity_id
+        have already been deleted (typically via delete_by_entity_id).
+
+        Args:
+            search_index_rows: List of SearchIndexRow objects to index
+            session: Optional caller-owned session; the caller then owns the commit
+        """
+
+        if not search_index_rows:  # pragma: no cover
+            return  # pragma: no cover
+
+        async with db.scoped_session(self.session_maker, session) as session:
+            # When using text() raw SQL, always serialize JSON to string
+            # Both SQLite (TEXT) and Postgres (JSONB) accept JSON strings in raw SQL
+            # The database driver/column type will handle conversion
+            insert_data_list = []
+            for row in search_index_rows:
+                insert_data = row.to_insert(serialize_json=True)
+                insert_data["project_id"] = self.project_id
+                insert_data["script_ngrams"] = build_script_ngrams(
+                    row.title,
+                    row.content_stems,
+                    row.content_snippet,
+                )
+                insert_data_list.append(insert_data)
+
+            # Batch insert all records using executemany
+            await session.execute(
+                text("""
+                    INSERT INTO search_index (
+                        id, title, content_stems, content_snippet, script_ngrams, permalink, file_path, type, metadata,
+                        from_id, to_id, relation_type,
+                        entity_id, category,
+                        created_at, updated_at,
+                        project_id
+                    ) VALUES (
+                        :id, :title, :content_stems, :content_snippet, :script_ngrams, :permalink, :file_path, :type, :metadata,
+                        :from_id, :to_id, :relation_type,
+                        :entity_id, :category,
+                        :created_at, :updated_at,
+                        :project_id
+                    )
+                """),
+                insert_data_list,
+            )
+            logger.debug(f"Bulk indexed {len(search_index_rows)} rows")
+
+    async def get_entity_search_rows(self, entity_id: int) -> list[SearchIndexRow]:
+        """Return every search projection owned by one entity."""
+        async with db.scoped_session(self.session_maker) as session:
+            result = await session.execute(
+                text(
+                    "SELECT project_id, id, title, content_stems, content_snippet, "
+                    "permalink, file_path, type, metadata, from_id, to_id, relation_type, "
+                    "entity_id, category, created_at, updated_at "
+                    "FROM search_index "
+                    "WHERE project_id = :project_id AND ("
+                    "(type = 'entity' AND id = :entity_id) "
+                    "OR entity_id = :entity_id "
+                    "OR (type = 'relation' AND from_id = :entity_id)"
+                    ") ORDER BY type, id"
+                ),
+                {"project_id": self.project_id, "entity_id": entity_id},
+            )
+            return [SearchIndexRow.from_mapping(dict(row)) for row in result.mappings().all()]
+
+    async def get_entity_chunk_manifest(self, entity_id: int) -> list[ChunkManifestRow]:
+        """Return the stored vector-chunk manifest for one project-scoped entity."""
+        async with db.scoped_session(self.session_maker) as session:
+            connection = await session.connection()
+            manifest_exists = await connection.run_sync(
+                lambda sync_connection: inspect(sync_connection).has_table("search_vector_chunks")
+            )
+            if not manifest_exists:
+                return []
+
+            result = await session.execute(
+                text(
+                    "SELECT entity_id, chunk_key, chunk_text, source_hash, "
+                    "source_type, source_row_id, chunk_index, "
+                    "entity_fingerprint, embedding_model, vector_index, "
+                    "embedding_status, updated_at "
+                    "FROM search_vector_chunks "
+                    "WHERE project_id = :project_id AND entity_id = :entity_id "
+                    "ORDER BY source_type, source_row_id, chunk_index"
+                ),
+                {"project_id": self.project_id, "entity_id": entity_id},
+            )
+            return [ChunkManifestRow.from_mapping(dict(row)) for row in result.mappings().all()]
+
+    @abstractmethod
+    async def get_entity_physical_chunk_keys(self, entity_id: int) -> set[str] | None:
+        """Return manifest chunk keys whose built-in physical vector row is live.
+
+        ``None`` means physical storage is not inspectable here: semantic search is
+        disabled, or the configured index is external and exposes no portable
+        storage-inspection contract (mirroring get_embedding_status()).
+        """
+        ...
+
+    async def delete_by_entity_id(
+        self, entity_id: int, session: AsyncSession | None = None
+    ) -> None:
+        """Delete all search index entries for an entity.
+
+        This implementation is shared across backends as it uses standard SQL DELETE.
+        A caller-owned ``session`` keeps the delete inside the caller's transaction.
+        """
+        async with db.scoped_session(self.session_maker, session) as session:
+            await session.execute(
+                text(
+                    "DELETE FROM search_index WHERE entity_id = :entity_id AND project_id = :project_id"
+                ),
+                {"entity_id": entity_id, "project_id": self.project_id},
+            )
+
+    async def delete_by_permalink(self, permalink: str, search_item_type: SearchItemType) -> None:
+        """Delete the one search row an address owns for the given row kind.
+
+        This implementation is shared across backends as it uses standard SQL DELETE.
+
+        The kind is required rather than optional because an address can be shared by
+        two kinds (#1437): deleting one note's relation row by permalink alone also
+        removed another note's observation row, and nothing restores a projection whose
+        source row still exists -- the orphan sweep only removes, it never rebuilds.
+        """
+        async with db.scoped_session(self.session_maker) as session:
+            await session.execute(
+                text(f"DELETE FROM search_index WHERE {SEARCH_INDEX_ROW_KEY_PREDICATE}"),
+                {
+                    "permalink": permalink,
+                    "type": search_item_type.value,
+                    "project_id": self.project_id,
+                },
+            )
+            await session.commit()
+
+    async def delete_project_search_rows(self) -> None:
+        """Delete every full-text search row owned by this repository's project.
+
+        Shared across backends: both store rows in `search_index` keyed by
+        project_id, and a project-scoped DELETE leaves sibling projects in the
+        same database untouched. On Postgres the bounded FTS chunk rows follow
+        via their ON DELETE CASCADE foreign key.
+        """
+        async with db.scoped_session(self.session_maker) as session:
+            await session.execute(
+                text("DELETE FROM search_index WHERE project_id = :project_id"),
+                {"project_id": self.project_id},
+            )
+            await session.commit()
+
+    async def execute_query(
+        self,
+        query: Executable,
+        params: Dict[str, Any],
+    ) -> Result[Any]:
+        """Execute a query asynchronously.
+
+        This implementation is shared across backends for utility query execution.
+        """
+        async with db.scoped_session(self.session_maker) as session:
+            start_time = time.perf_counter()
+            result = await session.execute(query, params)
+            end_time = time.perf_counter()
+            elapsed_time = end_time - start_time
+            logger.debug(f"Query executed successfully in {elapsed_time:.2f}s.")
+            return result
+
+    async def delete_entity_vector_rows(self, entity_id: int) -> None:
+        """Delete one entity's derived vector rows using the backend's cleanup path."""
+        await self._ensure_vector_tables()
+
+        async with db.scoped_session(self.session_maker) as session:
+            staged_deletions = await self._delete_entity_chunks(session, entity_id)
+            await session.commit()
+        await self._finalize_prepared_vector_deletions(
+            _PreparedEntityVectorSync(
+                entity_id=entity_id,
+                sync_start=time.perf_counter(),
+                source_rows_count=0,
+                embedding_jobs=[],
+                delete_entity_vectors=True,
+                staged_deletions=staged_deletions,
+            )
+        )
+
+    async def delete_external_entity_vectors(
+        self,
+        session: AsyncSession,
+        entity_ids: Sequence[int],
+    ) -> None:
+        """Delete externally stored entity vectors under the caller's project lock."""
+        deleted_entity_ids = tuple(dict.fromkeys(entity_ids))
+        await self._lock_external_vector_write(session)
+        if not deleted_entity_ids:
+            return
+
+        params = {
+            "project_id": self.project_id,
+            **{
+                f"entity_id_{index}": entity_id
+                for index, entity_id in enumerate(deleted_entity_ids)
+            },
+        }
+        placeholders = ", ".join(f":entity_id_{index}" for index in range(len(deleted_entity_ids)))
+        ownership_result = await session.execute(
+            text(
+                "SELECT DISTINCT vector_index FROM search_vector_chunks "
+                "WHERE project_id = :project_id "
+                f"AND entity_id IN ({placeholders})"
+            ),
+            params,
+        )
+        recorded_indexes = frozenset(
+            str(vector_index) for vector_index in ownership_result.scalars().all()
+        )
+        await self._delete_external_entity_vectors_locked(
+            session,
+            deleted_entity_ids,
+            recorded_indexes=recorded_indexes,
+        )
+
+    async def _delete_external_entity_vectors_locked(
+        self,
+        session: AsyncSession,
+        entity_ids: Sequence[int],
+        *,
+        recorded_indexes: frozenset[str],
+    ) -> None:
+        """Delete external vectors after the caller has acquired the project lock."""
+        self._assert_manifest_vector_ownership(recorded_indexes)
+        external_indexes = recorded_indexes - BUILT_IN_VECTOR_INDEX_NAMES
+        if not external_indexes:
+            return
+
+        deleted_entity_ids = tuple(dict.fromkeys(entity_ids))
+        configured_index = self._semantic_vector_index_name
+        if not hasattr(self, "_semantic_vector_index"):
+            raise SemanticVectorIndexExtensionError(
+                f"Semantic vector adapter {configured_index!r} is unavailable. "
+                "Enable semantic search and retry the entity deletion."
+            )
+
+        # Trigger: DB-first deletion runs inside a caller-owned SQL transaction.
+        # Why: the external adapter cannot participate in that transaction. If its
+        # delete succeeds and the caller later rolls back, ready manifests would
+        # incorrectly claim the now-missing vectors are searchable.
+        # Outcome: commit a non-searchable retry marker in an independent session
+        # before touching external storage while the caller retains the project
+        # lock; a retried delete remains idempotent and no new generation can race.
+        stage_params = {
+            "project_id": self.project_id,
+            "vector_index": configured_index,
+            **{
+                f"entity_id_{index}": entity_id
+                for index, entity_id in enumerate(deleted_entity_ids)
+            },
+        }
+        placeholders = ", ".join(f":entity_id_{index}" for index in range(len(deleted_entity_ids)))
+        connection = await session.connection()
+        if connection.dialect.name == "postgresql":
+            async with db.scoped_session(self.session_maker) as marker_session:
+                await marker_session.execute(
+                    text(
+                        "UPDATE search_vector_chunks SET embedding_status = 'pending' "
+                        "WHERE project_id = :project_id AND vector_index = :vector_index "
+                        f"AND entity_id IN ({placeholders})"
+                    ),
+                    stage_params,
+                )
+                await marker_session.commit()
+        else:
+            # SQLite permits only one writer, so a second marker transaction would
+            # deadlock behind the project write lock. Keep the marker in the caller
+            # transaction; extension cleanup still remains serialized.
+            await session.execute(
+                text(
+                    "UPDATE search_vector_chunks SET embedding_status = 'pending' "
+                    "WHERE project_id = :project_id AND vector_index = :vector_index "
+                    f"AND entity_id IN ({placeholders})"
+                ),
+                stage_params,
+            )
+
+        await self._semantic_vector_index.initialize()
+        for entity_id in deleted_entity_ids:
+            await self._semantic_vector_index.delete_entity(self.project_id, entity_id)
+
+    async def _delete_project_builtin_vector_rows(self, session: AsyncSession) -> None:
+        """Delete backend-owned vector rows before their SQL manifest is removed."""
+
+    async def _lock_external_vector_project(
+        self,
+        session: AsyncSession,
+        *,
+        dialect_name: str,
+    ) -> None:
+        """Serialize project-wide cleanup with external adapter writes."""
+        if dialect_name == "postgresql":
+            await session.execute(
+                text("SELECT id FROM project WHERE id = :project_id FOR UPDATE"),
+                {"project_id": self.project_id},
+            )
+            return
+        if dialect_name == "sqlite":
+            # SQLite has no row-level lock. This no-op write acquires its database
+            # write lock before ownership is read and keeps it through adapter I/O.
+            await session.execute(
+                text("UPDATE project SET id = id WHERE id = :project_id"),
+                {"project_id": self.project_id},
+            )
+            return
+        raise SemanticVectorIndexExtensionError(
+            f"External vector cleanup does not support SQL dialect {dialect_name!r}."
+        )
+
+    async def _lock_external_vector_write(self, session: AsyncSession) -> None:
+        """Share one project lock across external manifest mutations and cleanup."""
+        if not self._uses_external_vector_index():
+            return
+
+        connection = await session.connection()
+        await self._lock_external_vector_project(
+            session,
+            dialect_name=connection.dialect.name,
+        )
+
+    def _replans_prepare_under_write_lock(self) -> bool:
+        """Return whether prepare re-reads its rows after taking a write lock.
+
+        Only a backend that holds a lock across the re-read and the write gains from
+        it: external indexes take the project lock, and SQLite overrides this for its
+        prepare write lock. Built-in Postgres takes no lock here, so a re-read would
+        add round trips without closing the window.
+        """
+        return self._uses_external_vector_index()
+
+    def _uses_external_vector_index(self) -> bool:
+        """Return whether this repository writes vectors outside the SQL backend."""
+        return self._semantic_vector_index_name not in BUILT_IN_VECTOR_INDEX_NAMES and hasattr(
+            self, "_semantic_vector_index"
+        )
+
+    def _assert_manifest_vector_ownership(self, vector_index_names: Iterable[object]) -> None:
+        """Reject cleanup that cannot reach every externally owned vector."""
+        recorded_indexes = frozenset(str(name) for name in vector_index_names if str(name))
+        external_indexes = recorded_indexes - BUILT_IN_VECTOR_INDEX_NAMES
+        configured_index = self._semantic_vector_index_name
+        if external_indexes and (
+            not hasattr(self, "_semantic_vector_index")
+            or external_indexes != frozenset({configured_index})
+        ):
+            raise SemanticVectorIndexExtensionError(
+                "Cannot mutate vector manifests owned by external indexes "
+                f"{sorted(external_indexes)!r} with configured adapter "
+                f"{configured_index!r}. Restore the owning adapter and retry."
+            )
+
+    async def delete_project_vector_rows(
+        self,
+        *,
+        strict_adapter_cleanup: bool = True,
+        session: AsyncSession | None = None,
+    ) -> None:
+        """Delete this project's vectors through the configured storage adapter.
+
+        Core enumerates ownership from the SQL manifest because the adapter
+        contract intentionally has no project-wide listing or destructive reset.
+        A full reindex clears the manifest even when semantic search is disabled,
+        so stale ready rows cannot become current if the feature is re-enabled.
+        External adapter cleanup is strict by default because the manifest is the
+        only durable ownership record for remote vectors. Ownership mismatches
+        fail closed because only the owning extension can safely remove previously
+        written vectors.
+        """
+        if session is not None:
+            await self._delete_project_vector_rows_in_session(
+                session,
+                strict_adapter_cleanup=strict_adapter_cleanup,
+            )
+            return
+
+        async with db.scoped_session(self.session_maker) as owned_session:
+            changed = await self._delete_project_vector_rows_in_session(
+                owned_session,
+                strict_adapter_cleanup=strict_adapter_cleanup,
+            )
+            if changed:
+                await owned_session.commit()
+
+    async def _delete_project_vector_rows_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        strict_adapter_cleanup: bool,
+    ) -> bool:
+        """Delete project vectors while retaining the caller's transaction boundary."""
+        connection = await session.connection()
+        manifest_exists = await connection.run_sync(
+            lambda sync_connection: inspect(sync_connection).has_table("search_vector_chunks")
+        )
+        if not manifest_exists:
+            return False
+
+        manifest_columns = await connection.run_sync(
+            lambda sync_connection: {
+                str(column["name"])
+                for column in inspect(sync_connection).get_columns("search_vector_chunks")
+            }
+        )
+        manifest_has_embedding_status = "embedding_status" in manifest_columns
+        configured_index = self._semantic_vector_index_name
+        external_adapter_available = (
+            configured_index not in BUILT_IN_VECTOR_INDEX_NAMES
+            and hasattr(self, "_semantic_vector_index")
+        )
+        if external_adapter_available:
+            # Constraint: the project row is the only lock that also covers future
+            # manifest inserts. The caller retains it through adapter I/O, manifest
+            # removal, and—during hard deletion—the project-row delete itself.
+            await self._lock_external_vector_write(session)
+
+        entity_ids_by_vector_index: dict[str, list[int]] = {}
+        if "vector_index" in manifest_columns:
+            result = await session.execute(
+                text(
+                    "SELECT DISTINCT entity_id, vector_index FROM search_vector_chunks "
+                    "WHERE project_id = :project_id ORDER BY vector_index, entity_id"
+                ),
+                {"project_id": self.project_id},
+            )
+            for entity_id, vector_index in result.all():
+                entity_ids_by_vector_index.setdefault(str(vector_index), []).append(int(entity_id))
+        else:
+            result = await session.execute(
+                text(
+                    "SELECT DISTINCT entity_id FROM search_vector_chunks "
+                    "WHERE project_id = :project_id ORDER BY entity_id"
+                ),
+                {"project_id": self.project_id},
+            )
+            legacy_vector_index = (
+                "sqlite-vec" if connection.dialect.name == "sqlite" else "pgvector"
+            )
+            entity_ids_by_vector_index[legacy_vector_index] = [
+                int(entity_id) for entity_id in result.scalars().all()
+            ]
+
+        # Trigger: manifests belong to an external index other than the available adapter.
+        # Why: adapter configuration can change after vectors were written, and deleting
+        # the manifest would discard the only durable routing information for old vectors.
+        # Outcome: fail before touching any adapter or manifest so the owner can be restored.
+        self._assert_manifest_vector_ownership(entity_ids_by_vector_index)
+
+        builtin_indexes = frozenset(entity_ids_by_vector_index) & BUILT_IN_VECTOR_INDEX_NAMES
+        if manifest_has_embedding_status and (not external_adapter_available or builtin_indexes):
+            builtin_filter = ""
+            if external_adapter_available:
+                builtin_filter = " AND vector_index IN ('pgvector', 'sqlite-vec')"
+            await session.execute(
+                text(
+                    "UPDATE search_vector_chunks SET embedding_status = 'pending' "
+                    f"WHERE project_id = :project_id{builtin_filter}"
+                ),
+                {"project_id": self.project_id},
+            )
+
+        adapter_entity_ids = entity_ids_by_vector_index.get(configured_index, [])
+        if external_adapter_available:
+            try:
+                await self._delete_external_entity_vectors_locked(
+                    session,
+                    adapter_entity_ids,
+                    recorded_indexes=frozenset(entity_ids_by_vector_index),
+                )
+            except Exception as exc:
+                # Trigger: a configured external adapter cannot initialize or delete.
+                # Why: reindex and project deletion must not discard the only
+                # ownership manifest for external data.
+                # Outcome: strict callers stop for a retry before manifest deletion.
+                logger.warning(
+                    "Could not clean semantic vector adapter: "
+                    "project_id={project_id} vector_index={vector_index} error={error}",
+                    project_id=self.project_id,
+                    vector_index=self._semantic_vector_index_name,
+                    error=exc,
+                )
+                if strict_adapter_cleanup:
+                    raise
+
+        await self._delete_project_builtin_vector_rows(session)
+        await session.execute(
+            text("DELETE FROM search_vector_chunks WHERE project_id = :project_id"),
+            {"project_id": self.project_id},
+        )
+        return True
+
+    async def delete_stale_vector_rows(self) -> None:
+        """Delete vectors whose source entity no longer exists.
+
+        The SQL manifest remains the source of truth for ownership. External
+        indexes receive stable entity deletes before their manifest rows are
+        removed, avoiding backend-specific cleanup in the service layer.
+        """
+        if not self._semantic_enabled:
+            return
+
+        await self._ensure_vector_tables()
+        async with db.scoped_session(self.session_maker) as session:
+            result = await session.execute(
+                text(
+                    "SELECT DISTINCT entity_id FROM search_vector_chunks "
+                    "WHERE project_id = :project_id AND entity_id NOT IN ("
+                    "SELECT id FROM entity WHERE project_id = :project_id) "
+                    "ORDER BY entity_id"
+                ),
+                {"project_id": self.project_id},
+            )
+            entity_ids = [int(entity_id) for entity_id in result.scalars().all()]
+
+        for entity_id in entity_ids:
+            await self.delete_entity_vector_rows(entity_id)
+
+    async def reconcile_vector_index(self) -> None:
+        """Let capable adapters prune records absent from the ready SQL manifest."""
+        if not self._semantic_enabled:
+            return
+
+        await self._ensure_vector_tables()
+        if not isinstance(self._semantic_vector_index, SemanticVectorIndexReconciler):
+            return
+
+        external_vector_index = self._uses_external_vector_index()
+        async with db.scoped_session(self.session_maker) as session:
+            if external_vector_index:
+                # Trigger: reconciliation snapshots the live manifest before asking
+                # an external adapter to delete everything else.
+                # Why: a concurrent watcher could otherwise publish a new vector
+                # after the snapshot and have reconciliation delete that live key.
+                # Outcome: share the project lock with external writes through both
+                # the manifest read and orphan deletion.
+                await self._lock_external_vector_write(session)
+            result = await session.execute(
+                text(
+                    "SELECT entity_id, chunk_key FROM search_vector_chunks "
+                    "WHERE project_id = :project_id "
+                    "AND vector_index = :vector_index "
+                    "AND embedding_model = :embedding_model "
+                    "AND embedding_status = 'ready' "
+                    "ORDER BY entity_id, chunk_key"
+                ),
+                {
+                    "project_id": self.project_id,
+                    "vector_index": self._semantic_vector_index_name,
+                    "embedding_model": self._embedding_model_key(),
+                },
+            )
+            live_keys = [
+                VectorKey(
+                    entity_id=int(row["entity_id"]),
+                    chunk_key=str(row["chunk_key"]),
+                )
+                for row in result.mappings().all()
+            ]
+
+            if external_vector_index:
+                await self._semantic_vector_index.delete_orphans(self.project_id, live_keys)
+                await session.commit()
+                return
+
+        await self._semantic_vector_index.delete_orphans(self.project_id, live_keys)
+
+    # ------------------------------------------------------------------
+    # Shared semantic search: guard, text processing, chunking
+    # ------------------------------------------------------------------
+
+    def _assert_semantic_available(self) -> None:
+        if not self._semantic_enabled:
+            raise SemanticSearchDisabledError(
+                "Semantic search is unavailable: the vector runtime failed to load at "
+                "startup, so search is keyword-only. See the startup log for the cause."
+            )
+        if self._embedding_provider is None:
+            raise SemanticDependenciesMissingError(
+                "No embedding provider configured. "
+                "Install/update basic-memory to include semantic dependencies "
+                "(pip install -U basic-memory)."
+            )
+
+    def _build_chunk_records(self, rows: Iterable[SemanticSourceRow]) -> list[VectorChunkRecord]:
+        chunk_build = build_vector_chunk_records(rows)
+        if chunk_build.duplicate_chunk_keys:
+            logger.warning(
+                "Collapsed duplicate vector chunk keys before embedding sync: "
+                "project_id={project_id} duplicate_chunk_keys={duplicate_chunk_keys}",
+                project_id=self.project_id,
+                duplicate_chunk_keys=chunk_build.duplicate_chunk_keys,
+            )
+
+        return chunk_build.records
+
+    def _build_entity_fingerprint(self, chunk_records: list[VectorChunkRecord]) -> str:
+        return build_entity_fingerprint(chunk_records)
+
+    def _embedding_model_key(self) -> str:
+        """Build a stable model identity for vector invalidation checks."""
+        assert self._embedding_provider is not None
+        provider = self._embedding_provider
+        # Trigger: providers can change request/input semantics without changing
+        # model/dimensions.
+        # Why: asymmetric providers may use role-specific API params or literal
+        # text-prefix transforms that change stored vector meaning.
+        # Outcome: reindex treats those semantic config changes as stale vectors.
+        provider_identity = embedding_provider_identity(provider)
+        return f"{type(provider).__name__}:{provider_identity}"
+
+    def _plan_entity_vector_shard(
+        self,
+        pending_records: list[VectorChunkRecord],
+    ) -> _EntityVectorShardPlan:
+        """Select the bounded shard to process for one entity sync invocation."""
+        return semantic_vector_sync.plan_entity_vector_shard(
+            pending_records,
+            shard_size=OVERSIZED_ENTITY_VECTOR_SHARD_SIZE,
+        )
+
+    def _log_vector_shard_plan(
+        self,
+        *,
+        entity_id: int,
+        shard_plan: _EntityVectorShardPlan,
+    ) -> None:
+        """Emit shard planning logs once the pending work is known."""
+        semantic_vector_sync.log_vector_shard_plan(
+            self,
+            entity_id=entity_id,
+            shard_plan=shard_plan,
+            shard_size=OVERSIZED_ENTITY_VECTOR_SHARD_SIZE,
+        )
+
+    # --- Text splitting ---
+
+    def _split_text_into_chunks(self, text_value: str) -> list[str]:
+        return split_text_into_chunks(text_value)
+
+    # ------------------------------------------------------------------
+    # Shared semantic search: sync_entity_vectors orchestration
+    # ------------------------------------------------------------------
+
+    async def sync_entity_vectors(self, entity_id: int) -> VectorSyncBatchResult:
+        """Sync semantic chunk rows + embeddings for a single entity."""
+        return await self._sync_entity_vectors_internal(
+            [entity_id],
+            progress_callback=None,
+            continue_on_error=False,
+        )
+
+    async def sync_entity_vectors_batch(
+        self,
+        entity_ids: list[int],
+        progress_callback: Optional[Callable[[int, int, int], Any]] = None,
+    ) -> VectorSyncBatchResult:
+        """Sync semantic chunk rows + embeddings for a batch of entities."""
+        return await self._sync_entity_vectors_internal(
+            entity_ids,
+            progress_callback=progress_callback,
+            continue_on_error=True,
+        )
+
+    async def _sync_entity_vectors_internal(
+        self,
+        entity_ids: list[int],
+        progress_callback: Optional[Callable[[int, int, int], Any]],
+        continue_on_error: bool,
+    ) -> VectorSyncBatchResult:
+        """Run shared vector sync orchestration for one or many entities.
+
+        Every public entry point converges here, which is why the deferral marker
+        is written here too. It first sat on the batch method, and the per-entity
+        scheduler -- the path normal editing actually takes -- reached the same
+        sharding decision and recorded nothing (#1440 review). Producing a
+        deferral and recording it cannot come apart if there is one place that
+        does both. `tests/repository/test_vector_sync_deferral_paths.py` fails if
+        a third entry point appears that does not delegate here.
+
+        Recorded at this boundary rather than inside the portable helper: this
+        class owns a database session, and the helper is also driven by test
+        doubles that have none.
+        """
+        pass_started_at = datetime.now(timezone.utc)
+        try:
+            result = await semantic_vector_sync.sync_entity_vectors_internal(
+                self,
+                entity_ids,
+                progress_callback,
+                continue_on_error,
+            )
+        except BaseException:
+            # Trigger: the pass raised instead of returning terminal states. The
+            #   per-entity scheduler calls this with continue_on_error=False, so
+            #   a prepare or flush failure escapes rather than being collected.
+            # Why: recording only what the pass *returns* leaves that path
+            #   unmarked, and an edited multi-chunk note keeps its earlier ready
+            #   chunks -- enough to read as fully embedded (#1440 review).
+            #   Whatever a pass leaves behind must be recorded whether it
+            #   returned it or raised it.
+            # Outcome: mark every entity in the batch unfinished. We cannot know
+            #   which ones completed, and over-marking is the safe direction: the
+            #   next pass clears the ones that are actually current, whereas an
+            #   unmarked incomplete entity is never revisited.
+            await self.record_entity_vector_deferrals(
+                unfinished_entity_ids=set(entity_ids),
+                completed_entity_ids=set(),
+                pass_started_at=pass_started_at,
+            )
+            raise
+
+        # Deferred *and* failed both leave the entity owing work; only synced is
+        # finished. Enumerating the pass's terminal states here is what keeps
+        # readiness agreeing with it, rather than tracking the one state that
+        # happened to be found first.
+        await self.record_entity_vector_deferrals(
+            unfinished_entity_ids=set(result.deferred_entity_ids) | set(result.failed_entity_ids),
+            completed_entity_ids=set(result.synced_entity_ids),
+            pass_started_at=pass_started_at,
+        )
+        return result
+
+    def _vector_prepare_window_size(self) -> int:
+        """Return the number of entities to prepare in one orchestration window."""
+        return semantic_vector_sync.vector_prepare_window_size(
+            self,
+            max_window_size=_SQLITE_MAX_PREPARE_WINDOW,
+        )
+
+    @asynccontextmanager
+    async def _prepare_entity_write_scope(self):
+        """Serialize the write-side prepare section when a backend needs it."""
+        yield
+
+    def _prepare_window_entity_params(
+        self,
+        entity_ids: list[int],
+    ) -> tuple[str, dict[str, object]]:
+        """Build deterministic bind params for one prepare window."""
+        return semantic_vector_sync.prepare_window_entity_params(self, entity_ids)
+
+    async def _fetch_prepare_window_source_rows(
+        self,
+        session: AsyncSession,
+        entity_ids: list[int],
+    ) -> dict[int, list[Any]]:
+        """Fetch all search_index rows needed for one prepare window."""
+        return await semantic_vector_sync.fetch_prepare_window_source_rows(
+            self,
+            session,
+            entity_ids,
+        )
+
+    def _prepare_window_existing_rows_sql(self, placeholders: str) -> str:
+        """SQL for existing chunk/embedding rows in one prepare window."""
+        return semantic_vector_sync.prepare_window_existing_rows_sql(placeholders)
+
+    async def _fetch_prepare_window_existing_rows(
+        self,
+        session: AsyncSession,
+        entity_ids: list[int],
+    ) -> dict[int, list[VectorChunkState]]:
+        """Fetch all persisted chunk state needed for one prepare window."""
+        return await semantic_vector_sync.fetch_prepare_window_existing_rows(
+            self,
+            session,
+            entity_ids,
+        )
+
+    async def _fetch_prepare_window_projector_owned_entity_ids(
+        self,
+        session: AsyncSession,
+        entity_ids: list[int],
+    ) -> set[int]:
+        """Fetch the window entities whose current revision the Wiki projector wrote."""
+        return await semantic_vector_sync.fetch_prepare_window_projector_owned_entity_ids(
+            self,
+            session,
+            entity_ids,
+        )
+
+    async def _prepare_entity_vector_jobs_window(
+        self,
+        entity_ids: list[int],
+    ) -> list[_PreparedEntityVectorSync | BaseException]:
+        """Prepare one window of entity vector jobs with shared read-side batching."""
+        return await semantic_vector_sync.prepare_entity_vector_jobs_window(
+            self,
+            entity_ids,
+        )
+
+    async def _upsert_scheduled_chunk_records(
+        self,
+        session: AsyncSession,
+        *,
+        entity_id: int,
+        scheduled_records: list[VectorChunkRecord],
+        existing_by_key: dict[str, VectorChunkState],
+        entity_fingerprint: str,
+        embedding_model: str,
+    ) -> list[_PendingEmbeddingJob]:
+        """Upsert scheduled chunk rows and return embedding jobs."""
+        return await semantic_vector_sync.upsert_scheduled_chunk_records(
+            self,
+            session,
+            entity_id=entity_id,
+            scheduled_records=scheduled_records,
+            existing_by_key=existing_by_key,
+            entity_fingerprint=entity_fingerprint,
+            embedding_model=embedding_model,
+        )
+
+    async def _flush_embedding_jobs(
+        self,
+        flush_jobs: list[_PendingEmbeddingJob],
+        entity_runtime: dict[int, _EntitySyncRuntime],
+        synced_entity_ids: set[int],
+    ) -> tuple[float, float]:
+        """Embed and persist one queued flush chunk."""
+        return await semantic_vector_sync.flush_embedding_jobs(
+            self,
+            flush_jobs,
+            entity_runtime,
+            synced_entity_ids,
+        )
+
+    def _finalize_completed_entity_syncs(
+        self,
+        *,
+        entity_runtime: dict[int, _EntitySyncRuntime],
+        synced_entity_ids: set[int],
+        deferred_entity_ids: set[int],
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> float:
+        """Finalize completed entities and return cumulative queue wait seconds."""
+        return semantic_vector_sync.finalize_completed_entity_syncs(
+            self,
+            entity_runtime=entity_runtime,
+            synced_entity_ids=synced_entity_ids,
+            deferred_entity_ids=deferred_entity_ids,
+            progress_callback=progress_callback,
+        )
+
+    def _log_vector_sync_runtime_settings(
+        self,
+        *,
+        backend_name: str,
+        entities_total: int,
+    ) -> None:
+        """Log the resolved embedding runtime knobs before the first prepare window."""
+        semantic_vector_sync.log_vector_sync_runtime_settings(
+            self,
+            backend_name=backend_name,
+            entities_total=entities_total,
+        )
+
+    def _log_vector_sync_complete(
+        self,
+        *,
+        entity_id: int,
+        total_seconds: float,
+        prepare_seconds: float,
+        queue_wait_seconds: float,
+        embed_seconds: float,
+        write_seconds: float,
+        source_rows_count: int,
+        chunks_total: int,
+        chunks_skipped: int,
+        embedding_jobs_count: int,
+        entity_skipped: bool,
+        entity_complete: bool,
+        oversized_entity: bool,
+        pending_jobs_total: int,
+        shard_index: int,
+        shard_count: int,
+        remaining_jobs_after_shard: int,
+    ) -> None:
+        """Log completion and slow-entity warnings with a consistent format."""
+        semantic_vector_sync.log_vector_sync_complete(
+            self,
+            entity_id=entity_id,
+            total_seconds=total_seconds,
+            prepare_seconds=prepare_seconds,
+            queue_wait_seconds=queue_wait_seconds,
+            embed_seconds=embed_seconds,
+            write_seconds=write_seconds,
+            source_rows_count=source_rows_count,
+            chunks_total=chunks_total,
+            chunks_skipped=chunks_skipped,
+            embedding_jobs_count=embedding_jobs_count,
+            entity_skipped=entity_skipped,
+            entity_complete=entity_complete,
+            oversized_entity=oversized_entity,
+            pending_jobs_total=pending_jobs_total,
+            shard_index=shard_index,
+            shard_count=shard_count,
+            remaining_jobs_after_shard=remaining_jobs_after_shard,
+        )
+
+    async def _prepare_vector_session(self, session: AsyncSession) -> None:
+        """Hook for per-session setup (e.g. loading sqlite-vec extension).
+
+        Default implementation is a no-op. SQLite overrides this.
+        """
+        pass
+
+    def _timestamp_now_expr(self) -> str:
+        """SQL expression for 'now' in the backend.
+
+        SQLite uses CURRENT_TIMESTAMP, Postgres uses NOW().
+        """
+        return "CURRENT_TIMESTAMP"

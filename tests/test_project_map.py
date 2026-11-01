@@ -168,6 +168,108 @@ class ProjectMapTests(unittest.TestCase):
         self.maps.scan("project_one", "rescan")
         self.assertNotIn(record["id"], {node["id"] for node in self.maps.query("project_one")["nodes"]})
 
+    def test_architecture_update_exposes_version_and_forget_uses_tombstone(self):
+        self.file("main.py")
+        self.maps.scan("project_one", "scan")
+        source = self.maps.evidence("project_one", "main.py")
+        created = self.maps.write("project_one", "write", "入口", "启动系统", [source], [])
+        graph = self.maps.query("project_one")
+        node = next(node for node in graph["nodes"] if node["id"] == created["id"])
+        self.assertEqual(node["revision"], 1)
+        self.assertEqual(node["etag"], created["etag"])
+        self.assertEqual(node["stale_reasons"], [])
+
+        updated = self.maps.update(
+            "project_one", "update", created["id"], 1, created["etag"],
+            "新入口", "由 app 启动", [source], [
+                {"source": "entry", "target": "file:main.py", "relation": "starts"},
+            ],
+        )
+        self.assertEqual(updated["revision"], 2)
+        self.assertEqual(updated["status"], "active")
+        node = next(
+            node for node in self.maps.query("project_one")["nodes"]
+            if node["id"] == created["id"]
+        )
+        self.assertEqual(node["revision"], 2)
+        self.assertEqual(node["etag"], updated["etag"])
+        self.assertEqual(node["title"], "新入口")
+        self.error("VERSION_CONFLICT", lambda: self.maps.update(
+            "project_one", "stale-update", created["id"], 1, created["etag"],
+            "旧写", "不应覆盖", [source], [],
+        ))
+
+        forgotten = self.maps.forget(
+            "project_one", "forget", created["id"], 2, updated["etag"],
+        )
+        self.assertTrue(forgotten["deleted"])
+        self.error("RECORD_NOT_FOUND", lambda: self.vault.read(created["id"]))
+        self.error("RECORD_NOT_FOUND", lambda: self.maps.forget(
+            "project_one", "forget-again", created["id"], 2, updated["etag"],
+        ))
+        self.assertNotIn(
+            created["id"],
+            {node["id"] for node in self.maps.query("project_one", include_stale=True)["nodes"]},
+        )
+        resurrected = {
+            "id": created["id"], "type": "architecture", "scope": "project",
+            "project_id": "project_one", "title": "Resurrected", "body": "",
+            "sources": [source], "relations": [], "status": "active",
+            "revision": 1, "created_at": "2026-10-28T00:00:00+00:00",
+            "source_type": "host_reported",
+        }
+        self.error("RECORD_DELETED", lambda: self.vault.commit(
+            "resurrect", {"id": created["id"]},
+            lambda: ([{"record": resurrected, "path": "architecture/old.md", "expected": None}], {}),
+        ))
+
+    def test_architecture_update_rejects_unscanned_or_changed_sources(self):
+        target = self.file("main.py", "first")
+        self.maps.scan("project_one", "scan")
+        source = self.maps.evidence("project_one", "main.py")
+        created = self.maps.write("project_one", "write", "Entry", "Main", [source], [])
+        target.write_text("changed", encoding="utf-8")
+        self.error("SOURCE_CHANGED", lambda: self.maps.update(
+            "project_one", "update-stale", created["id"], 1, created["etag"],
+            "Entry", "Main changed", [source], [],
+        ))
+        rescan = self.maps.scan("project_one", "rescan")
+        self.assertEqual(rescan["changed"], ["main.py"])
+        current = self.maps.evidence("project_one", "main.py")
+        updated = self.maps.update(
+            "project_one", "update-current", created["id"], 1, created["etag"],
+            "Entry", "Main changed", [current], [],
+        )
+        self.assertEqual(updated["revision"], 2)
+        graph = self.maps.query("project_one", include_stale=True)
+        node = next(node for node in graph["nodes"] if node["id"] == created["id"])
+        self.assertEqual(node["status"], "active")
+        self.assertEqual(node["stale_reasons"], [])
+
+    def test_architecture_update_is_project_scoped(self):
+        self.file("main.py")
+        self.maps.scan("project_one", "scan")
+        source = self.maps.evidence("project_one", "main.py")
+        created = self.maps.write("project_one", "write", "Entry", "Main", [source], [])
+        other_root = Path(self.temporary.name) / "other"
+        other_root.mkdir()
+        other = {
+            "id": "project_two", "type": "project", "scope": "project",
+            "project_id": "project_two", "root": str(other_root), "revision": 1,
+            "title": "Other project", "body": "",
+        }
+        self.vault.commit("register-two", other, lambda: (
+            [{"record": other, "path": "projects/project_two.md", "expected": None}],
+            {"id": other["id"]},
+        ))
+        self.error("SCOPE_DENIED", lambda: self.maps.update(
+            "project_two", "cross-project", created["id"], 1, created["etag"],
+            "Wrong", "Wrong", [source], [],
+        ))
+        self.error("SCOPE_DENIED", lambda: self.maps.forget(
+            "project_two", "cross-project-forget", created["id"], 1, created["etag"],
+        ))
+
     def test_query_filters_and_limits_nodes_and_edges(self):
         for number in range(4):
             self.file(f"src/file{number}.py")
