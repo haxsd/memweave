@@ -10,6 +10,8 @@ MemWeave 在现有编程 Agent 内提供任务工作记忆、并行执行进度�
 
 如果模型可见上下文已经有 MemWeave 启动块，先读它；如果没有，立即调用 `memweave_system_status` 和只读 `memweave_workspace_prepare`。MCP 在本进程未成功 prepare 前会对其他项目工具返回 `PREPARE_REQUIRED`。Cursor 的 `sessionStart` 只按 best effort 处理，不能用 Hook 收据代替模型实际收到的证据：
 
+状态、接续或“做到哪一步/下一步做什么”类请求应直接调用常驻 MCP；不要在 prepare 前用 shell 读取 Skill、`PLAN.md`、`context/CURRENT_STATE.md`、源码或运行全仓搜索，也不要用 CLI/Python 绕过 MCP 硬门。除非用户要求实施，这类请求保持只读，不修改项目文件。
+
 首次接续、创建任务或发生一次性回退后，下一条用户可见回复应以单独一行开头：有已建立任务时写 `MemWeave · 任务 <id> · <next_step>`，没有任务时写 `MemWeave · 尚未建立任务`。不要每轮重复；这一行表示产品状态，不表示 MCP 写入已经成功。
 
 ```text

@@ -2,7 +2,8 @@
 
 本目录是 MemWeave（织忆）的开发工作区。
 
-- 开始项目前先读 `README.md`、`docs/README.md`、`PLAN.md`；本机开发区存在 `context/CURRENT_STATE.md` 时一并读取，再按任务读取 `docs/` 的接口与开发说明。
+- 状态、接续或“做到哪一步/下一步做什么”类请求是只读请求：首个项目动作必须是常驻 MCP 的 `memweave_workspace_prepare`（绝对执行根，明确 `inspect`/`resume`/`new`），可并行调用 `memweave_system_status`，再读取有界任务与检查点摘要。不得先用 shell 读取 `SKILL.md`、`PLAN.md`、`context/CURRENT_STATE.md`、README/docs 或搜索源码，也不得用 CLI/Python 调 `workspace_prepare` 绕过 MCP 硬门；不得创建、编辑或删除文件。MCP 不可用时直接说明并请求启用，不得用文件或 CLI 猜测任务状态。
+- 实施类请求在完成上述接续后，再读 `README.md`、`docs/README.md`、`PLAN.md`；本机开发区存在 `context/CURRENT_STATE.md` 时一并读取，再按任务读取 `docs/` 的接口与开发说明。不要用 shell 重读已加载的 Skill。
 - 前期讨论、两份 v0.1 原文、合并后的开发历程和图片位于 `docs/history/`，仅在需要追溯时读取。历史记录是参考资料，较早的建议可能已被后续决策取代。
 - 当前已确认方向：AGPL-3.0-or-later 完全开源；产品语义只有任务工作记忆与长期知识两层，文件/架构关系是支撑证据；以 Basic Memory 为底层，直接深度融合 planning-with-files 的任务生命周期；最终只有一个 MCP、一个 Skill、一个 Hook 入口；同一项目单活跃任务、其余顺序排队。
 - 新的重要技术选型与用户讨论后确定；常规实施细节根据已有决策推进。

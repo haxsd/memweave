@@ -55,7 +55,8 @@ class CodexHookTests(unittest.TestCase):
         self.assertIn("PROJECT_POLICY_VISIBLE", output["additionalContext"])
         self.assertIn("verify change", output["additionalContext"])
         self.assertIn("唯一 current 任务", output["additionalContext"])
-        self.assertIn("memweave-continuity", output["additionalContext"])
+        self.assertIn("不要用 shell 重读 Skill", output["additionalContext"])
+        self.assertNotIn("读取 memweave-continuity Skill", output["additionalContext"])
 
     def test_new_session_restores_current_checkpoint_and_never_resumes_queued_task(self):
         task = self.task()

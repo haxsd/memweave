@@ -121,7 +121,11 @@ class CursorHooks:
                 "再决定是否创建任务。"
             )
         guidance = (
-            "MemWeave: 读取 memweave-continuity Skill。"
+            "MemWeave: 首个项目动作必须是常驻 MCP 的 memweave_workspace_prepare"
+            "（绝对执行根 + inspect/resume/new），需要时可并行调用 memweave_system_status。"
+            "不要用 shell 重读 Skill，也不要在 prepare 前读取 PLAN/CURRENT_STATE/源码"
+            "或运行全仓搜索；不得用 CLI/Python 调 workspace_prepare。"
+            "状态/下一步请求保持只读，不创建、编辑或删除文件。"
             + selection
             + "首次接续、创建任务或回退注入时，在面向用户的回复开头用一行显示 "
             "`MemWeave · 任务 <id> · <next_step>`；没有任务时显示 "

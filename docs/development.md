@@ -90,6 +90,8 @@ Phase 14 新增 `startup_context_emitted`/`startup_context_source` 状态命名�
 
 Phase 15 P0 新增 Git common directory worktree 解析、`project_register`/`workspace_prepare` 复用主项目、Codex Hook worktree 路径接受、`clients doctor` 的 `worktree_unconfigured` 发现/修复，以及 Cursor `.cursor/.gitignore` 合并。真实 `haxsd-byok` worktree 已修复并保持 5 个项目；主 checkout 与 worktree 的 `check --probe` 均返回 22 工具。全新 Codex CLI 会话实际调用 `system_status`/`workspace_prepare` 并返回 `state=ready`，同时留下自动 SessionStart/SessionEnd 收据。2026-11-01 进一步完成真实客户端新会话验收：Codex 桌面新会话加载 22 工具、返回 `workspace_prepare=ready` 并留下自动 `SessionStart` 收据；Cursor 3.27.22 新会话加载 22 工具，`sessionStart` 以 4.295 秒 exit 0 返回有效上下文，并首轮调用 `workspace_prepare`。Codex 本次只有收据，没有 `hook_sessions` 或模型可见启动块，实际恢复路径仍是常驻 MCP。定向 32 项通过，全量 212 项运行、1 项仅因 Windows 符号链接权限跳过且其余通过，耗时 763.653 秒；`clients doctor` 最终 7 roots / 8 targets 全 ready。
 
+2026-11-02 Phase 15 收口验证：3 个真实首轮样本为 Codex 26.0 秒、Cursor 修复前 230.4 秒、修复后 75.3 秒；修复后首个项目动作是 MCP `workspace_prepare`，不再先读 PLAN/源码或通过 CLI 绕过硬门。干净源码副本重建的 `memweave-0.2.5-py3-none-any.whl` 为 997,244 字节、SHA-256 `1DDDC80BE5031DA25C32A5F91F4E92CE00840F15328EBEE1D3A4D7B5F3040783`；独立 venv 安装、`init`、`doctor`、stdio `probe` 重启读回与 `pip check` 通过。最终全量回归 217 tests / 1 skipped / OK（649.713 秒），`clients doctor` 7 roots / 8 targets ready。旧 `build/lib` 的遗留资源没有进入干净 wheel；旧 MCP prompt/resource/UI 模块导入均为缺失。上述改动包含在本次聚焦提交中。
+
 本轮需验收绝对执行根、同仓库 linked worktree 复用项目、单 current 约束、并发任务创建、queued 顺序推进、并行 WorkUnit、阻塞关闭保护、阶段独立收束、`new` 不恢复旧任务、准备入口无隐式写入、用户范围显式选择、长历史下知识与结构的预算分配、漂移架构排除、实际纳入的来源标识，以及真实 MCP 服务重启恢复。命令清单表示验证方法，是否通过以本轮执行记录为准。
 
 ## 代码边界

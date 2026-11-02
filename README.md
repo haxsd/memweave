@@ -26,6 +26,8 @@
 
 **当前开发版已完成 Phase 0–14，实现长期项目有界历史、低频 Hook、单一通用工具面，并在 Codex/Cursor 真实会话验证连续工作恢复。** 用户项目不再用累计 Phase 表示批次；每个有明确目标与验收的需求批次仍是一个有界任务。完成并知识审查后进入可查询归档，默认 `workspace_prepare` 只装配 current、queued、待审查项、计数和最多 5 条近期归档；`task_list` 提供分页、状态与摘要查询。检查点与阶段写入独立 Markdown，任务正文不再随每次操作无限增长。Codex 和 Cursor 的默认 Hook 面分别收敛为 3 类和 2 类会话生命周期事件，文件编辑、工具调用、逐轮原话检索和每轮 Stop 维护改走常驻 MCP，不再提供高频/轻量的双轨选择。Phase 13 将默认工具面收敛为单一通用的 22 个 MCP 工具，旧 `--toolset` 只保留迁移兼容；诊断、恢复和管理动作走 CLI/UI。Basic Memory `0.24.1` 仍是 Markdown/SQLite 单底座，活动库位于 `%USERPROFILE%\.memweave`。Codex CLI 与桌面应用已产生低频 `SessionStart`/`SessionEnd` 收据；Codex 新会话及真实压缩后恢复均通过。Cursor 原生 Agent 在未提供任务 ID 的普通提示下，通过常驻 MCP 自动恢复同一任务；检查点后新会话也能恢复到新 revision。Cursor 的 `sessionStart` 仅按 best effort 记录，`hook_sessions.startup_context_emitted=true` 不代表模型已收到。Cursor 结束事件和统计收益仍需观察；0.2.5 私有开发快照已提交并推送，公开标签和 GitHub Release 尚未执行。目标行为见 [AGPL 深度融合目标规格](docs/specs/2026-10-27-agpl-fusion-target.md)，融合前的产品行为作为历史基准保留在 [产品行为基准](docs/specs/2026-10-27-product-realignment.md)。
 
+**Phase 15 已完成（2026-11-02）。** 3 个真实首轮样本已验证：Codex 最终状态 26.0 秒；Cursor 修复前 230.4 秒，收紧首轮路径后 75.3 秒，后续首个项目动作是 MCP `workspace_prepare`。Cursor 的 Hook 仍按 best effort 记录，不能把收据当作模型已收到启动块。干净 wheel、独立 venv、217 项全量回归、`clients doctor` 8/8、敏感信息和 Git 状态发布门均已在本地核对；提交与推送已获用户授权，标签和 Release 仍未执行。
+
 ## 接入已有 Agent（当前开发版）
 
 **让 Agent 安装：** 将 [本仓库](https://github.com/haxsd/memweave) 链接与目标项目、客户端交给 Agent，让它读取 [AGENT_INSTALL.md](AGENT_INSTALL.md) 并执行。AGPL 许可证与第三方声明已在 Phase 0 落地；可公开发布准备的代码与 wheel 已完成验证。0.2.5 开发快照已提交并推送到私有仓库，尚未建公开标签或 GitHub Release。

@@ -7,6 +7,8 @@ description: Maintains task working memory, parallel WorkUnits and reviewed long
 
 Keep the next host able to continue from evidence. Markdown is authoritative, SQLite is replaceable, and the host performs understanding and consolidation.
 
+**Status or continuation requests:** Do not re-read this file through a shell command. Make MCP `memweave_workspace_prepare` the first project tool call; do not inspect `PLAN.md`, `context/CURRENT_STATE.md`, source, or run repository-wide searches first, and do not bypass the MCP gate with CLI or Python. Keep the request read-only unless the user asks for implementation.
+
 ## Start or resume
 
 1. Read any Hook-injected MemWeave block first. A `current` task is a recovery candidate, not proof that it matches the current request. Verify the user's goal and actual repository state before continuing.

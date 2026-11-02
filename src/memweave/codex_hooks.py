@@ -183,7 +183,7 @@ class CodexHooks(CursorHooks):
             state["prompted_generation"] = turn
             return {"decision": "block", "reason": (
                 "MemWeave 观察到本轮项目改动或验证，但尚未关联任务。"
-                "读取接续 Skill，调用 memweave_workspace_prepare，按当前真实目标显式准备或创建任务，"
+                "不要先用 shell 重读 Skill；调用 memweave_workspace_prepare，按当前真实目标显式准备或创建任务，"
                 "再调用 memweave_task_checkpoint 保存真实发现、失败、验证结果与下一步。"
                 "不要猜测旧任务，不要将未通过验证记为通过，不保存凭据或完整对话。"
                 "只完成这一次记忆维护后结束，不扩展业务工作。"

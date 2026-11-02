@@ -71,6 +71,8 @@ class HookWorkflowTests(unittest.TestCase):
         context = response.get("additional_context", "")
         self.assertIn("PROJECT_RULE_VISIBLE", context)
         self.assertIn("memweave_workspace_prepare", context)
+        self.assertIn("不要用 shell 重读 Skill", context)
+        self.assertNotIn("读取 memweave-continuity Skill", context)
         self.assertIn("OLD_TASK_GOAL_MUST_NOT_LEAK", context)
         self.assertIn("唯一 current 任务", context)
         self.assertIn("MemWeave · 任务", context)

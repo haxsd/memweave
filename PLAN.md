@@ -4,11 +4,15 @@
 
 > 唯一有效的长期执行计划。创建于 2026-10-27。当前开发树已完成 Phase 0–14；Phase 10 增加架构记录受 revision/etag 保护的更新与遗忘、来源漂移保护、tombstone 和 knowledge/architecture 状态计数，Phase 11 把项目级状态与架构纠正/遗忘接入管理页，Phase 12 完成长期项目的有界任务历史、独立检查点、自动归档与非打断式低频 Hook，Phase 13 将 MCP 收敛为单一通用 22 工具面并完成产品价值复核，Phase 14 在真实 Codex/Cursor 会话验证新会话、检查点和压缩恢复。真实活动库已清除旧演示架构造成的 `graph_stale`，管理页已在真实浏览器完成 stale → 显式重扫纠正 → 遗忘闭环。`github-radar` 的四任务顺序链路、真实 `task_close`、文件编辑和旧 Stop 证据保留为历史；Codex CLI 与桌面 App 已产生成功 `SessionStart`/`SessionEnd` 收据；Cursor MCP 首轮恢复已验证，但模型可见启动注入和 `preCompact` 仍无通过证据。0.2.5 私有开发快照已提交推送；公开标签和 GitHub Release 尚未执行。除本文件外，不再新增逐轮 plan/report。
 
+> 2026-11-02 Phase 15 已完成：3 个真实新会话样本已记录。Codex 最终状态 26.0 秒；Cursor 修复前 230.4 秒，修复后 75.3 秒，且首个项目动作从读 PLAN/源码改为 MCP `workspace_prepare`。当前干净 wheel 已在独立 venv 完成 `init`、`doctor`、stdio `probe` 与 `pip check`，最终全量回归 217 tests / 1 skipped / OK（649.713 秒），`clients doctor` 8/8 ready。Phase 15 收尾改动随本次提交进入 `main`；公开标签和 GitHub Release 未执行。
+
 **目标：** 把 MemWeave 做成 AGPL-3.0-or-later 完全开源、本地优先的编程 Agent 连续工作层。以 Basic Memory 的 Markdown + SQLite、检索与上下文能力为底层，直接融合 planning-with-files 的任务生命周期与 Hook 机制，最终形成一个 MCP、一个 Skill、一个 Hook 入口，而不是并排运行两个成熟项目。
 
 **目标规格：** [AGPL 深度融合目标规格](docs/specs/2026-10-27-agpl-fusion-target.md)
 
 **当前基线：** 分支 `main` 上的 0.2.5 私有开发快照。2026-10-29 Phase 14 全量回归 204 项运行，1 项仅因 Windows 符号链接权限跳过，其余全部通过（669.450 秒）；Phase 14 定向回归 35 项通过。Phase 0–14 已完成；Codex 与 Cursor 的受管入口统一为 `universal` 22 工具面，`clients doctor` 修复 5 个过期资源后复检 6/6 `ready`；Codex、Cursor 当前项目 `check --probe` 均为 SDK stdio、22 工具、1 个 active task。真实活动库 `workspace_prepare` 返回 1 个 current 任务、5 条近期历史，`attention` 为空；最终项目扫描覆盖 611 个文件、0 错误。`sessionStart` Hook 两次独立 CLI 实测 3.4–3.6 秒，输出约 3.9k 字符，但 Cursor 3.27.22 的 `additional_context` 没有进入模型可见上下文。Codex 新会话和真实压缩后恢复通过；Cursor 普通首轮和检查点后新会话通过常驻 MCP + Rule/Skill 恢复；Cursor `sessionEnd` 和统计收益仍未验证；默认安装不含 `preCompact`。
+
+**2026-11-02 当前基线：** `147eb4e` 之后的一次聚焦提交包含 13 个发布门改动（首轮指令、Codex/Cursor Hook、Skill、测试和发布文档）。最终全量回归 217 tests / 1 skipped / OK（649.713 秒）；干净源码 wheel 为 997,244 字节，SHA-256 `1DDDC80BE5031DA25C32A5F91F4E92CE00840F15328EBEE1D3A4D7B5F3040783`，独立 venv 安装、`init`、`doctor`、stdio `probe` 重启读回和 `pip check` 通过；`clients doctor` 为 7 roots / 8 targets ready；许可证、来源声明、敏感信息高信号扫描和 Git 工作树核对完成。仓库仍为私有，无 tag 或 Release。
 
 **完成标准：**
 
@@ -345,6 +349,8 @@
 
 **状态：进行中（2026-11-01）。** 当前任务 `task_c593ac12bbe04d8d99294bd555fec567`。管理页升级 WorkUnit 已完成；2026-10-30 真实使用发现 Codex 项目分组不会重绑线程 cwd，旧会话仍运行在未配置 MemWeave 的 linked worktree，导致 MCP、Skill 和 Hook 全部静默失联。该接入可靠性问题升为当前阶段 P0，先于首响测量和发布门。P0 代码、真实 `haxsd-byok` 本机修复、全新 Codex CLI 加载验收，以及 2026-11-01 的 Codex 桌面/Cursor 新会话验收均已完成。Codex 当前新会话加载 22 工具且 `workspace_prepare state=ready`；Cursor 3.27.22 新会话加载 22 工具，`sessionStart` 4.295 秒返回有效上下文并首轮调用 `workspace_prepare`。Codex 本次只产生 `SessionStart` 收据，没有生成 `hook_sessions` 或模型可见启动块，实际恢复由常驻 MCP 完成；该差异保留为已知边界。剩余的是首响样本、探索路径收紧和发布门；不增加运行时、模式或默认高频 Hook，并在明确授权前不发布。
 
+**状态更新（2026-11-02）：已完成。** 3 个真实首轮样本分别为 Codex 26.0 秒、Cursor 修复前 230.4 秒、Cursor 修复后 75.3 秒；Hook 分别记录为约 5.7 秒窗口、5.068 秒和 4.679 秒。修复后的 Cursor 首个项目动作是并行 MCP `workspace_prepare` + `system_status`，没有先读 PLAN/CURRENT_STATE/源码，也没有通过 CLI/Python 绕过 MCP。发布门本地通过；提交与推送已获用户授权；标签和 Release 仍未执行。
+
 - [x] **P0（2026-10-30）：worktree 与项目绑定。** 同一 Git common directory 的主 checkout 和 linked worktrees 必须解析为同一 MemWeave project；worktree 只作为执行根，不产生重复项目或第二个 current。Hook 接受已登记仓库的合法 worktree；`clients doctor` 巡检缺失的项目级安装并显式警告/修复；新会话必须能直接看到 `memweave_*` 工具和 `workspace_prepare state=ready`。
   - [x] 同一仓库 worktree 解析、执行根/登记根返回、单项目/单 current 保持。
   - [x] Hook 接受合法 worktree，跨仓库和嵌套独立项目仍不注入。
@@ -352,10 +358,12 @@
   - [x] 修复 Cursor 项目级安装缺少 `.cursor/.gitignore` 导致用户仓库污染的问题。
   - [x] 从真实 worktree 新建受控 Codex CLI 会话，确认 22 工具、`workspace_prepare state=ready` 和自动 SessionStart/SessionEnd 收据；旧进程热更新不算。
   - [x] 在 Codex 桌面/Cursor 客户端的新会话中确认宿主重载、项目信任与 Hook 信任；受控 CLI 不替代桌面验收。2026-11-01 验证：Codex 新会话 `01a19499-f285-7b52-ba8a-9d7bee842bf5` 产生自动 `SessionStart` 收据、加载 22 工具并返回 `workspace_prepare state=ready`；Cursor 3.27.22 新会话 `2e5b62f6-5911-4ba9-bee5-f8f1329fe893` 的 `sessionStart` 以 4.295 秒 exit 0 返回有效上下文，MCP 加载 22 工具并在首轮调用 `workspace_prepare`。Codex 本次启动上下文没有模型可见落点，不能把收据写成注入；实际恢复路径是常驻 MCP。本轮两个新会话分别位于 MemWeave 主 checkout 和 `github-radar`，worktree 路径由受控 CLI 与 `clients doctor` 覆盖。
-- [ ] 收紧首轮状态/续接提示的探索路径：优先使用 `system_status`、`workspace_prepare` 与检查点摘要；只有当前请求需要涉及实现时才展开 PLAN、全仓搜索或大范围代码阅读。
-- [ ] 用至少 3 个真实 Cursor/Codex 首轮样本记录“提示发出到第一份有效状态/下一步”的耗时；Hook 启动耗时与 Agent 探索耗时分开统计，没有数据不宣称优化。
-- [ ] 保持 Cursor `sessionStart` 为 best effort，并持续验证常驻 MCP + Rule/Skill 恢复；除非平台提供明确的模型交付信号，不新增逐提示或逐工具 Hook。
-- [ ] 发布门：许可证、来源声明、wheel、全量回归、clients doctor、敏感信息与 Git 状态全部核对；提交、推送、标签和 Release 只在用户明确授权后执行。
+- [x] 收紧首轮状态/续接提示的探索路径：优先使用 `system_status`、`workspace_prepare` 与检查点摘要；只有当前请求需要涉及实现时才展开 PLAN、全仓搜索或大范围代码阅读。
+- [x] 用至少 3 个真实 Cursor/Codex 首轮样本记录“提示发出到第一份有效状态/下一步”的耗时；Hook 启动耗时与 Agent 探索耗时分开统计，没有数据不宣称优化。
+- [x] 保持 Cursor `sessionStart` 为 best effort，并持续验证常驻 MCP + Rule/Skill 恢复；除非平台提供明确的模型交付信号，不新增逐提示或逐工具 Hook。
+- [x] 发布门：许可证、来源声明、wheel、全量回归、clients doctor、敏感信息与 Git 状态全部核对；提交、推送、标签和 Release 只在用户明确授权后执行。
+
+**验证：** 首轮第三个 Cursor 样本在 13:59:25 提问，13:59:27.939 首个 MCP `workspace_prepare`；Hook 4.679 秒，最终有效回答 14:00:40.518 完成（75.3 秒）且未修改项目文件。干净 wheel `memweave-0.2.5-py3-none-any.whl` 为 997,244 字节、SHA-256 `1DDDC80BE5031DA25C32A5F91F4E92CE00840F15328EBEE1D3A4D7B5F3040783`，已验证 Skill、静态页、42 个 Alembic 脚本和 3 份许可证文本；旧 Basic Memory prompt/resource/UI 模块导入均不存在。全量 217 项通过、1 项因 Windows 符号链接权限跳过；`clients doctor` 0 attention；高信号敏感信息扫描无命中。上述 13 个发布门改动包含在本次聚焦提交中，未创建 tag/Release。
 
 ## 风险与止损
 
