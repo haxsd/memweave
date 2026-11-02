@@ -8,11 +8,13 @@ MemWeave 在现有编程 Agent 内提供任务工作记忆、并行执行进度�
 
 ## 开始或恢复
 
-如果模型可见上下文已经有 MemWeave 启动块，先读它；如果没有，立即调用 `memweave_system_status` 和只读 `memweave_workspace_prepare`。MCP 在本进程未成功 prepare 前会对其他项目工具返回 `PREPARE_REQUIRED`。Cursor 的 `sessionStart` 只按 best effort 处理，不能用 Hook 收据代替模型实际收到的证据：
+如果模型可见上下文已经有 MemWeave 启动块，先读它；如果没有，立即沿首轮路径调用 `memweave_system_status` → 只读 `memweave_workspace_prepare`（必要时再 `memweave_task_read` 当前任务）。在 prepare/`reboot` 给出唯一下一步之前，禁止打开 `PLAN.md`、全仓搜索、`project_scan` 或大范围 graph 扫描。MCP 在本进程未成功 prepare 前会对其他项目工具返回 `PREPARE_REQUIRED`。Cursor 的 `sessionStart` 只按 best effort 处理，不能用 Hook 收据代替模型实际收到的证据：
 
 状态、接续或“做到哪一步/下一步做什么”类请求应直接调用常驻 MCP；不要在 prepare 前用 shell 读取 Skill、`PLAN.md`、`context/CURRENT_STATE.md`、源码或运行全仓搜索，也不要用 CLI/Python 绕过 MCP 硬门。除非用户要求实施，这类请求保持只读，不修改项目文件。
 
 首次接续、创建任务或发生一次性回退后，下一条用户可见回复应以单独一行开头：有已建立任务时写 `MemWeave · 任务 <id> · <next_step>`，没有任务时写 `MemWeave · 尚未建立任务`。不要每轮重复；这一行表示产品状态，不表示 MCP 写入已经成功。
+
+工具仍保持 22 个；Skill 将其标为 **首轮** / **续写** / **少用**。少用但不删除：`evidence_read`、`graph_query`/`graph_write`/`graph_update`（仅在架构类 attention 需要时查询）、`task_phase_close`；`project_scan` 也不走首轮路径。任务与知识核心工具属续写。
 
 ```text
 memweave_workspace_prepare(
