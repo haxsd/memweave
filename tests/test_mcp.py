@@ -82,6 +82,14 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                     "memweave_probe_write", {"operation_id": "new", "marker": "x" * 1025}
                 )
                 self.assertTrue(invalid.is_error)
+                registered = await client.call_tool("memweave_project_register", {
+                    "root": self.temporary.name, "name": "errors", "operation_id": "error-project",
+                })
+                self.assertFalse(registered.is_error, str(registered.content))
+                prepared = await client.call_tool("memweave_workspace_prepare", {
+                    "root": self.temporary.name, "intent": "inspect",
+                })
+                self.assertFalse(prepared.is_error, str(prepared.content))
                 invalid_source = await client.call_tool("memweave_memory_write", {
                     "scope": "user", "title": "invalid source", "body": "must not write",
                     "sources": ["missing-separator"], "operation_id": "invalid-source",
@@ -128,6 +136,10 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertFalse(project.is_error, str(project.content))
                 project_id = project.structured_content["data"]["id"]
+                prepared = await client.call_tool("memweave_workspace_prepare", {
+                    "root": self.temporary.name, "intent": "inspect",
+                })
+                self.assertFalse(prepared.is_error, str(prepared.content))
                 written = await client.call_tool("memweave_memory_write", {
                     "project_id": project_id, "title": "phase note",
                     "body": "candidate default sentinel should stay hidden",
@@ -161,6 +173,7 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(response.is_error, str(response.content))
                     return response.structured_content["data"]
                 project = await call("project_register", root=self.temporary.name, name="切换演示", operation_id="p")
+                await call("workspace_prepare", root=self.temporary.name, intent="inspect")
                 task = await call("task_open", project_id=project["id"], title="交接", goal="跨工具接续",
                                   acceptance=["保留下一步"], operation_id="t")
                 unit = await call(
@@ -173,17 +186,17 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                            expected_etag=latest["etag"], findings="已定位", progress="实现中",
                            next_step="运行验证", operation_id="cp")
             async with self.client() as client:
-                task_response = await client.call_tool("memweave_task_read", {"task_id": task["id"]})
-                self.assertEqual(task_response.structured_content["data"]["next_step"], "运行验证")
-                self.assertEqual(
-                    task_response.structured_content["data"]["work_units"][0]["id"], unit["id"]
-                )
                 prepared = await client.call_tool("memweave_workspace_prepare", {
                     "root": self.temporary.name, "intent": "resume", "query": "交接", "budget": 2000,
                 })
                 self.assertFalse(prepared.is_error, str(prepared.content))
                 self.assertEqual(prepared.structured_content["data"]["task_id"], task["id"])
                 self.assertIn("运行验证", prepared.structured_content["data"]["context"]["text"])
+                task_response = await client.call_tool("memweave_task_read", {"task_id": task["id"]})
+                self.assertEqual(task_response.structured_content["data"]["next_step"], "运行验证")
+                self.assertEqual(
+                    task_response.structured_content["data"]["work_units"][0]["id"], unit["id"]
+                )
                 self.assertEqual(prepared.structured_content["data"]["context"]["graph"]["coverage"]["state"],
                                  "not_scanned")
                 self.assertIn("worker-a", prepared.structured_content["data"]["context"]["text"])
@@ -230,6 +243,7 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                     "project_register", root=self.temporary.name, name="stdio queue",
                     operation_id="project",
                 )
+                await call("workspace_prepare", root=self.temporary.name, intent="inspect")
                 first = await call(
                     "task_open", project_id=project["id"], title="当前任务",
                     goal="验证队列", acceptance=["验收"], operation_id="first",
@@ -290,6 +304,8 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                     first_client, "project_register", root=self.temporary.name,
                     name="parallel stdio", operation_id="parallel-project",
                 )
+                await call(first_client, "workspace_prepare", root=self.temporary.name, intent="inspect")
+                await call(second_client, "workspace_prepare", root=self.temporary.name, intent="inspect")
                 task = await call(
                     first_client, "task_open", project_id=project["id"],
                     title="跨进程并行", goal="验证独立 WorkUnit",
@@ -339,6 +355,10 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertFalse(project.is_error, str(project.content))
                 project_id = project.structured_content["data"]["id"]
+                prepared = await client.call_tool("memweave_workspace_prepare", {
+                    "root": self.temporary.name, "intent": "inspect",
+                })
+                self.assertFalse(prepared.is_error, str(prepared.content))
                 written = await client.call_tool("memweave_memory_write", {
                     "project_id": project_id, "title": "Rebuild boundary",
                     "body": "Markdown survives while the derived SQLite index can be rebuilt.",
@@ -353,6 +373,10 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
             shutil.rmtree(self.home / "index" / "basic-memory")
 
             async with self.client() as client:
+                prepared = await client.call_tool("memweave_workspace_prepare", {
+                    "root": self.temporary.name, "intent": "inspect",
+                })
+                self.assertFalse(prepared.is_error, str(prepared.content))
                 restored = await client.call_tool("memweave_memory_search", {
                     "project_id": project_id, "query": "derived SQLite index",
                 })
@@ -377,6 +401,7 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                     "project_register", root=str(root), name="graph flat",
                     operation_id="graph-project",
                 )
+                await call("workspace_prepare", root=str(root), intent="inspect")
                 await call("project_scan", project_id=project["id"], operation_id="graph-scan")
                 evidence = await call(
                     "evidence_read", project_id=project["id"], path="main.py", max_chars=20
