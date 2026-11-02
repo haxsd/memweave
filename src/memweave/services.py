@@ -79,10 +79,39 @@ def task_summary(task):
 
 
 class Service:
+    # Agent MCP turns on require_workspace_prepare so the first project-scoped
+    # tool call must follow a successful workspace_prepare (process lifetime).
+    PREPARE_EXEMPT_ACTIONS = frozenset({
+        "workspace_prepare",
+        "status",
+        "project_list",
+        "project_register",
+        "recover",
+        "rebuild",
+        "recovery_status",
+        "recovery_resolve",
+    })
+    PREPARE_RECORD_KEYS = {
+        "task_read": ("task_id", "task"),
+        "task_list": ("project_id", None),
+        "task_checkpoint": ("task_id", "task"),
+        "task_close": ("task_id", "task"),
+        "task_phase_close": ("task_id", "task"),
+        "work_unit_update": ("task_id", "task"),
+        "memory_review": ("task_id", "task"),
+        "memory_review_complete": ("task_id", "task"),
+        "memory_read": ("memory_id", "memory"),
+        "memory_update": ("memory_id", "memory"),
+        "memory_forget": ("memory_id", "memory"),
+        "memory_activate": ("memory_id", "memory"),
+    }
+
     def __init__(self, home: Path):
         self.vault = Vault(home)
         self.index: BasicMemoryIndex | None = None
         self._index_error: str | None = None
+        self.require_workspace_prepare = False
+        self._prepared_projects: set[str] = set()
 
     def initialize(self):
         self.vault.initialize()
@@ -158,6 +187,57 @@ class Service:
         except Exception as error:
             self._index_error = str(error)
 
+    def _mark_workspace_prepared(self, prepared: dict) -> None:
+        project = prepared.get("project")
+        if not isinstance(project, dict):
+            return
+        project_id = project.get("id")
+        if (
+            isinstance(project_id, str)
+            and project_id
+            and prepared.get("state") in ("ready", "no_active_task")
+        ):
+            self._prepared_projects.add(project_id)
+
+    def _prepare_project_id(self, action: str, parameters: dict) -> str | None:
+        project_id = parameters.get("project_id")
+        if isinstance(project_id, str) and project_id.strip():
+            return project_id
+        mapping = self.PREPARE_RECORD_KEYS.get(action)
+        if mapping is None:
+            return None
+        key, record_type = mapping
+        if record_type is None:
+            return None
+        record_id = parameters.get(key)
+        if not isinstance(record_id, str) or not record_id.strip():
+            return None
+        try:
+            record = self._record(record_id, record_type)
+        except DiagnosticError:
+            return None
+        value = record.get("project_id")
+        return value if isinstance(value, str) and value else None
+
+    def _enforce_workspace_prepare(self, action: str, parameters: dict) -> None:
+        if not self.require_workspace_prepare or action in self.PREPARE_EXEMPT_ACTIONS:
+            return
+        project_id = self._prepare_project_id(action, parameters)
+        if project_id is not None:
+            if project_id in self._prepared_projects:
+                return
+            raise DiagnosticError(
+                "PREPARE_REQUIRED",
+                "Call workspace_prepare for this project's absolute execution root "
+                "before other MemWeave project tools.",
+            )
+        if self._prepared_projects:
+            return
+        raise DiagnosticError(
+            "PREPARE_REQUIRED",
+            "Call workspace_prepare for the absolute execution root before other MemWeave tools.",
+        )
+
     def dispatch(self, action: str, parameters: dict | None = None) -> dict:
         parameters = {} if parameters is None else parameters
         allowed = {
@@ -172,6 +252,7 @@ class Service:
         }
         if action not in allowed or not isinstance(parameters, dict):
             raise DiagnosticError("RECORD_INVALID", "Unknown action or invalid parameter object.")
+        self._enforce_workspace_prepare(action, parameters)
         try:
             output = getattr(self, action)(**parameters)
         except TypeError as error:
@@ -577,6 +658,7 @@ class Service:
             is_worktree=False,
         )
         if project is None:
+            self._mark_workspace_prepared(prepared)
             return prepared
         registered_root = Path(project["root"]).expanduser().resolve()
         prepared["registered_root"] = str(registered_root)
@@ -695,6 +777,7 @@ class Service:
                 raise DiagnosticError("TASK_STATE_INVALID", "More than one current task needs migration.")
             else:
                 prepared["state"] = "no_active_task"
+                self._mark_workspace_prepared(prepared)
                 return prepared
         if intent != "inspect":
             prepared["task_id"] = selected["id"] if selected else None
@@ -705,6 +788,7 @@ class Service:
             prepared["context"] = context
             prepared["attention"] = context.get("attention", prepared_attention)
             prepared["completion"] = context.get("completion")
+        self._mark_workspace_prepared(prepared)
         return prepared
 
     def task_open(self, project_id, title, goal, acceptance, operation_id):

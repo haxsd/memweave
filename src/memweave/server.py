@@ -81,6 +81,8 @@ def create_server(
     if toolset not in (None, *LEGACY_TOOLSETS):
         raise DiagnosticError("RECORD_INVALID", "Tool selection is not a user-facing mode.")
     service = Service(diagnostics.home)
+    # Hard first-turn convention for agents: project tools refuse until prepare.
+    service.require_workspace_prepare = True
 
     @asynccontextmanager
     async def lifespan(_server):
@@ -94,7 +96,7 @@ def create_server(
         "MemWeave",
         instructions=(
             "Local task continuity, scoped long-term memory and evidence-based project maps. "
-            "Begin with workspace_prepare for the absolute execution root and explicit inspect/new/resume intent; "
+            "Begin with workspace_prepare for the absolute execution root and explicit inspect/new/resume intent; ""other project tools return PREPARE_REQUIRED until that succeeds in this process; "
             "a linked worktree resolves to its registered repository project. "
             "Each project has one current task and a deterministic queue; never create parallel top-level current tasks. "
             "Use WorkUnits for parallel subagents inside the current task and keep each unit revision separate. "

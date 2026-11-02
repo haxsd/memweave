@@ -31,6 +31,7 @@ async def run_demo(home: Path, root: Path) -> dict:
             project = await call(host_a, "project_register", root=str(root.resolve()),
                                  name=root.name, operation_id=prefix + "-project")
             project_id = project["id"]
+            await call(host_a, "workspace_prepare", root=str(root.resolve()), intent="inspect")
             task = await call(host_a, "task_open", project_id=project_id,
                               title="【演示】从工具 A 接续到工具 B", goal="记录检查点并在另一个服务进程中恢复",
                               acceptance=["恢复检查点", "检索并纠正知识"], operation_id=prefix + "-task")
@@ -51,6 +52,7 @@ async def run_demo(home: Path, root: Path) -> dict:
                        progress="工具 A 已完成第一段工作。", next_step="由工具 B 恢复并验证知识检索。",
                        operation_id=prefix + "-checkpoint")
         async with client() as host_b:
+            await call(host_b, "workspace_prepare", root=str(root.resolve()), intent="resume")
             restored = await call(host_b, "task_read", task_id=task_id)
             restart_readback = restored["next_step"] == "由工具 B 恢复并验证知识检索。"
             if {item["id"] for item in restored["work_units"]} != {item["id"] for item in work_units}:

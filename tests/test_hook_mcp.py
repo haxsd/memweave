@@ -47,6 +47,7 @@ class HookMcpTests(unittest.IsolatedAsyncioTestCase):
                         return response.structured_content["data"]
 
                     project = await call("project_register", root=str(root), name="SDK Hook", operation_id="p")
+                    await call("workspace_prepare", root=str(root), intent="inspect")
                     await hook("sessionStart")
                     task = await call("task_open", project_id=project["id"], title="修复",
                                       goal="验证自动记忆维护", acceptance=["回归"], operation_id="t")
@@ -121,6 +122,10 @@ class HookMcpTests(unittest.IsolatedAsyncioTestCase):
                         "name": "cross client",
                         "operation_id": "cross-project",
                     })).structured_content["data"]
+                    prepared = await client.call_tool("memweave_workspace_prepare", {
+                        "root": str(root), "intent": "inspect",
+                    })
+                    assert not prepared.is_error, prepared.content
                     task = (await client.call_tool("memweave_task_open", {
                         "project_id": project["id"],
                         "title": "cross client task",
