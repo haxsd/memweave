@@ -24,12 +24,12 @@
 
 许可证文本、完整来源记录和修改清单见仓库根目录 [LICENSE](../LICENSE) 与 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。Basic Memory `0.24.1` 已接入单一服务生命周期；planning-with-files 固定提交的规则已改编进 MemWeave 自有记录模型，未作为第二套产品运行。
 
-上游采用程度（2026-10-28 核对）：Basic Memory 的 `src/basic_memory/` 有 546 个文件；归一化 Windows CRLF 后，542 个文件与固定提交完全一致，只有 4 个文件包含已声明的文本检索适配修改，因此是源码级 fork。planning-with-files 的 22 个脚本一个也没有复制，`task_plan.md`/`findings.md`/`progress.md` 文件系统、plan-hash attestation、`check-complete` 和 `gate-stop` 也没有原样实现；MemWeave 用 task/WorkUnit/phase 记录、`task_close` 验收门禁和单一 Hook 入口表达相近约束。不得把后者写成“复制了 planning-with-files 的实现”。
+上游采用程度（2026-11-02 核对）：Basic Memory 固定提交的完整上游树有 546 个文件、486 个 Python 文件；MemWeave 当前只保留运行时闭包内的 268 个文件、266 个 Python 文件，其余 278 个上游文件有意不进入发行。归一化 Windows CRLF 后，保留树中 262 个文件与固定提交完全一致，6 个文件包含已声明的适配修改，因此仍是源码级 fork。planning-with-files 的 22 个脚本一个也没有复制，`task_plan.md`/`findings.md`/`progress.md` 文件系统、plan-hash attestation、`check-complete` 和 `gate-stop` 也没有原样实现；MemWeave 用 task/WorkUnit/phase 记录、`task_close` 验收门禁和单一 Hook 入口表达相近约束。不得把后者写成“复制了 planning-with-files 的实现”。
 
 ## Phase 1–2 实际接入
 
-- `src/basic_memory/` 是固定提交的上游源码树；`src/memweave/basic_memory_engine.py` 和 `basic_memory_index.py` 是在其上的单进程、单项目适配层。
-- MCP 的 lifespan 启动同一个 `Service` 和唯一 Basic Memory index；不再启动 Basic Memory MCP、HTTP、CLI、cloud 或第二个检索服务。
+- `src/basic_memory/` 是固定提交上游源码树的运行时子集，不是完整上游发行树；`src/memweave/basic_memory_engine.py` 和 `basic_memory_index.py` 是在其上的单进程、单项目适配层。
+- MCP 的 lifespan 启动同一个 `Service` 和唯一 Basic Memory index；Basic Memory 自己的 MCP、HTTP、CLI、cloud、importer、watcher、man-page 与 OKF 入口没有 vendored，也没有启动。
 - 业务记录仍以 Markdown 为权威；`index/basic-memory/memory.db` 是可重建的 FTS/上下文索引。旧的 `records` 表与自研词法搜索已删除。
 - Phase 3 已统一知识检索与上下文来源：`memory_search` 返回 Basic Memory FTS 命中、permalink、score 与当前 Markdown revision/etag；`context_get` 不再使用近期背景兜底，并附带 Basic Memory context 的关系/observation 覆盖。最终文字仍按任务优先预算由 MemWeave 组装。
 - 活动库从开发区的 `work/runtime/memory home/` 迁到 `%USERPROFILE%\.memweave`，客户端配置和项目安装清单同步更新。
@@ -57,7 +57,7 @@
 | Basic Memory：FTS + 元数据过滤 + ContextService 关系/observation | 召回不能只有扁平关键词 | `memory_search`、`memory_context`、有限的 context 覆盖 | 保留，后续扩展关系覆盖 | 中 |
 | Basic Memory：schema/Alembic 迁移 | 长期记录需要可演进 | vendored Alembic 与运行时 schema | 保留 | 核心 |
 | Basic Memory：可选语义 provider | 语义召回与成本/依赖之间的取舍 | 当前显式 `none`，仅文本 FTS | 拒绝默认启用；以后按真实收益评估 | 中 |
-| Basic Memory：API/CLI/cloud/多服务入口 | 上游平台能力完整 | 只保留一个 MCP 和本地 CLI | 拒绝作为产品表面 | 低 |
+| Basic Memory：API/CLI/cloud/多服务入口 | 上游平台能力完整 | 只保留一个 MCP 和本地 CLI | 已从 vendored 树删除，拒绝作为产品表面 | 已完成 |
 | planning-with-files：2-action、read-before-decide、update-after-act、记录错误、失败不重复、3-strike | 长任务丢失证据、重复失败、计划漂移 | 单一 continuity Skill、检查点、失败/验证字段 | 保留并强化提示 | 核心 |
 | planning-with-files：5-question reboot | 新会话恢复慢、必须重新询问 | 原先只有原始任务/历史文本 | **本轮吸收**为结构化 reboot summary | 最高 |
 | planning-with-files：completion/stop gate | Agent 把未完成阶段或缺失验收当成完成 | `task_close` 已有验收/WorkUnit 门禁；completion readiness、attention 和下一次 SessionStart 恢复待办 | **本轮改造**为显式 MCP 查询与任务边界维护，不注册逐轮 Stop follow-up；close 仍要求 host-reported acceptance | 高 |

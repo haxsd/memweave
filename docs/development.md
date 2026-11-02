@@ -117,6 +117,6 @@ Phase 15 P0 新增 Git common directory worktree 解析、`project_register`/`wo
 | `src/memweave/static/index.html` | 可选中文管理页 |
 | `src/memweave/demo.py` | 两个独立 MCP 服务进程的完整演示 |
 
-构建本轮 wheel 后，应在独立环境安装实际构建的 wheel，离开源码目录核对 `--version`、新入口、上下文与真实 MCP 重启，再执行 `init`、`doctor`、`probe` 和包资源检查。最终 wheel 已在文档定稿后重建，并完成全新 venv 安装、`pip check`、stdio 重启读回和资源/许可证检查；更早 wheel 只作为 superseded 证据保留，不能混用其安装结果。目标 wheel 包含 Basic Memory 的 Alembic 脚本、提示模板、MCP resources/UI、原创 Skill 和许可证文本；资源存在不能证明目标客户端已安装或触发它。可选页面没有 npm 构建或前端运行依赖。
+构建本轮 wheel 后，应在独立环境安装实际构建的 wheel，离开源码目录核对 `--version`、新入口、上下文与真实 MCP 重启，再执行 `init`、`doctor`、`probe` 和包资源检查。历史 wheel 已在文档定稿后重建，并完成全新 venv 安装、`pip check`、stdio 重启读回和资源/许可证检查；更早 wheel 只作为 superseded 证据保留，不能混用其安装结果。2026-11-02 精简 Basic Memory 后，目标 wheel 只保留其 Alembic 脚本、原创 Skill 和许可证文本；旧 Wheel 中的提示模板与 MCP resources/UI 已不再属于当前发行内容，必须重建并重新核对。资源存在不能证明目标客户端已安装或触发它。可选页面没有 npm 构建或前端运行依赖。
 
 不把 `clients.*.desktop_verification` 手动改为“已通过”来代替桌面验收。Cursor `3.27.22` 的 `D:\project` 有 `sessionStart` 进程输出、MCP 调用、可见状态行、真实任务创建和检查点历史；`github-radar` 的后续真实 Agent 会话完成过顺序任务、关闭和提炼。Phase 14 进一步区分了进程输出与模型交付：同版本的新会话模型没有收到启动块，但通过常驻 MCP 的 `workspace_prepare` 恢复了任务。Phase 12 起默认安装只保留低频会话 Hook，旧的 `afterMCPExecution`、`afterFileEdit`、`PostToolUse` 和 `UserPromptSubmit` 触发证据只作为历史。当前配置仍须在客户端重载后重新观察 Codex 的 SessionStart/Interrupt/SessionEnd 与 Cursor 的 sessionStart/sessionEnd；Codex 结束事件与 Cursor `sessionStart` 进程输出已有样本，Cursor 的模型可见启动注入、`sessionEnd` 与 `preCompact`（未安装）仍缺通过证据。单轮 Codex CLI 对照只证明一次精确知识召回，不证明统计收益，也不替代跨客户端或完整桌面 Hook 验收。历史证据见 `work/evidence/2026-10-28-phase9/`。
