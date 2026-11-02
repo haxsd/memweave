@@ -258,7 +258,11 @@ def has_cloud_credentials(config: BasicMemoryConfig) -> bool:
     """Return whether API-key or OAuth cloud credentials are available."""
     if config.cloud_api_key:
         return True
-    from basic_memory.cli.auth import CLIAuth
+    # MemWeave vendors Basic Memory without its CLI/cloud auth surface.
+    try:
+        from basic_memory.cli.auth import CLIAuth
+    except ImportError:
+        return False
 
     auth = CLIAuth(client_id=config.cloud_client_id, authkit_domain=config.cloud_domain)
     return auth.load_tokens() is not None
