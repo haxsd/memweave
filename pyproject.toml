@@ -44,7 +44,4 @@ basic_memory = [
     "alembic/*.ini",
     "alembic/*.mako",
     "alembic/versions/*.py",
-    "templates/prompts/*.hbs",
-    "mcp/resources/*.md",
-    "mcp/ui/html/*.html",
 ]

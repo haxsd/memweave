@@ -46,10 +46,14 @@ async def detect_project_from_workspace_identifier_prefix(
     if not is_workspace_qualified_plain_identifier(identifier):
         return None
 
-    from basic_memory.mcp.project_context import (
-        _workspace_identifier_discovery_available,
-        resolve_workspace_qualified_identifier,
-    )
+    # MemWeave vendors Basic Memory without its MCP/cloud project-context surface.
+    try:
+        from basic_memory.mcp.project_context import (
+            _workspace_identifier_discovery_available,
+            resolve_workspace_qualified_identifier,
+        )
+    except ImportError:
+        return None
 
     if not _workspace_identifier_discovery_available(identifier, config):
         return None
