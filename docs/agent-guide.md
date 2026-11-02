@@ -8,6 +8,8 @@ MemWeave 在现有编程 Agent 内提供任务工作记忆、并行执行进度�
 
 ## 开始或恢复
 
+调用前必须核对**当前工具列表**。Codex 在线程恢复时可能先创建回合、后完成 MCP 注册；只有 `memweave_workspace_prepare` 已实际出现在可用工具中才调用它。若未出现，直接说明 MCP 尚未加载或仍在重连，等待下一轮；不要凭本文件、Hook 或历史记忆凭空发起工具调用，否则客户端可能报 `upstream returned undeclared tool`。
+
 如果模型可见上下文已经有 MemWeave 启动块，先读它；如果没有，立即沿首轮路径调用 `memweave_system_status` → 只读 `memweave_workspace_prepare`（必要时再 `memweave_task_read` 当前任务）。在 prepare/`reboot` 给出唯一下一步之前，禁止打开 `PLAN.md`、全仓搜索、`project_scan` 或大范围 graph 扫描。MCP 在本进程未成功 prepare 前会对其他项目工具返回 `PREPARE_REQUIRED`。Cursor 的 `sessionStart` 只按 best effort 处理，不能用 Hook 收据代替模型实际收到的证据：
 
 状态、接续或“做到哪一步/下一步做什么”类请求应直接调用常驻 MCP；不要在 prepare 前用 shell 读取 Skill、`PLAN.md`、`context/CURRENT_STATE.md`、源码或运行全仓搜索，也不要用 CLI/Python 绕过 MCP 硬门。除非用户要求实施，这类请求保持只读，不修改项目文件。

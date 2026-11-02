@@ -6,13 +6,19 @@
 
 > 2026-11-02 Phase 15 已完成：3 个真实新会话样本已记录。Codex 最终状态 26.0 秒；Cursor 修复前 230.4 秒，修复后 75.3 秒，且首个项目动作从读 PLAN/源码改为 MCP `workspace_prepare`。当前干净 wheel 已在独立 venv 完成 `init`、`doctor`、stdio `probe` 与 `pip check`，最终全量回归 217 tests / 1 skipped / OK（649.713 秒），`clients doctor` 8/8 ready。Phase 15 收尾改动随本次提交进入 `main`；公开标签和 GitHub Release 未执行。
 
+> 2026-11-02 Phase 16 已完成：修复 `build/lib` 增量复用导致根目录 wheel 混入已删除 Basic Memory 入口的 P1。标准根目录构建从 2,033,151 字节 / 528 条目 / 157 个陈旧入口，收敛为 997,245 字节 / 299 条目 / 0 个陈旧入口；新增 `setup.py` 的 `build_py` 清理钩子和 `tests/test_packaging.py`。独立 wheel venv 完成安装、`pip check`、`init`、`doctor`、stdio `probe`；全新 MCP 进程从活动 home 恢复同一任务 revision 3、2 个检查点和 next step。全量回归 218 tests / 1 skipped / OK（628.174 秒），`clients doctor` 8/8，Codex/Cursor `check --probe` 均 22 工具。Phase 16 打包修复与后续 P1 合并进入本次稳定化提交；公开标签和 Release 未执行。
+
+> 2026-11-02 Phase 16 后续 P1 完成：修复 Codex 恢复线程时 MCP 工具目录晚于 `turn/start` 的竞态。日志显示回合在 08:39:19.497 开始、MemWeave 到 08:39:22.866 才 ready，首轮上游因此返回 `undeclared tool`。Service 改为首次真实工具调用才惰性启动，`memweave.server` 导入从 2.75 秒降至 1.52 秒，`tools/list` 从 3.3–4.0 秒提前到 1.34–1.37 秒，22 工具与 `PREPARE_REQUIRED` 语义不变；AGENTS、Skill、Cursor Rule、Hook 文案和 MCP instructions 均禁止在工具未出现时凭名称调用。全量 219 tests / 1 skipped / OK（656.644 秒），`clients doctor` 8/8，Codex/Cursor/worktree 探针均 22 工具。改动随本次稳定化提交进入 `main`。
+
 **目标：** 把 MemWeave 做成 AGPL-3.0-or-later 完全开源、本地优先的编程 Agent 连续工作层。以 Basic Memory 的 Markdown + SQLite、检索与上下文能力为底层，直接融合 planning-with-files 的任务生命周期与 Hook 机制，最终形成一个 MCP、一个 Skill、一个 Hook 入口，而不是并排运行两个成熟项目。
 
 **目标规格：** [AGPL 深度融合目标规格](docs/specs/2026-10-27-agpl-fusion-target.md)
 
 **当前基线：** 分支 `main` 上的 0.2.5 私有开发快照。2026-10-29 Phase 14 全量回归 204 项运行，1 项仅因 Windows 符号链接权限跳过，其余全部通过（669.450 秒）；Phase 14 定向回归 35 项通过。Phase 0–14 已完成；Codex 与 Cursor 的受管入口统一为 `universal` 22 工具面，`clients doctor` 修复 5 个过期资源后复检 6/6 `ready`；Codex、Cursor 当前项目 `check --probe` 均为 SDK stdio、22 工具、1 个 active task。真实活动库 `workspace_prepare` 返回 1 个 current 任务、5 条近期历史，`attention` 为空；最终项目扫描覆盖 611 个文件、0 错误。`sessionStart` Hook 两次独立 CLI 实测 3.4–3.6 秒，输出约 3.9k 字符，但 Cursor 3.27.22 的 `additional_context` 没有进入模型可见上下文。Codex 新会话和真实压缩后恢复通过；Cursor 普通首轮和检查点后新会话通过常驻 MCP + Rule/Skill 恢复；Cursor `sessionEnd` 和统计收益仍未验证；默认安装不含 `preCompact`。
 
-**2026-11-02 当前基线：** `147eb4e` 之后的一次聚焦提交包含 13 个发布门改动（首轮指令、Codex/Cursor Hook、Skill、测试和发布文档）。最终全量回归 217 tests / 1 skipped / OK（649.713 秒）；干净源码 wheel 为 997,244 字节，SHA-256 `1DDDC80BE5031DA25C32A5F91F4E92CE00840F15328EBEE1D3A4D7B5F3040783`，独立 venv 安装、`init`、`doctor`、stdio `probe` 重启读回和 `pip check` 通过；`clients doctor` 为 7 roots / 8 targets ready；许可证、来源声明、敏感信息高信号扫描和 Git 工作树核对完成。仓库仍为私有，无 tag 或 Release。
+**2026-11-02 Phase 15 基线：** `147eb4e` 之后的一次聚焦提交包含 13 个发布门改动（首轮指令、Codex/Cursor Hook、Skill、测试和发布文档）。最终全量回归 217 tests / 1 skipped / OK（649.713 秒）；干净源码 wheel 为 997,244 字节，SHA-256 `1DDDC80BE5031DA25C32A5F91F4E92CE00840F15328EBEE1D3A4D7B5F3040783`，独立 venv 安装、`init`、`doctor`、stdio `probe` 重启读回和 `pip check` 通过；`clients doctor` 为 7 roots / 8 targets ready；许可证、来源声明、敏感信息高信号扫描和 Git 工作树核对完成。仓库仍为私有，无 tag 或 Release。
+
+**2026-11-02 Phase 16 基线：** `40a0e8a` 之后新增根目录构建清理钩子、打包回归、MCP 冷启动修复和稳定化文档。根目录标准 wheel 构建不再复用陈旧 `build/lib`；独立 venv、活动 home 的新 MCP 进程、两端客户端探针和全量回归均通过。Phase 16 打包修复与后续 MCP 冷启动 P1 合并为一次稳定化提交；仓库仍为私有，无 tag 或 Release。
 
 **完成标准：**
 
@@ -347,7 +353,7 @@
 
 ### Phase 15：接续首响与发布门
 
-**状态：进行中（2026-11-01）。** 当前任务 `task_c593ac12bbe04d8d99294bd555fec567`。管理页升级 WorkUnit 已完成；2026-10-30 真实使用发现 Codex 项目分组不会重绑线程 cwd，旧会话仍运行在未配置 MemWeave 的 linked worktree，导致 MCP、Skill 和 Hook 全部静默失联。该接入可靠性问题升为当前阶段 P0，先于首响测量和发布门。P0 代码、真实 `haxsd-byok` 本机修复、全新 Codex CLI 加载验收，以及 2026-11-01 的 Codex 桌面/Cursor 新会话验收均已完成。Codex 当前新会话加载 22 工具且 `workspace_prepare state=ready`；Cursor 3.27.22 新会话加载 22 工具，`sessionStart` 4.295 秒返回有效上下文并首轮调用 `workspace_prepare`。Codex 本次只产生 `SessionStart` 收据，没有生成 `hook_sessions` 或模型可见启动块，实际恢复由常驻 MCP 完成；该差异保留为已知边界。剩余的是首响样本、探索路径收紧和发布门；不增加运行时、模式或默认高频 Hook，并在明确授权前不发布。
+**状态：已完成（2026-11-02）。** 当前任务 `task_c593ac12bbe04d8d99294bd555fec567`。管理页升级 WorkUnit 已完成；2026-10-30 真实使用发现 Codex 项目分组不会重绑线程 cwd，旧会话仍运行在未配置 MemWeave 的 linked worktree，导致 MCP、Skill 和 Hook 全部静默失联。该接入可靠性问题升为当前阶段 P0，先于首响测量和发布门。P0 代码、真实 `haxsd-byok` 本机修复、全新 Codex CLI 加载验收，以及 2026-11-01 的 Codex 桌面/Cursor 新会话验收均已完成。Codex 当前新会话加载 22 工具且 `workspace_prepare state=ready`；Cursor 3.27.22 新会话加载 22 工具，`sessionStart` 4.295 秒返回有效上下文并首轮调用 `workspace_prepare`。Codex 本次只产生 `SessionStart` 收据，没有生成 `hook_sessions` 或模型可见启动块，实际恢复由常驻 MCP 完成；该差异保留为已知边界。首响样本、探索路径收紧和发布门随后完成；本轮不增加运行时、模式或默认高频 Hook。
 
 **状态更新（2026-11-02）：已完成。** 3 个真实首轮样本分别为 Codex 26.0 秒、Cursor 修复前 230.4 秒、Cursor 修复后 75.3 秒；Hook 分别记录为约 5.7 秒窗口、5.068 秒和 4.679 秒。修复后的 Cursor 首个项目动作是并行 MCP `workspace_prepare` + `system_status`，没有先读 PLAN/CURRENT_STATE/源码，也没有通过 CLI/Python 绕过 MCP。发布门本地通过；提交与推送已获用户授权；标签和 Release 仍未执行。
 
@@ -364,6 +370,29 @@
 - [x] 发布门：许可证、来源声明、wheel、全量回归、clients doctor、敏感信息与 Git 状态全部核对；提交、推送、标签和 Release 只在用户明确授权后执行。
 
 **验证：** 首轮第三个 Cursor 样本在 13:59:25 提问，13:59:27.939 首个 MCP `workspace_prepare`；Hook 4.679 秒，最终有效回答 14:00:40.518 完成（75.3 秒）且未修改项目文件。干净 wheel `memweave-0.2.5-py3-none-any.whl` 为 997,244 字节、SHA-256 `1DDDC80BE5031DA25C32A5F91F4E92CE00840F15328EBEE1D3A4D7B5F3040783`，已验证 Skill、静态页、42 个 Alembic 脚本和 3 份许可证文本；旧 Basic Memory prompt/resource/UI 模块导入均不存在。全量 217 项通过、1 项因 Windows 符号链接权限跳过；`clients doctor` 0 attention；高信号敏感信息扫描无命中。上述 13 个发布门改动包含在本次聚焦提交中，未创建 tag/Release。
+
+### Phase 16：真实自用稳定化
+
+**状态：已完成（2026-11-02）。** 当前任务 `task_d650205f2bca4cecac224b1a78dbed17`；目标是在不新增功能、运行时、模式或高频 Hook 的前提下，用实际工作批次修复阻断自用的 P1，并验证构建、安装和重启恢复。
+
+- [x] 在 MemWeave 本仓库创建 Phase 16 current 任务，记录起点检查点，完成根目录构建污染修复，并保留 WorkUnit 的 findings、progress、verification 与 next step。
+- [x] 复现并消除陈旧 `build/lib` 污染：坏 wheel 2,033,151 字节 / 528 条目 / 157 个已删除入口；加入 `setup.py` 的 `build_py` 清理钩子后，同一根目录构建为 997,245 字节 / 299 条目 / 0 陈旧入口。`tests/test_packaging.py` 在临时源码树中注入哨兵文件，验证每次构建都会丢弃陈旧产物。
+- [x] 干净 venv 安装 wheel 并通过 `pip check`、`init`、`doctor`、stdio `probe`；probe 返回 31 个内部工具和 `restart_readback=true`。`clients doctor` 为 7 roots / 8 targets 全 ready，Codex/Cursor `check --probe` 均 22 工具。
+- [x] 全新 MCP stdio 进程从活动 home 恢复同一任务：`ready`、revision 3、2 个检查点、completed WorkUnit 与 next step 一致，没有第二个 current。
+- [x] 全量回归 218 tests / 1 skipped / OK（628.174 秒）；未新增运行时、模式、工具面或高频 Hook。
+
+**验证：** 修复后 wheel SHA-256 `13D2D2395DB736CFED534140A44265DAF685D0B1570BDDFCC42D3D28930C070A`；`git diff --check`、`compileall` 与 `pip check` 通过。Phase 16 原始的 6 个文件与后续 MCP 冷启动 P1 的指令、服务、客户端资源和测试改动一起进入本次稳定化提交；仓库仍私有，无 tag 或 Release。
+
+### Phase 16 后续 P1：MCP 冷启动工具声明竞态
+
+**状态：已完成（2026-11-02）。** 当前任务 `task_ee89f9003aad4c1e9204f90eff8dcb5c`。该修复只处理客户端恢复线程时的启动竞态，不新增运行时、工具面或 Hook。
+
+- [x] 从 Codex 客户端日志复现：`turn/start` 在 08:39:19.497 已开始，memweave MCP 在 08:39:22.866 才 ready；失败回合没有持久化函数调用，上游记录为 `upstream returned undeclared tool: mcp__memweave__memweave_workspace_prepare`，耗时 136.594 秒。
+- [x] 将 `Service` 从模块导入/服务器启动阶段推迟到首次真实工具调用，保留首次调用的完整初始化、单 current 和 `PREPARE_REQUIRED` 门禁；工具列表可先返回 22 个声明。
+- [x] 在 `AGENTS.md`、安装 Rule、Cursor Hook 文案、continuity Skill 和 MCP instructions 中加入约束：当前工具列表没有 `memweave_workspace_prepare` 时不得凭名称或文案发起调用，应直接说明 MCP 正在加载/重连。
+- [x] 增加 `tests/test_startup.py`，验证导入 `memweave.server` 不加载重型 `memweave.services`；更新 Setup/Hook 文案断言。
+- [x] 冷启动三次：`tools/list` 1.372/1.367/1.337 秒，均为 22 工具；首次 `status` 3.622/3.502/3.543 秒，`workspace_prepare` 均 ready。`memweave.server` 导入由 2.75 秒降至 1.52 秒。
+- [x] 定向 43 项（Hooks/Setup/Toolset/Workspace gate）与 13 项真实 stdio MCP/Hook-MCP 全部通过；`clients doctor` 修复受管资源后复检 8/8，Codex/Cursor/worktree `check --probe` 均 22 工具；全量 219 tests / 1 skipped / OK（656.644 秒）。
 
 ## 风险与止损
 

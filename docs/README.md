@@ -1,8 +1,10 @@
 # 文档总览
 
-当前产品文档按职责维护，不再为每轮实现新增独立 plan/report。方向是 **AGPL-3.0-or-later 完全开源 + Basic Memory/planning-with-files 深度融合**。Phase 0–11 已完成基础运行时、单 current/并行 WorkUnit、统一 MCP/上下文、真实桌面接续、知识复用、管理页维护和架构记录生命周期。Phase 12 已完成：任务历史收敛为有界分页与归档，检查点和阶段不再追加到任务正文；Codex 和 Cursor 的 Hook 面统一为低频会话事件，逐工具/逐编辑召回改走常驻 MCP，不再提供轻量/全量双轨。Phase 13 已完成：`core/full` 收敛为单一通用 22 工具面，诊断和恢复动作转 CLI/UI。Phase 14 已完成真实恢复验证：Codex 新会话及真实压缩后保持同一任务；Cursor 在普通首轮和检查点后新会话中，通过常驻 MCP + Rule/Skill 自动恢复任务。Cursor `sessionStart` 是 fire-and-forget，当前模型未收到启动块，因此只按 best effort 记录。Phase 15 P0 已完成：真实 worktree 复用同一项目，doctor 可巡检并修复缺失入口；Codex 桌面与 Cursor 新会话均加载 22 工具，Codex 返回 `workspace_prepare=ready`，Cursor `sessionStart` 4.295 秒成功并首轮恢复。Codex 本次启动块未进入模型，实际恢复由常驻 MCP 完成。剩余首响样本、Cursor `sessionEnd`、压缩事件（`preCompact` 未安装）、统计收益和公开发布动作。
+当前产品文档按职责维护，不再为每轮实现新增独立 plan/report。方向是 **AGPL-3.0-or-later 完全开源 + Basic Memory/planning-with-files 深度融合**。Phase 0–11 已完成基础运行时、单 current/并行 WorkUnit、统一 MCP/上下文、真实桌面接续、知识复用、管理页维护和架构记录生命周期。Phase 12 已完成：任务历史收敛为有界分页与归档，检查点和阶段不再追加到任务正文；Codex 和 Cursor 的 Hook 面统一为低频会话事件，逐工具/逐编辑召回改走常驻 MCP，不再提供轻量/全量双轨。Phase 13 已完成：`core/full` 收敛为单一通用 22 工具面，诊断和恢复动作转 CLI/UI。Phase 14 已完成真实恢复验证：Codex 新会话及真实压缩后保持同一任务；Cursor 在普通首轮和检查点后新会话中，通过常驻 MCP + Rule/Skill 自动恢复任务。Cursor `sessionStart` 是 fire-and-forget，当前模型未收到启动块，因此只按 best effort 记录。Phase 15 P0 已完成：真实 worktree 复用同一项目，doctor 可巡检并修复缺失入口；Codex 桌面与 Cursor 新会话均加载 22 工具，Codex 返回 `workspace_prepare=ready`，Cursor `sessionStart` 4.295 秒成功并首轮恢复。Codex 本次启动块未进入模型，实际恢复由常驻 MCP 完成。Cursor `sessionEnd`、压缩事件（`preCompact` 未安装）、统计收益和公开发布动作仍未验证或未执行。
 
 **Phase 15 已完成（2026-11-02）。** 3 个真实首轮样本为 Codex 26.0 秒、Cursor 修复前 230.4 秒、Cursor 收紧路径后 75.3 秒；修复后的首动作是 MCP `workspace_prepare`。干净 wheel、独立 venv `init`/`doctor`/stdio `probe`、217 项全量回归、`clients doctor` 8/8、许可证/来源声明、敏感信息高信号扫描和 Git 状态已本地核对。Cursor `sessionEnd`、压缩事件、统计收益和公开发布仍未验证或未执行。
+
+**Phase 16 已完成（2026-11-02）。** 根目录构建现在由 `setup.py` 的 `build_py` 钩子先清理 `build/lib`，避免 wheel 混入已删除源码；`tests/test_packaging.py` 覆盖哨兵文件被丢弃。独立 venv 安装、`init`/`doctor`/stdio `probe`、活动 home 的新 MCP 进程恢复、`clients doctor` 8/8、两端 22 工具探针和 218 tests / 1 skipped / OK（628.174 秒）均通过。后续 P1 将重型服务初始化推迟到首次工具调用，`tools/list` 提前到约 1.34–1.37 秒，并在 AGENTS/Skill/Rule/Hook 中禁止工具未声明时凭空调用；最终全量 219 tests / 1 skipped / OK（656.644 秒）。这些改动随本次稳定化提交进入 `main`。
 
 唯一长期执行计划：[PLAN.md](../PLAN.md)。任何范围变化先更新该计划。
 

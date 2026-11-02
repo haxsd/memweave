@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from collections.abc import Callable
+from threading import Lock
 from typing import Annotated, Any
 
 from mcp.server import MCPServer
@@ -9,7 +10,6 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from memweave.diagnostics import Diagnostics, DiagnosticError
-from memweave.services import Service
 
 
 def invoke(function: Callable[..., dict], *arguments: str) -> dict:
@@ -80,17 +80,31 @@ def create_server(
     """Build the one agent-facing server surface; diagnostic keeps internal probe tools."""
     if toolset not in (None, *LEGACY_TOOLSETS):
         raise DiagnosticError("RECORD_INVALID", "Tool selection is not a user-facing mode.")
-    service = Service(diagnostics.home)
-    # Hard first-turn convention for agents: project tools refuse until prepare.
-    service.require_workspace_prepare = True
+    service = None
+    service_lock = Lock()
+
+    def get_service():
+        nonlocal service
+        if service is not None:
+            return service
+        with service_lock:
+            if service is None:
+                from memweave.services import Service
+
+                loaded = Service(diagnostics.home)
+                loaded.require_workspace_prepare = True
+                loaded.start()
+                service = loaded
+        return service
 
     @asynccontextmanager
     async def lifespan(_server):
-        await asyncio.to_thread(service.start)
         try:
             yield
         finally:
-            await asyncio.to_thread(service.close)
+            active = service
+            if active is not None:
+                await asyncio.to_thread(active.close)
 
     server = MCPServer(
         "MemWeave",
@@ -101,7 +115,8 @@ def create_server(
             "do not open PLAN.md, repo-wide search, project_scan, or broad graph sweeps. "
             "Begin with workspace_prepare for the absolute execution root and explicit inspect/new/resume intent; "
             "other project tools return PREPARE_REQUIRED until that succeeds in this process; "
-            "a linked worktree resolves to its registered repository project. "
+            "Only call MemWeave tools that are present in the current tool list; if they are absent, report that MCP is still loading or disabled and do not guess. "
+            "A linked worktree resolves to its registered repository project. "
             "Each project has one current task and a deterministic queue; never create parallel top-level current tasks. "
             "Use WorkUnits for parallel subagents inside the current task and keep each unit revision separate. "
             "Restore current task, running or blocked WorkUnits, knowledge and local structure before work. "
@@ -126,7 +141,11 @@ def create_server(
 
     def call(action, parameters):
         parameters = {key: value for key, value in parameters.items() if key != "call"}
-        return invoke(service.dispatch, action, parameters)
+        try:
+            loaded = get_service()
+        except DiagnosticError as error:
+            raise ToolError(str(error)) from error
+        return invoke(loaded.dispatch, action, parameters)
 
     @server.tool(annotations=read_only, structured_output=True)
     def memweave_system_status() -> dict[str, Any]:

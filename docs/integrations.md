@@ -129,6 +129,8 @@ Windows `commandWindows` 显式启动 PowerShell，以编码命令保护中文�
 
 ## 目标客户端的验收操作
 
+Codex 恢复线程时存在客户端启动边界：日志可能先出现 `turn/start`，再出现 MemWeave MCP ready。服务已把重型索引推迟到首次工具调用，冷启动工具目录实测约 1.34–1.37 秒，但客户端仍可能先开始回合。此时不要让 Agent 凭文案发出 `memweave_workspace_prepare`；只有当前工具列表出现 `memweave_*` 才调用，否则直接说明 MCP 正在加载/重连，等工具出现后再发。把这个协议错误当作客户端启动竞态处理，不要用文件或 CLI 猜测任务状态。
+
 分别在 Codex 桌面版与 Cursor 中执行，并记录客户端版本、时间、实际工具调用、结果和额外操作负担。同 IDE 的后续工作与跨客户端接续都应观察。
 
 1. 加载服务，确认 `memweave_*` 工具出现，包含 `workspace_prepare`、task、memory、graph 工具；读取状态并核对版本与 `--home`。

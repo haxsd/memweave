@@ -55,6 +55,8 @@ class SetupTests(unittest.TestCase):
         self.assertIn("不因完成一个子步骤或保存检查点就交回控制权", rule_text)
         self.assertIn("状态、接续", rule_text)
         self.assertIn("不得用 CLI/Python 绕过 MCP 硬门", rule_text)
+        self.assertIn("当前工具列表已出现", rule_text)
+        self.assertIn("不得凭本规则凭空发起工具调用", rule_text)
         mcp = json.loads((self.cursor / "mcp.json").read_text(encoding="utf-8"))
         self.assertNotIn("--toolset", mcp["mcpServers"]["memweave"]["args"])
         manifest = json.loads((self.cursor / "memweave.json").read_text(encoding="utf-8"))

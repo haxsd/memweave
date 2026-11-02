@@ -121,8 +121,9 @@ class CursorHooks:
                 "再决定是否创建任务。"
             )
         guidance = (
-            "MemWeave: 首个项目动作必须是常驻 MCP 的 memweave_workspace_prepare"
+            "MemWeave: 当前工具列表实际出现 memweave_workspace_prepare 时，首个项目动作必须是它"
             "（绝对执行根 + inspect/resume/new），需要时可并行调用 memweave_system_status。"
+            "未出现时不得凭 Hook 文案发起调用，直接说明 MCP 尚未加载或仍在重连。"
             "不要用 shell 重读 Skill，也不要在 prepare 前读取 PLAN/CURRENT_STATE/源码"
             "或运行全仓搜索；不得用 CLI/Python 调 workspace_prepare。"
             "状态/下一步请求保持只读，不创建、编辑或删除文件。"
