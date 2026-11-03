@@ -48,9 +48,10 @@ class ClientDoctorTests(unittest.TestCase):
     def test_healthy_installations_are_reported_without_writes(self):
         setup_cursor(self.root, self.home)
         setup_codex(self.root, self.home)
+        self.write_codex_global(server=server_command(self.home))
         first = doctor_clients(self.home, global_base=self.global_base)
         self.assertEqual(first["state"], "ready")
-        self.assertEqual(first["summary"]["ready"], 2)
+        self.assertEqual(first["summary"]["ready"], 3)
         before = self.snapshot()
         second = doctor_clients(self.home, global_base=self.global_base)
         self.assertEqual(second, first)

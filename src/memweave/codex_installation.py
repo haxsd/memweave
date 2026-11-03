@@ -14,7 +14,7 @@ from memweave.installation import (
     ProjectFiles, apply_plan, fingerprint, json_bytes, probe_installation, selected_home,
 )
 from memweave.integrations import (
-    CODEX_HOOK_EVENTS, CODEX_LEGACY_HOOK_EVENTS, client_configuration, server_command,
+    CODEX_HOOK_EVENTS, CODEX_LEGACY_HOOK_EVENTS, client_configuration, codex_server_command,
 )
 from memweave.services import Service
 
@@ -132,7 +132,7 @@ def merged_ignore(project, relative, lines):
 def installation_plan(project, home, toolset, manifest):
     config = read_config(project)
     servers = table(config, "mcp_servers")
-    server = server_command(home)
+    server = codex_server_command(home)
     if servers.get("memweave") not in (None, server, manifest.get("server")):
         raise DiagnosticError("SETUP_CONFLICT", "Existing MemWeave MCP differs; preserve or merge it first.")
     if owns_hook(config.get("hooks", {})):
@@ -241,7 +241,7 @@ def check_codex(root, home=None, probe=False):
         if not isinstance(servers, Mapping):
             raise DiagnosticError("CONFIG_INVALID", "Codex mcp_servers must be a table.")
         existing = servers.get("memweave")
-        server = server_command(selected)
+        server = codex_server_command(selected)
         check("mcp", existing == server, "MCP 必须匹配当前安装的解释器、参数、记忆库和通用工具面。")
         features = config.get("features", {})
         check("features", isinstance(features, Mapping) and features.get("hooks") is True, "项目已启用 Hooks。")

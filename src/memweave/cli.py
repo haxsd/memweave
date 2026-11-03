@@ -84,6 +84,16 @@ def run_hook(arguments: argparse.Namespace, diagnostics: Diagnostics) -> int:
             payload = json.loads(raw.decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
             raise DiagnosticError("RECORD_INVALID", "Hook input must be UTF-8 JSON.") from error
+        if arguments.client == "codex" and arguments.event == "UserPromptSubmit":
+            session_id = payload.get("session_id")
+            root = arguments.root.expanduser().resolve() if arguments.root is not None else None
+            state = (
+                diagnostics.hook_state("codex:" + session_id)
+                if isinstance(session_id, str) and session_id else {}
+            )
+            if root is None or state.get("root") != str(root) or not state.get("compaction_pending"):
+                print("{}")
+                return 0
         diagnostics.record_hook(arguments.client, arguments.event, payload)
         from memweave.services import Service
         service = Service(diagnostics.home)

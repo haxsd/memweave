@@ -15,7 +15,7 @@ from memweave.services import Service
 
 
 class HookMcpTests(unittest.IsolatedAsyncioTestCase):
-    async def test_real_stdio_results_drive_checkpoint_consolidation_and_next_session(self):
+    async def test_explicit_mcp_lifecycle_and_next_session_retrieval(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "项目"
             root.mkdir()
@@ -41,9 +41,6 @@ class HookMcpTests(unittest.IsolatedAsyncioTestCase):
                     async def call(action, **parameters):
                         response = await client.call_tool("memweave_" + action, parameters)
                         self.assertFalse(response.is_error, str(response.content))
-                        await hook("afterMCPExecution", tool_name="memweave_" + action,
-                                   mcp_server_name="memweave", tool_input=json.dumps(parameters),
-                                   result_json=response.model_dump_json(by_alias=True))
                         return response.structured_content["data"]
 
                     project = await call("project_register", root=str(root), name="SDK Hook", operation_id="p")
@@ -51,17 +48,12 @@ class HookMcpTests(unittest.IsolatedAsyncioTestCase):
                     await hook("sessionStart")
                     task = await call("task_open", project_id=project["id"], title="修复",
                                       goal="验证自动记忆维护", acceptance=["回归"], operation_id="t")
-                    reminder = await hook("stop", status="completed", loop_count=0)
-                    self.assertIn("memweave_task_checkpoint", reminder.get("followup_message", ""))
                     saved = await call("task_checkpoint", task_id=task["id"], expected_revision=1,
                                        expected_etag=task["etag"], findings="SDK 真实响应可关联",
                                        progress="测试环境已执行验证", next_step="关闭并提炼", operation_id="cp")
-                    self.assertEqual(await hook("stop", status="completed", loop_count=1), {})
                     closed = await call("task_close", task_id=task["id"], expected_revision=saved["revision"],
                                         expected_etag=saved["etag"], outcome="completed", summary="已验证",
                                         acceptance_results=["测试环境通过"], operation_id="close")
-                    review = await hook("stop", status="completed", loop_count=0, generation_id="turn-2")
-                    self.assertIn("memweave_memory_review", review.get("followup_message", ""))
                     await call("memory_review", task_id=task["id"])
                     memory = await call("memory_write", project_id=project["id"], title="已确认的项目经验",
                                         body="NEXT_SESSION_REUSES_KNOWLEDGE", operation_id="knowledge",
@@ -69,7 +61,6 @@ class HookMcpTests(unittest.IsolatedAsyncioTestCase):
                     await call("memory_review_complete", task_id=task["id"], expected_revision=closed["revision"],
                                expected_etag=closed["etag"], memory_ids=[memory["id"]],
                                summary="已核对并保存", operation_id="review")
-                    self.assertEqual(await hook("stop", status="completed", loop_count=1), {})
 
                 await hook("sessionEnd")
                 restored = await hook("sessionStart", conversation_id="next-session")
@@ -157,25 +148,6 @@ class HookMcpTests(unittest.IsolatedAsyncioTestCase):
                         session_id="codex-cross",
                         cwd=str(root),
                         turn_id="turn-1",
-                    )
-                    await hook(
-                        "codex",
-                        "PostToolUse",
-                        session_id="codex-cross",
-                        cwd=str(root),
-                        turn_id="turn-1",
-                        tool_name="mcp__memweave__memweave_task_checkpoint",
-                        tool_input={
-                            "task_id": task["id"],
-                            "expected_revision": task["revision"],
-                            "expected_etag": task["etag"],
-                        },
-                        tool_response={
-                            "structuredContent": {
-                                "status": "ok",
-                                "data": checkpoint,
-                            }
-                        },
                     )
                     await hook(
                         "codex",

@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from memweave.services import Service
 from memweave.diagnostics import DiagnosticError
@@ -38,7 +39,7 @@ class ContextTests(unittest.TestCase):
         task = self.call("task_open", project_id=self.project, title="auth fix", goal="Verify refresh expiry",
                          acceptance=["Expiry checked"], operation_id="task")
         self.call("task_checkpoint", task_id=task["id"], expected_revision=1, expected_etag=task["etag"],
-                  findings="Old exploration. " * 600, progress="Handler located",
+                  findings="LATEST_CORRECTION_DO_NOT_ROLL_BACK " + "detail " * 600, progress="Handler located",
                   next_step="Run expiry regression", operation_id="checkpoint")
         context = self.call("context_get", project_id=self.project, task_id=task["id"], query="auth", budget=2400)
         self.assertIn("Run expiry regression", context["text"])
@@ -46,11 +47,15 @@ class ContextTests(unittest.TestCase):
         self.assertIn("auth.py", context["text"])
         self.assertIn("auth refresh boundary", context["text"])
         self.assertLessEqual(len(context["text"]), 2400)
-        self.assertNotIn("Old exploration", context["text"])
+        self.assertIn("LATEST_CORRECTION_DO_NOT_ROLL_BACK", context["text"])
         self.assertTrue({task["id"], memory["id"], architecture["id"], "file:auth.py"}.issubset(
             {source["id"] for source in context["included_sources"]}
         ))
         self.assertEqual(context["graph"]["freshness"]["state"], "checked")
+        default = self.call("context_get", project_id=self.project, task_id=task["id"], budget=2400)
+        self.assertIn("LATEST_CORRECTION_DO_NOT_ROLL_BACK", default["text"])
+        self.assertNotIn("Structure [", default["text"])
+        self.assertNotIn("History:", default["text"])
 
     def test_context_excludes_changed_architecture_and_reports_scan_boundary(self):
         architecture = self.map_architecture()
@@ -127,7 +132,7 @@ class ContextTests(unittest.TestCase):
         self.assertNotIn(continuation["id"], sources)
         self.assertNotIn("任务接续方法", context["text"])
         self.assertFalse(context["memory"]["recent_fallback"])
-        self.assertEqual(context["memory"]["strategy"], "basic_memory_sqlite_fts5+context")
+        self.assertEqual(context["memory"]["strategy"], "basic_memory_sqlite_fts5")
 
     def test_empty_query_only_injects_current_task_scoped_knowledge(self):
         task = self.call(
@@ -162,11 +167,11 @@ class ContextTests(unittest.TestCase):
         self.assertTrue(hit["retrieval"]["permalink"])
         detail = self.service.memory_context(hit["retrieval"]["permalink"])
         self.assertEqual(detail["metadata"]["primary_count"], 1)
-        context = self.call(
-            "context_get", project_id=self.project, query="canonical retrieval", budget=3000
-        )
-        self.assertEqual(context["memory"]["strategy"], "basic_memory_sqlite_fts5+context")
-        self.assertEqual(context["memory"]["contexts_checked"], 1)
+        with patch.object(self.service, "memory_context", side_effect=AssertionError("unused relation lookup")):
+            context = self.call(
+                "context_get", project_id=self.project, query="canonical retrieval", budget=3000
+            )
+        self.assertEqual(context["memory"]["strategy"], "basic_memory_sqlite_fts5")
         self.assertIn(memory["id"], {source["id"] for source in context["included_sources"]})
 
     def test_architecture_is_prioritized_before_graph_result_limit(self):
@@ -243,9 +248,10 @@ class ContextTests(unittest.TestCase):
         context = self.call("context_get", project_id=self.project, task_id=task["id"])
         reboot = context["reboot"]
         self.assertEqual(set(reboot), {
-            "where", "goal", "done", "failed", "next", "contract", "attention", "completion", "text",
+            "where", "goal", "findings", "done", "failed", "next", "contract", "attention", "completion", "text",
         })
         self.assertIn("Run targeted regression", reboot["next"])
+        self.assertIn("Located the boundary.", reboot["findings"])
         self.assertIn("Contract is unconfirmed", reboot["failed"])
         self.assertIn("Reboot summary:", reboot["text"])
         self.assertIn("Completion: blocked", reboot["text"])

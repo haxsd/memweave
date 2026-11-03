@@ -1,11 +1,75 @@
 import json
 import re
-import shlex
+from datetime import datetime, timezone
 from pathlib import Path
 
 from memweave.diagnostics import DiagnosticError
 from memweave.hooks import CursorHooks
 from memweave.worktrees import repository_root, same_repository
+
+
+def _clip(value, limit):
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _content_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(_content_text(item) for item in value if item)
+    if isinstance(value, dict):
+        for key in ("text", "content", "message"):
+            if key in value:
+                return _content_text(value[key])
+    return ""
+
+
+def _tool_call(payload):
+    return _clip(payload.get("name") or payload.get("tool_name"), 90)
+
+
+def _transcript_details(path):
+    if not isinstance(path, str) or not path:
+        return {}
+    try:
+        transcript = Path(path)
+        if not transcript.is_file():
+            return {}
+        with transcript.open("rb") as stream:
+            stream.seek(max(0, transcript.stat().st_size - 12_000_000))
+            data = stream.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return {}
+    user = ""
+    assistant = ""
+    tools = []
+    for line in data.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            item = json.loads(line)
+        except (ValueError, TypeError, RecursionError):
+            continue
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else item
+        kind = payload.get("type")
+        if kind == "message":
+            text = _content_text(payload.get("content"))
+            if payload.get("role") == "user" and text:
+                user = text
+            elif payload.get("role") == "assistant" and text:
+                assistant = text
+        elif kind in ("user_message", "agent_message"):
+            text = _content_text(payload.get("message") or payload.get("content"))
+            if text and (kind == "user_message" or payload.get("role") == "user"):
+                user = text
+            elif text:
+                assistant = text
+        elif kind in ("function_call", "custom_tool_call"):
+            tool = _tool_call(payload)
+            if tool:
+                tools.append(tool)
+    return {"user": user[-2400:], "assistant": assistant[-3200:], "tools": tools[-6:]}
 
 
 class CodexHooks(CursorHooks):
@@ -25,10 +89,16 @@ class CodexHooks(CursorHooks):
         effective = Path(cwd).resolve()
         if not self.in_scope(effective) or self.nested_project(effective):
             return {}
-        if event in ("SessionStart", "UserPromptSubmit"):
-            self.ensure_started()
         root = str(self.root)
         session_id = "codex:" + payload["session_id"]
+        if event == "SessionStart":
+            if payload.get("source") == "compact":
+                with self.session(session_id, root) as state:
+                    text = self.take_compaction_snapshot(state, "")
+                if text:
+                    return self.context(event, text)
+            self.ensure_started()
+        pending_compaction = None
         with self.session(session_id, root) as state:
             if event == "SessionEnd":
                 state.clear()
@@ -36,6 +106,8 @@ class CodexHooks(CursorHooks):
             if event == "Interrupt":
                 state["interrupted_turn"] = payload.get("turn_id")
                 return {}
+            if event == "PreCompact":
+                pending_compaction = self.capture_compaction(root, state, payload)
             if event == "SessionStart":
                 if payload.get("source") not in ("compact", "resume"):
                     state.clear()
@@ -44,15 +116,10 @@ class CodexHooks(CursorHooks):
                 return self.context(event, text) if text else {}
             if event == "UserPromptSubmit":
                 state.pop("interrupted_turn", None)
-                recalled = self.prompt_context(root, state, payload.get("prompt", ""), budget=1800)
-                if not recalled:
-                    return {}
-                return self.context(event, recalled["additional_context"])
-            if event == "PostToolUse":
-                self.observe(payload, state, effective)
-            elif event == "Stop":
-                self.refresh_stop_task(root, state)
-                return self.stop(payload, state)
+                text = self.take_compaction_snapshot(state, payload.get("prompt", ""))
+                return self.context(event, text) if text else {}
+        if pending_compaction is not None:
+            self.persist_compaction(pending_compaction, payload)
         return {}
 
     def nested_project(self, cwd):
@@ -84,108 +151,105 @@ class CodexHooks(CursorHooks):
         path = Path(path).expanduser().resolve()
         return path.is_relative_to(self.root) or same_repository(self.root, path)
 
-    def source_scope(self, cwd):
-        cwd = Path(cwd).expanduser().resolve()
-        root = repository_root(cwd)
-        return root if root is not None and same_repository(root, self.root) else cwd
-
-    def own_path(self, value, cwd):
-        if not isinstance(value, str) or not value.strip():
-            return False
-        path = Path(value)
-        path = (path if path.is_absolute() else cwd / path).resolve()
-        scope = self.source_scope(cwd)
-        if not path.is_relative_to(scope) or path.is_relative_to(self.diagnostics.home):
-            return False
-        relative = path.relative_to(scope).as_posix()
-        return not relative.startswith((".codex/", ".agents/skills/memweave-continuity/"))
-
-    def observe(self, payload, state, cwd):
-        name = payload.get("tool_name", "")
-        parameters = payload.get("tool_input")
-        response = payload.get("tool_response")
-        if not isinstance(parameters, dict) or response is None:
-            return
-        prefix = "mcp__memweave__"
-        if isinstance(name, str) and name.startswith(prefix):
-            self.observe_tool({
-                "mcp_server_name": "memweave", "tool_name": name[len(prefix):],
-                "tool_input": json.dumps(parameters), "result_json": json.dumps(response),
-            }, state)
-            if state.get("task_id"):
-                state.pop("unbound_work", None)
-            return
-        actual_work = False
-        if name in ("apply_patch", "Edit", "Write"):
-            if isinstance(response, dict) and (response.get("success") is False or response.get("isError")):
-                return
-            command = parameters.get("command", "")
-            paths = re.findall(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$",
-                               command, re.MULTILINE) if isinstance(command, str) else []
-            paths += [parameters.get("file_path", parameters.get("path"))]
-            actual_work = any(self.own_path(path, cwd) for path in paths)
-        elif name in ("Bash", "exec_command", "functions.exec_command"):
-            workdir = parameters.get("workdir", parameters.get("cwd"))
-            if workdir is not None:
-                if not isinstance(workdir, str):
-                    return
-                effective = Path(workdir)
-                effective = (effective if effective.is_absolute() else cwd / effective).resolve()
-                if not self.in_scope(effective):
-                    return
-            command = parameters.get("command", parameters.get("cmd", ""))
-            actual_work = self.validation_command(command)
-        if actual_work:
-            state["needs_checkpoint" if state.get("task_id") else "unbound_work"] = True
-
-    def validation_command(self, command):
-        if not isinstance(command, str):
-            return False
-        try:
-            tokens = shlex.split(command, posix=False)
-        except ValueError:
-            return False
-        if tokens[:1] == ["&"]:
-            tokens = tokens[1:]
-        if not tokens:
-            return False
-        executable = tokens[0].strip("'\"").replace("\\", "/").rsplit("/", 1)[-1]
-        executable = re.sub(r"\.(exe|cmd|bat)$", "", executable.lower())
-        arguments = tokens[1:]
-        if executable == "pytest":
-            return True
-        if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?|py", executable):
-            while arguments and arguments[0] in ("-X", "-I", "-B", "-u", "-E", "-s", "-S", "-O", "-OO"):
-                arguments = arguments[2:] if arguments[0] == "-X" else arguments[1:]
-            return len(arguments) >= 2 and arguments[0] == "-m" and arguments[1] in ("pytest", "unittest")
-        if executable in ("npm", "pnpm"):
-            arguments = arguments[1:] if arguments[:1] == ["run"] else arguments
-            return arguments[:1] == ["test"]
-        if executable in ("cargo", "go", "mvn", "gradle", "gradlew"):
-            return arguments[:1] == ["test"]
-        return executable == "ruff" and arguments[:1] == ["check"]
-
-    def stop(self, payload, state):
-        turn = payload.get("turn_id")
-        if (not isinstance(turn, str) or not turn or payload.get("stop_hook_active") is not False
-                or state.get("interrupted_turn") == turn or state.get("prompted_generation") == turn):
-            return {}
-        if state.get("task_id"):
+    def capture_compaction(self, root, state, payload):
+        task = None
+        task_id = state.get("task_id")
+        if isinstance(task_id, str) and task_id:
             try:
-                followup = self.followup(
-                    {"generation_id": turn, "loop_count": 0, "status": "completed"}, state
-                )
-            except DiagnosticError:
-                return {}
-            if followup:
-                return {"decision": "block", "reason": followup["followup_message"]}
-        elif state.get("unbound_work"):
-            state["prompted_generation"] = turn
-            return {"decision": "block", "reason": (
-                "MemWeave 观察到本轮项目改动或验证，但尚未关联任务。"
-                "不要先用 shell 重读 Skill；调用 memweave_workspace_prepare，按当前真实目标显式准备或创建任务，"
-                "再调用 memweave_task_checkpoint 保存真实发现、失败、验证结果与下一步。"
-                "不要猜测旧任务，不要将未通过验证记为通过，不保存凭据或完整对话。"
-                "只完成这一次记忆维护后结束，不扩展业务工作。"
-            )}
-        return {}
+                task = self.service.task_read(task_id, checkpoint_limit=1)
+            except (DiagnosticError, OSError, ValueError, TypeError, KeyError):
+                task = None
+        if task is None or task["status"] != "current":
+            task = None
+            try:
+                project = self.service._project_for_root(root)
+                if project is not None:
+                    current = self.service.task_list(project["id"], status="current", limit=1)["items"]
+                    if current:
+                        task = self.service.task_read(current[0]["id"], checkpoint_limit=1)
+            except (DiagnosticError, OSError, ValueError, TypeError, KeyError):
+                pass
+        if task is not None:
+            state.update(task_id=task["id"], revision=task["revision"])
+        details = _transcript_details(payload.get("transcript_path"))
+        snapshot = self.compaction_snapshot(task, details, payload)
+        state["compaction_pending"] = True
+        state["compaction_snapshot"] = snapshot
+        state["compaction_captured_at"] = datetime.now(timezone.utc).isoformat()
+        return task, snapshot
+
+    def persist_compaction(self, pending, payload):
+        task, snapshot = pending
+        if task is None:
+            return
+        try:
+            previous = task.get("findings", "").split("\n\n[Pre-compaction snapshot]")[0]
+            findings = (
+                previous[:7500] + "\n\n[Pre-compaction snapshot]\n" + snapshot
+            )[:11900]
+            self.service.task_checkpoint(
+                task["id"], task["revision"], task["etag"],
+                findings=findings,
+                progress=task.get("progress") or "Pre-compaction snapshot recorded.",
+                failures=task.get("failures", ""),
+                verification=task.get("verification", ""),
+                next_step=task.get("next_step") or "Re-read the latest files and continue from the snapshot.",
+                operation_id=self.compaction_operation_id(payload),
+            )
+        except (DiagnosticError, OSError, ValueError, TypeError, KeyError):
+            pass
+
+    def compaction_operation_id(self, payload):
+        value = "precompact-{}-{}-{}-{}".format(
+            str(payload.get("session_id", ""))[:16],
+            str(payload.get("turn_id", "turn")),
+            str(payload.get("trigger", "auto")),
+            datetime.now(timezone.utc).isoformat(),
+        )
+        return re.sub(r"[^A-Za-z0-9_-]", "-", value)[:180]
+
+    def compaction_snapshot(self, task, details, payload):
+        lines = ["Pre-compaction snapshot captured before Codex compacted its context."]
+        if task is not None:
+            findings = task.get("findings", "").split("\n\n[Pre-compaction snapshot]")[0]
+            lines.extend([
+                f"Task [{task['id']}] {_clip(task.get('title'), 140)} (revision {task.get('revision')})",
+                f"Goal: {_clip(task.get('goal'), 250)}",
+                f"Next: {_clip(task.get('next_step'), 300)}",
+                f"Findings: {_clip(findings, 400)}",
+                f"Progress: {_clip(task.get('progress'), 250)}",
+                f"Failures: {_clip(task.get('failures'), 250)}",
+                f"Verification: {_clip(task.get('verification'), 250)}",
+            ])
+        if details.get("user"):
+            lines.append("Last user: " + _clip(details["user"], 650))
+        if details.get("assistant"):
+            lines.append("Last assistant: " + _clip(details["assistant"], 650))
+        if details.get("tools"):
+            lines.append("Recent tools:")
+            lines.extend("- " + _clip(tool, 90) for tool in details["tools"])
+        if len(lines) == 1:
+            lines.append("No task or transcript details available.")
+        lines.append(f"Trigger: {payload.get('trigger', 'unknown')}")
+        return "\n".join(lines)[:4000]
+
+    def take_compaction_snapshot(self, state, prompt):
+        snapshot = state.pop("compaction_snapshot", "")
+        state.pop("compaction_pending", None)
+        state.pop("compaction_captured_at", None)
+        if not isinstance(snapshot, str) or not snapshot.strip():
+            return ""
+        lines = [
+            "MemWeave compaction recovery. The previous Codex context was compacted; "
+            "this is a bounded snapshot captured before compaction, not current truth.",
+        ]
+        if prompt:
+            lines.append("Current user prompt: " + _clip(prompt, 500))
+        lines.extend([
+            snapshot,
+            "First confirm the user's goal still matches this task. If memweave_workspace_prepare "
+            "is available, call it with the absolute execution root and intent resume (or new "
+            "for a different goal), then read the current task and verify "
+            "the real files and git state; do not assume omitted details disappeared.",
+        ])
+        return "\n".join(lines)[:5000]

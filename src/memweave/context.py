@@ -122,6 +122,7 @@ def build_reboot(task, graph_freshness, pending_tasks, pending_phases):
         where += f", {len(blocked)} blocked"
     where += "."
     goal = one_line(task.get("goal", ""), 500) or "No goal recorded."
+    findings = one_line(task.get("findings", ""), 500)
     progress = one_line(task.get("progress", ""), 260)
     verification = one_line(task.get("verification", ""), 260)
     if progress and verification:
@@ -176,6 +177,7 @@ def build_reboot(task, graph_freshness, pending_tasks, pending_phases):
         "Reboot summary:",
         f"- Where: {where}",
         f"- Next: {next_step}",
+        f"- Findings: {findings or 'No findings recorded.'}",
         f"- Goal: {goal}",
         f"- Done: {done}",
         f"- Failed: {failed}",
@@ -186,6 +188,7 @@ def build_reboot(task, graph_freshness, pending_tasks, pending_phases):
     return {
         "where": where,
         "goal": goal,
+        "findings": findings,
         "done": done,
         "failed": failed,
         "next": next_step,
@@ -292,10 +295,6 @@ def build_context(
     memories = []
     memory_reasons = {}
     seen_memories = set()
-    memory_contexts = []
-    context_related = 0
-    context_observations = 0
-    context_errors = []
     for memory, reason in memory_items:
         if memory["id"] in seen_memories:
             continue
@@ -306,20 +305,6 @@ def build_context(
         if reason == "task_scope":
             label += ", current task scope"
         content = f"Memory [{memory['id']}] ({label}) {clip(memory['title'], 100)}\n{memory['body']}"
-        retrieval = memory.get("retrieval") or {}
-        if reason in ("matched", "task_query") and retrieval.get("permalink") and len(memory_contexts) < 4:
-            try:
-                related_context = service.memory_context(retrieval["permalink"], depth=1)
-                context_related += related_context["metadata"]["related_count"]
-                context_observations += related_context["metadata"]["total_observations"]
-                memory_contexts.append({
-                    "memory_id": memory["id"],
-                    "related_count": related_context["metadata"]["related_count"],
-                    "total_observations": related_context["metadata"]["total_observations"],
-                    "has_more": related_context["metadata"]["has_more"],
-                })
-            except Exception as error:
-                context_errors.append({"memory_id": memory["id"], "error": str(error)})
         memories.append((memory["id"], "memory", content))
     if include_user:
         matches = service.memory_search(query=query, scope="user")["items"]
@@ -342,6 +327,8 @@ def build_context(
     graph_blocks = []
     for node in sorted(graph["nodes"], key=lambda item: {"architecture": 0, "file": 1}.get(item["type"], 2)):
         if node.get("status") != "active" or node.get("path") == ".":
+            continue
+        if not query.strip() and node["type"] != "architecture":
             continue
         identifier = node["id"]
         candidates.append(identifier)
@@ -386,13 +373,6 @@ def build_context(
             truncated = truncated or len(rendered) < len(content)
             allowance -= len(rendered) + 2
         remaining += allowance
-    if task:
-        history = "\n\nHistory:\n" + task["body"]
-        if remaining > 12:
-            parts.append(clip(history[2:], remaining - 2))
-            truncated = truncated or len(history) > remaining
-        else:
-            truncated = True
     freshness = dict(graph["freshness"])
     if "stale_files" in freshness:
         freshness["stale_file_count"] = len(freshness["stale_files"])
@@ -402,13 +382,8 @@ def build_context(
                 reboot=reboot, attention=attention, completion=completion,
                 graph={"coverage": graph["coverage"], "freshness": freshness},
                 memory={
-                    "strategy": "basic_memory_sqlite_fts5+context",
+                    "strategy": "basic_memory_sqlite_fts5",
                     "query_used": bool(knowledge_query),
                     "query_source": knowledge_query_source,
                     "recent_fallback": False,
-                    "contexts_checked": len(memory_contexts),
-                    "related_count": context_related,
-                    "observation_count": context_observations,
-                    "contexts": memory_contexts,
-                    "errors": context_errors,
                 })

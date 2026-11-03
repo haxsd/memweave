@@ -1,6 +1,6 @@
 # 客户端接入与验证
 
-> 状态：本文描述 **当前开发接入**。主 MCP 使用 Basic Memory 单索引和稳定记忆库 `%USERPROFILE%\.memweave`；顶层任务为单 `current` 顺序队列，任务内 WorkUnit 可并行，阶段可独立收束。Phase 12 将 Hook 统一为低频会话生命周期：Cursor 只生成 `sessionStart/sessionEnd`，Codex 只生成 `SessionStart/Interrupt/SessionEnd`；文件编辑、工具调用、逐轮原话检索和每次 Stop 维护直接使用常驻 MCP。历史上的 `Stop`、`afterFileEdit`、`afterMCPExecution`、`PostToolUse`、`UserPromptSubmit` 和 `PreCompact` 触发证据只代表旧配置。Codex CLI/桌面已产生 `SessionStart`/`SessionEnd` 收据；Cursor `sessionStart` 是 fire-and-forget，3.27.22 实测没有把 `additional_context` 送入模型上下文，真实恢复依赖首轮 `workspace_prepare`。`preCompact`（未安装）、Cursor `sessionEnd` 和完整桌面自证仍未验证。目标见 [目标规格](specs/2026-10-27-agpl-fusion-target.md)，执行顺序见 [PLAN.md](../PLAN.md)。
+> 状态：本文描述 **当前开发接入**。主 MCP 使用 Basic Memory 单索引和稳定记忆库 `%USERPROFILE%\.memweave`；顶层任务为单 `current` 顺序队列，任务内 WorkUnit 可并行，阶段可独立收束。Phase 12 将 Hook 统一为低频会话生命周期；2026-11-02 起，Codex 只额外注册 `PreCompact`（压缩前有界快照）和 `UserPromptSubmit`（仅在快照 pending 时注入；普通输入快速返回）以补齐真实压缩恢复，Cursor 仍只生成 `sessionStart/sessionEnd`。文件编辑、工具调用、逐轮原话检索和 Stop 维护仍走常驻 MCP；其它历史高频事件只代表旧配置。Codex CLI/桌面已产生 `SessionStart`/`SessionEnd` 收据；Cursor `sessionStart` 是 fire-and-forget，3.27.22 实测没有把 `additional_context` 送入模型上下文，真实恢复依赖首轮 `workspace_prepare`。Codex 压缩 Hook 的客户端重载和 Cursor `sessionEnd` 仍待验证。目标见 [目标规格](specs/2026-10-27-agpl-fusion-target.md)，执行顺序见 [PLAN.md](../PLAN.md)。
 
 0.2.5 提供 Codex 与 Cursor 接入。Agent 自动安装见 [仓库安装入口](../AGENT_INSTALL.md)，逐项操作见 [手动安装](manual-install.md)。管理页是可选辅助，现已支持项目状态和架构维护；配置、协议、原生 CLI、桌面体验与模型收益仍分别记录。
 
@@ -86,7 +86,7 @@ Hook 输出为 `version: 1` 的配置，合入项目 `.cursor/hooks.json` 时保
 
 启动上下文预算为 3300 字符，加上固定指引、任务计数和覆盖概况。多个工作区根、未知根或缺少有效根目录时不注入。唯一 current 任务自动成为恢复候选；宿主必须先核对当前用户目标，若目标不同则显式使用 `new`。queued 任务不会被自动选中。待审查任务、阻塞 WorkUnit 和待审查阶段在下一次 SessionStart 或显式 MCP 读取时展示，不通过逐轮 Stop 打断当前请求。阶段和任务提炼仍需宿主在自然边界实际调用；没有可复用知识时可以静默记录空结果。
 
-跟进提示不会替宿主写检查点、关闭任务或生成知识。取消、错误、自动续轮和已完成提炼时不追加。Skill 仍负责重要发现、失败、验证和阶段变化的持续记录；Hook 不再从文件编辑或工具结果推断“待检查点”。当前请求相关的原话检索由 Agent 通过常驻 MCP 的 `workspace_prepare` 或 `memory_search` 完成，不注册 `UserPromptSubmit` 或 `afterMCPExecution`。恢复或新建任务后，宿主应在面向用户的第一条回复显示一行 `MemWeave · 任务 <id> · <next_step>`，没有任务时显示 `MemWeave · 尚未建立任务`。该要求同时写入常驻 Rule、Hook 上下文和 continuity Skill。默认 Rule、Skill 与 MCP 指令还要求同一用户请求内的普通步骤连续执行；不因完成子步骤或保存检查点而等待批准。客户端自身的回合边界仍由宿主控制，MemWeave 只负责消除额外打断，不提供强制续跑的 Stop Hook。
+Skill 负责重要发现、失败、验证和阶段变化的持续记录；Hook 不从文件编辑或工具结果推断“待检查点”，也不生成跟进提示。普通原话检索由 Agent 通过常驻 MCP 的 `workspace_prepare` 或 `memory_search` 完成；Codex `UserPromptSubmit` 仅消费 pending 压缩快照，不注册 `afterMCPExecution`。恢复或新建任务后，宿主应在面向用户的第一条回复显示一行 `MemWeave · 任务 <id> · <next_step>`，没有任务时显示 `MemWeave · 尚未建立任务`。该要求同时写入常驻 Rule、Hook 上下文和 continuity Skill。默认 Rule、Skill 与 MCP 指令还要求同一用户请求内的普通步骤连续执行；不因完成子步骤或保存检查点而等待批准。客户端自身的回合边界仍由宿主控制，不提供强制续跑的 Stop Hook。
 
 事件输入最大 65,536 字节，需为 UTF-8 JSON 对象，并有 `conversation_id` 或 `session_id`。收据只保留 `conversation_id`、`session_id`、`generation_id`、`event_id`、`turn_id` 等允许的标识；Cursor 的 `sessionStart` 会发送空 `generation_id`，因此空的可选标识按缺失处理，不能阻断 Hook。不会读取 transcript。相同客户端、事件及允许标识组成的收据去重。
 
@@ -109,17 +109,21 @@ Codex 侧栏把线程拖入一个项目只会改变分组，不会重写已有�
 
 项目 `.codex/` 需要被 Codex 信任。非托管 Hooks 另需用户审查并信任当前定义哈希，支持此能力的 CLI 使用 `/hooks`；定义变化后重新审查。`check` 始终返回 `hook_trust:requires_host_review`，不会假造已信任状态或代写宿主信任库。
 
+Codex 项目 MCP 设置 `required = true` 与 `startup_readiness = "catalog"`，要求以工具目录作为启动就绪条件；服务初始化失败时显式报错。当前本机 Codex `0.166.0-alpha.5.1` 解析器支持该配置；旧运行中的会话需重载后验证。项目安装保留全局配置。配置与子进程探针通过仍不等于模型已拿到工具。
+
 | 事件 | 实际作用 |
 |---|---|
 | SessionStart | 注入有预算的项目背景；唯一 current 任务、运行中/阻塞 WorkUnit 自动成为恢复候选，queued 不抢占。startup/resume/compact 都先核对用户目标，不把旧进度强制带入新目标 |
+| PreCompact | 读取 Codex transcript 尾部，保存当前任务、最近用户/助手文本和工具名称的有界快照；不保存命令、工具参数、transcript 路径、完整对话或工具输出，不阻断压缩 |
+| UserPromptSubmit | 仅在 `PreCompact` 快照 pending 时注入恢复包；无 pending 时由快速路径直接返回，不检索、不写逐轮 receipt |
 | Interrupt | 标记用户中断，不通过 Stop 重新启动同一轮 |
 | SessionEnd | 清理本会话最小状态 |
 
-Codex 使用官方 `hookSpecificOutput.additionalContext`。默认不注册 Stop，因此不会为常规任务维护阻塞宿主或插入额外续轮。Hook 不读取 transcript、不保存命令或输出、不代替 MCP 写入；宿主依 Skill 在重要发现、失败和验证后主动检查点。当前请求相关的原话检索通过常驻 MCP 的 `workspace_prepare` 或 `memory_search` 完成，不注册 `UserPromptSubmit` 或 `PostToolUse`。
+Codex 使用 `hookSpecificOutput.additionalContext`。默认不注册 Stop，因此不会插入额外续轮。`PreCompact` 只读取 transcript 尾部并保存有界摘要，同时写入 current 任务检查点；未绑定或旧任务已结束时通过现有项目与任务存储重新查找 current，捕获与消费均不启动搜索索引。`UserPromptSubmit` 无 pending 时直接返回。恢复块在下一次用户输入或 `SessionStart(compact)` 时消费一次，同回合自动续跑是否收到注入仍取决于宿主事件。Hook 会持久化有界用户/助手文本摘录，不能据此保证任意自然语言中的敏感信息都被过滤；命令、工具参数和输出不会进入新快照。宿主仍须在重要发现、用户纠正和验证后主动更新检查点。普通原话检索通过常驻 MCP 完成，不注册 `PostToolUse`。
 
 Windows `commandWindows` 显式启动 PowerShell，以编码命令保护中文、空格和单引号参数；编码不用于存放秘密。输入仍为 64 KiB 上限；超大事件跳过且不阻止原任务。收据只保存标识字段，Codex 另包括 `turn_id/tool_use_id`，会话状态按宿主隔离。
 
-本机 Codex CLI `0.164.0-alpha.11.1` 的 Hooks 开关为 stable/enabled；2026-10-27 已读取 [官方 Hooks](https://developers.openai.com/codex/hooks) 与 [配置参考](https://developers.openai.com/codex/config-reference/)。原生 CLI 和真实模型曾验证 SessionStart 恢复、UserPromptSubmit 原话召回与提示词不落库；Phase 12 已移除 `UserPromptSubmit`、`PostToolUse` 和 `PreCompact` 的默认注册，历史收据只说明旧配置确实触发过，不代表当前安装。普通安装不会跳过 Hook 信任。
+本机 Codex CLI `0.166.0-alpha.5.1` 的 Hooks 开关为 stable/enabled；2026-10-27 已读取 [官方 Hooks](https://developers.openai.com/codex/hooks) 与 [配置参考](https://developers.openai.com/codex/config-reference/)。真实 Codex 线程的 `contextCompaction` 未触发旧的 `SessionStart(compact)` 路径，因此当前实现改用 `PreCompact` 保存快照、`UserPromptSubmit` 按需恢复；历史收据只说明旧配置确实触发过，不代表当前安装。普通安装不会跳过 Hook 信任，定义变化后需重新审查。
 
 ## 复制原创 Skill
 

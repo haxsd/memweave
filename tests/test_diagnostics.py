@@ -112,9 +112,14 @@ class DiagnosticsTests(unittest.TestCase):
 
     def test_unknown_hook_event_cannot_be_silently_recorded(self):
         self.service.initialize()
-        with self.assertRaises(DiagnosticError) as caught:
-            self.service.record_hook("cursor", "notAnEvent", {})
-        self.assertEqual(caught.exception.code, "UNSUPPORTED_CAPABILITY")
+        for client, event in (
+            ("cursor", "notAnEvent"), ("cursor", "afterMCPExecution"),
+            ("cursor", "afterFileEdit"), ("cursor", "stop"), ("cursor", "preCompact"),
+            ("codex", "Stop"), ("codex", "PostToolUse"),
+        ):
+            with self.subTest(client=client, event=event), self.assertRaises(DiagnosticError) as caught:
+                self.service.record_hook(client, event, {})
+            self.assertEqual(caught.exception.code, "UNSUPPORTED_CAPABILITY")
         self.assertEqual(self.service.status()["data"]["hook_receipt_count"], 0)
 
     def test_newer_schema_is_not_modified_by_initialization(self):

@@ -85,29 +85,22 @@ class WorktreeResolverTests(unittest.TestCase):
         self.assertEqual(second["id"], first["id"])
         self.assertEqual(len(self.call("project_list")["items"]), 1)
 
-    def test_codex_hook_accepts_worktree_context_and_edits(self):
+    def test_codex_hook_recovers_the_same_task_in_worktree(self):
         project = self.call(
             "project_register", root=str(self.repository), name="hook", operation_id="project",
         )
         task = self.call(
-            "task_open", project_id=project["id"], title="hook task", goal="observe worktree",
-            acceptance=["edit is recorded"], operation_id="task",
+            "task_open", project_id=project["id"], title="hook task", goal="resume worktree",
+            acceptance=["same task is recovered"], operation_id="task",
         )
 
         started = self.hook("SessionStart", source="startup")
         self.assertIn(task["id"], started["hookSpecificOutput"]["additionalContext"])
 
-        self.hook(
-            "PostToolUse",
-            tool_name="apply_patch",
-            tool_input={
-                "command": "*** Begin Patch\n*** Add File: worktree_file.py\n+pass\n*** End Patch",
-            },
-            tool_response={"success": True},
-        )
-        stopped = self.hook("Stop", stop_hook_active=False)
-        self.assertEqual(stopped.get("decision"), "block")
-        self.assertIn("memweave_", stopped.get("reason", ""))
+        self.hook("PreCompact", trigger="auto", session_id="unbound-worktree")
+        restored = self.hook("UserPromptSubmit", prompt="continue", session_id="unbound-worktree")
+        self.assertIn(task["id"], restored["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.hook("UserPromptSubmit", prompt="continue", session_id="unbound-worktree"), {})
 
     def hook(self, event, **parameters):
         payload = {

@@ -738,7 +738,15 @@ class Service:
             ],
             tasks_truncated=len(opened) > 20, pending_truncated=len(pending) > 20,
             phases_truncated=len(phases) > 20, work_units_truncated=len(work_units) > 20,
-            history=[task_summary(item) for item in recent_history],
+            history=[
+                {
+                    **{key: item.get(key) for key in (
+                        "id", "title", "status", "revision", "archived_at",
+                    )},
+                    "lifecycle": task_lifecycle_status(item),
+                }
+                for item in recent_history
+            ],
             history_truncated=len(archived) > 5,
             task_counts=self._task_counts(tasks),
         )

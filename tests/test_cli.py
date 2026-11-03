@@ -86,6 +86,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(server["args"][-1], str(self.home))
         self.assertEqual(Path(server["command"]), Path(sys.executable))
         self.assertEqual(server["env"]["PYTHONUTF8"], "1")
+        self.assertTrue(server["required"])
+        self.assertEqual(server["startup_readiness"], "catalog")
 
     def test_cursor_hook_command_quotes_powershell_literals(self):
         completed = self.command("config", "--client", "cursor", "--kind", "hooks")

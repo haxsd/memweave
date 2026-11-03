@@ -109,7 +109,9 @@ Candidate knowledge stays outside default search and context until explicit acti
 
 ## Recovery and hooks
 
-After compaction or host switching, recover the current task and latest next action, then inspect `git status`, relevant diffs and files. Hooks may inject recovery context, but delivery or receipts do not prove that a write succeeded.
+After compaction or host switching, if Codex provides a bounded pre-compaction snapshot, treat it as a hint only: first call `memweave_workspace_prepare` for the absolute execution root and matching intent, then read the current task and relevant diffs and files. If the tool is absent, report that memory is disconnected; do not claim recovery. Cursor startup injection remains best effort. Hooks and receipts do not prove that a write or model delivery succeeded.
+
+In Codex, checkpoint a user's correction or evidence that overturns the current approach before continuing implementation. Replace the obsolete conclusion in the latest findings and next step, stating what superseded it. At a change of approach, compare the next action with the current goal and acceptance; a pre-compaction snapshot does not override newer user instructions or evidence.
 
 When a Hook asks for one bounded maintenance action:
 

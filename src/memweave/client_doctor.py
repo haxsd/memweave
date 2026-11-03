@@ -186,6 +186,15 @@ def _project_server(root, client):
     ) else None
 
 
+def _same_server(left, right, client):
+    if client != "codex":
+        return left == right
+    policy = {"required", "startup_readiness"}
+    return {key: value for key, value in left.items() if key not in policy} == {
+        key: value for key, value in right.items() if key not in policy
+    }
+
+
 def _inspect_project(root, client, expected_home, source, registered, global_server):
     project = ProjectFiles(root, directory="." if client == "codex" else ".cursor")
     manifest_bytes = project.read(PROJECT_MANIFEST[client])
@@ -265,12 +274,12 @@ def _inspect_project(root, client, expected_home, source, registered, global_ser
         manifest_home_value = None
         toolset = _server_toolset(server)
 
-    if global_server is not None and server is not None and global_server != server:
+    if global_server is not None and server is not None and not _same_server(global_server, server, client):
         _add_issue(
             issues, "duplicate_mcp",
             "本机全局入口与项目入口指向不同服务，客户端可能发生遮蔽。", False,
         )
-    if manifest is not None and global_server is not None and global_server != manifest.get("server"):
+    if manifest is not None and global_server is not None and not _same_server(global_server, manifest["server"], client):
         _add_issue(
             issues, "duplicate_mcp",
             "本机全局入口与项目安装清单指向不同服务。", False,

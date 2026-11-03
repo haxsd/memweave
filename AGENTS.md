@@ -15,6 +15,6 @@
 - 同一 Git common directory 的 linked worktree 属于已登记项目，只能作为执行根，不得产生第二个 project 或 current；不同 clone 仍分别登记。Codex 侧栏的项目分组不会重绑已有线程的 `cwd`，worktree 缺少自己的 `.codex`/`.cursor` 受管入口、Skill 或 Hook 时必须用 `clients doctor` 发现并显式修复。
 - Cursor 接入必须以目标项目作为唯一工作区根目录，用 **File → Open Folder** 打开；不要用 **Add Folders** 把它并入 `work/evidence/` 下的测试夹具或其他多根工作区。当前 Hook 对多根工作区保持沉默，Cursor 也可能只读取第一个根的 `.cursor/hooks.json`。
 - Cursor 的项目级 MCP 配置存在不等于当前 Agent 会话已加载服务；必须在会话内启用/连接 MCP 并确认 `memweave_*` 工具出现。空的可选 Hook 标识和 Cursor 的 `/D:/...` 工作区路径必须按兼容输入处理，不能阻断启动上下文。
-- Hook 只处理会话开始、结束和中断清理等低频生命周期；不注册逐轮 Stop follow-up，文件编辑、工具调用和逐轮原话检索走常驻 MCP。不得重新引入 `Stop`、`PostToolUse`、`afterMCPExecution`、`afterFileEdit`、`UserPromptSubmit` 或 `PreCompact` 的默认注册。
+- Hook 只处理会话生命周期。Codex 额外允许 `PreCompact`（压缩前保存有界快照）和 `UserPromptSubmit`（仅在待恢复快照存在时注入；无 pending 时快速空返回且不写逐轮 receipt），二者只服务压缩恢复；不得注册其它 `Stop`、`PostToolUse`、`afterMCPExecution`、`afterFileEdit` 或逐轮原话检索。Cursor 仍只注册 `sessionStart/sessionEnd`。
 - 客户端配置或安装器发生变化后运行 `memweave clients doctor`，检查活动库登记项目、Codex 已知项目及其 linked worktree 的旧 home、重复入口、Hook 与受管资源；`--fix` 只修项目级受管安装且必须保留备份，全局配置与人工修改不得静默覆盖。
 - `.venv/`、`.git/`、`.codex/`、`.agents/` 和用户目标仓库的未提交改动不属于可清理垃圾。删除前仍要核对精确绝对路径。

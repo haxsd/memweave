@@ -5,7 +5,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from memweave.codex_hooks import CodexHooks
 from memweave.services import Service
 
 
@@ -39,10 +41,6 @@ class CodexHookTests(unittest.TestCase):
     def task(self):
         return self.call("task_open", project_id=self.project["id"], title="fix", goal="verify change",
                          acceptance=["regression passes"], operation_id="task")
-
-    def observe(self, name, parameters, response):
-        return self.hook("PostToolUse", tool_name="mcp__memweave__memweave_" + name,
-                         tool_input=parameters, tool_response={"structuredContent": {"status": "ok", "data": response}})
 
     def test_start_context_uses_codex_protocol_and_auto_resumes_unique_task(self):
         self.call("memory_write", project_id=self.project["id"], title="policy",
@@ -93,7 +91,7 @@ class CodexHookTests(unittest.TestCase):
         response = self.hook("SessionStart", source="startup", cwd=str(nested))
         self.assertEqual(response, {})
 
-    def test_user_prompt_recalls_by_user_wording_deduplicates_and_does_not_persist_prompt(self):
+    def test_user_prompt_without_compaction_snapshot_is_empty_and_does_not_persist_prompt(self):
         self.call(
             "memory_write", project_id=self.project["id"], title="任务接续方法",
             body=(
@@ -105,10 +103,7 @@ class CodexHookTests(unittest.TestCase):
         )
         prompt = "resume previous work in another client PRIVATE_PROMPT_TOKEN_9f3a"
         first = self.hook("UserPromptSubmit", prompt=prompt, turn_id="turn-2")
-        text = first["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("任务接续方法", text)
-        self.assertIn("切换工具前保存检查点", text)
-        self.assertIn("可能不适用", text)
+        self.assertEqual(first, {})
         self.assertEqual(self.hook("UserPromptSubmit", prompt=prompt, turn_id="turn-3"), {})
         with self.service.vault.diagnostics._connect() as connection:
             dump = "\n".join(connection.iterdump())
@@ -134,110 +129,71 @@ class CodexHookTests(unittest.TestCase):
         self.assertNotIn("任务接续方法", text)
         self.assertNotIn("recent background", text)
 
-    def test_real_work_without_task_prompts_capture_once_without_fabricating_records(self):
-        self.hook("PostToolUse", tool_name="apply_patch",
-                  tool_input={"command": "*** Begin Patch\n*** Add File: main.py\n+pass\n*** End Patch"},
-                  tool_response={"success": True})
-        response = self.hook("Stop", stop_hook_active=False)
-        self.assertEqual(response.get("decision"), "block")
-        self.assertIn("memweave_workspace_prepare", response["reason"])
-        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
-        self.assertEqual(self.hook("Stop", stop_hook_active=True, turn_id="followup"), {})
-        self.assertEqual(self.call("task_list", project_id=self.project["id"])["items"], [])
-
-    def test_task_checkpoint_and_consolidation_are_requested_from_actual_state(self):
-        self.service.start()
-        self.addCleanup(self.service.close)
+    def test_resume_after_compaction_finds_current_task_and_preserves_privacy(self):
         task = self.task()
-        self.observe("task_open", {"project_id": self.project["id"]}, task)
-        response = self.hook("Stop", stop_hook_active=False)
-        self.assertIn("memweave_task_checkpoint", response.get("reason", ""))
-        saved = self.call("task_checkpoint", task_id=task["id"], expected_revision=1, expected_etag=task["etag"],
-                          findings="located cause", progress="not tested", next_step="run regression", operation_id="cp")
-        self.observe("task_checkpoint", {"task_id": task["id"]}, saved)
-        self.assertEqual(self.hook("Stop", stop_hook_active=False, turn_id="turn-2"), {})
-        self.hook("PostToolUse", tool_name="Bash", tool_input={"command": "python -m unittest"},
-                  tool_response={"exit_code": 1, "stdout": "PRIVATE_OUTPUT"})
-        self.assertIn("memweave_task_checkpoint", self.hook(
-            "Stop", stop_hook_active=False, turn_id="turn-2"
-        ).get("reason", ""))
-
-    def test_resume_after_compaction_uses_explicitly_bound_task_and_preserves_privacy(self):
-        task = self.task()
-        self.observe("task_open", {}, task)
-        saved = self.call("task_checkpoint", task_id=task["id"], expected_revision=1, expected_etag=task["etag"],
-                          findings="cause", progress="unverified", next_step="NEXT_ACTION_PRESERVED", operation_id="cp")
-        self.observe("task_checkpoint", {"task_id": task["id"]}, saved)
-        compact = self.hook("SessionStart", source="compact", transcript_path="PRIVATE_TRANSCRIPT")
-        self.assertIn("NEXT_ACTION_PRESERVED", compact["hookSpecificOutput"]["additionalContext"])
+        self.call("task_checkpoint", task_id=task["id"], expected_revision=1, expected_etag=task["etag"],
+                  findings="cause " * 600, progress="unverified " * 300,
+                  failures="unresolved " * 300, next_step="NEXT_ACTION_PRESERVED", operation_id="cp")
+        receipts = self.service.vault.diagnostics.status()["data"]["hook_receipt_count"]
+        self.assertEqual(self.hook("UserPromptSubmit", prompt="ordinary prompt"), {})
+        self.assertEqual(
+            self.service.vault.diagnostics.status()["data"]["hook_receipt_count"],
+            receipts,
+        )
+        transcript = Path(self.temporary.name) / "transcript.jsonl"
+        transcript.write_text(
+            '{"type":"response_item","payload":{"type":"message","role":"user",'
+            '"content":[{"type":"input_text","text":"PRECOMPACT_USER_DETAIL"}]}}\n'
+            + json.dumps({"type": "response_item", "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "PRECOMPACT_ASSISTANT_DETAIL " + "context " * 300}],
+            }}) + "\n"
+            + '{"type":"response_item","payload":{"type":"function_call",'
+            '"name":"exec_command","arguments":"{\\"cmd\\":\\"curl -H Bearer_SYNTHETIC_SECRET\\"}"}}\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            self.hook("PreCompact", trigger="auto", transcript_path=str(transcript)),
+            {},
+        )
+        compact = self.hook("UserPromptSubmit", prompt="continue after compaction")
+        text = compact["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("NEXT_ACTION_PRESERVED", text)
+        self.assertIn("PRECOMPACT_USER_DETAIL", text)
+        self.assertIn("PRECOMPACT_ASSISTANT_DETAIL", text)
+        self.assertLessEqual(len(text), 5000)
+        self.assertIn("exec_command", text)
+        self.assertNotIn("Bearer_SYNTHETIC_SECRET", text)
+        self.assertIn(
+            "PRECOMPACT_USER_DETAIL",
+            self.service.task_read(task["id"])["findings"],
+        )
         with self.service.vault.diagnostics._connect() as connection:
             dump = "\n".join(connection.iterdump())
-        self.assertNotIn("PRIVATE_TRANSCRIPT", dump)
+        self.assertNotIn(str(transcript), dump)
+        self.assertNotIn("Bearer_SYNTHETIC_SECRET", dump)
+        self.assertNotIn("Bearer_SYNTHETIC_SECRET", self.service.task_read(task["id"])["findings"])
+        self.assertEqual(self.hook("UserPromptSubmit", prompt="already restored"), {})
+        latest = self.service.task_read(task["id"])
+        self.hook("PreCompact", trigger="auto", transcript_path=str(transcript))
+        self.assertEqual(self.service.task_read(task["id"])["revision"], latest["revision"] + 1)
 
-    def test_interrupt_foreign_edits_and_failed_mcp_calls_do_not_restart_or_bind(self):
-        self.hook("PostToolUse", tool_name="apply_patch",
-                  tool_input={"command": "*** Begin Patch\n*** Add File: ../foreign.py\n+pass\n*** End Patch"},
-                  tool_response={"success": True})
-        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
-        self.hook("PostToolUse", tool_name="Bash", tool_input={"command": "pytest"},
-                  tool_response={"exit_code": 0})
+    def test_compaction_capture_and_consume_do_not_start_search(self):
+        task = self.task()
+        handler = CodexHooks(self.service.vault.diagnostics, self.root, service=self.service)
+        payload = {"session_id": "without-index", "cwd": str(self.root), "trigger": "auto"}
+        with patch.object(self.service, "start", side_effect=AssertionError("search unavailable")):
+            for event in ("UserPromptSubmit", "SessionStart"):
+                with self.subTest(event=event):
+                    self.assertEqual(handler.handle("PreCompact", payload), {})
+                    restored = handler.handle(event, {**payload, "prompt": "continue", "source": "compact"})
+                    self.assertIn(task["id"], restored["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.service.task_read(task["id"])["revision"], 3)
+
+    def test_session_end_discards_pending_compaction(self):
+        self.task()
+        self.hook("PreCompact", trigger="auto")
         self.hook("Interrupt")
-        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
-
-    def test_completed_task_prompts_review_then_stops_after_real_review(self):
-        self.service.start()
-        self.addCleanup(self.service.close)
-        task = self.task()
-        self.observe("task_open", {}, task)
-        closed = self.call(
-            "task_close", task_id=task["id"], expected_revision=task["revision"], expected_etag=task["etag"],
-            outcome="completed", summary="fixture completed", acceptance_results={"regression passes": "passed fixture"},
-            operation_id="close",
-        )
-        self.observe("task_close", {"task_id": task["id"]}, closed)
-        self.assertIn("memweave_memory_review", self.hook("Stop", stop_hook_active=False)["reason"])
-        review = self.call("memory_review", task_id=task["id"])
-        self.call(
-            "memory_review_complete", task_id=task["id"], expected_revision=review["task"]["revision"],
-            expected_etag=review["task"]["etag"], memory_ids=[], summary="No reusable knowledge.", operation_id="review",
-        )
-        self.assertEqual(self.hook("Stop", stop_hook_active=False, turn_id="turn-2"), {})
-
-    def test_failed_mcp_foreign_task_and_replayed_checkpoint_cannot_hide_new_work(self):
-        task = self.task()
-        self.hook("PostToolUse", tool_name="mcp__memweave__memweave_task_open", tool_input={},
-                  tool_response={"isError": True, "structuredContent": {"status": "ok", "data": task}})
-        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
-        self.observe("task_open", {}, task)
-        saved = self.call(
-            "task_checkpoint", task_id=task["id"], expected_revision=task["revision"],
-            expected_etag=task["etag"], findings="cause", progress="unverified", next_step="verify", operation_id="cp",
-        )
-        self.observe("task_checkpoint", {"task_id": task["id"]}, saved)
-        self.hook("PostToolUse", tool_name="Bash", tool_input={"command": "pytest"},
-                  tool_response={"exit_code": 1})
-        self.observe("task_checkpoint", {"task_id": task["id"]}, saved)
-        self.assertIn("memweave_task_checkpoint", self.hook("Stop", stop_hook_active=False)["reason"])
-
-    def test_session_end_clears_task_binding_and_never_persists_output(self):
-        task = self.task()
-        self.observe("task_open", {}, task)
-        self.hook("PostToolUse", tool_name="Bash", tool_input={"command": "pytest PRIVATE_COMMAND"},
-                  tool_response={"exit_code": 1, "stdout": "PRIVATE_OUTPUT"})
         self.hook("SessionEnd", reason="other")
-        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
-        with self.service.vault.diagnostics._connect() as connection:
-            dump = "\n".join(connection.iterdump())
-        self.assertNotIn("PRIVATE_COMMAND", dump)
-        self.assertNotIn("PRIVATE_OUTPUT", dump)
-
-    def test_read_only_mentions_and_foreign_validation_do_not_request_task_writes(self):
-        for command in ("rg pytest README.md", "echo pytest", "python -c \"print('pytest')\""):
-            self.hook("PostToolUse", tool_name="Bash", tool_input={"command": command},
-                      tool_response={"exit_code": 0})
-            self.assertEqual(self.hook("Stop", stop_hook_active=False), {}, command)
-        foreign = Path(self.temporary.name) / "foreign"
-        foreign.mkdir()
-        self.hook("PostToolUse", tool_name="Bash",
-                  tool_input={"command": "pytest", "workdir": str(foreign)}, tool_response={"exit_code": 1})
-        self.assertEqual(self.hook("Stop", stop_hook_active=False), {})
+        self.assertEqual(self.hook("UserPromptSubmit", prompt="continue"), {})
+        self.assertEqual(self.service.vault.diagnostics.hook_state("codex:codex-session"), {})

@@ -1,5 +1,7 @@
 # MemWeave AGPL 深度融合实施计划
 
+> 2026-11-02 当前聚焦修复（仅 Codex，尚未完成桌面验收）：真实场景出现压缩后断层、长任务沿用已被推翻的结论，以及服务运行但模型无 MCP 工具。复用现有入口：Codex 项目 MCP 设置 `required=true`、`startup_readiness="catalog"`；`PreCompact` 保存有界工作快照，下一次用户输入按需恢复；Skill 要求用户纠正先替换当前检查点中的旧结论。只做定向验证，不新增运行时或工具。必须区分本机配置/子进程验证与真实桌面压缩后的模型可见恢复；同一回合自动续跑尚无恢复注入证明。
+
 > 2026-10-29 Phase 14 结论：Codex 桌面新会话与真实压缩后恢复通过。Cursor `sessionStart` 的官方契约是 fire-and-forget；3.27.22 虽输出 `additional_context`，模型仍未收到启动块。两个 Cursor 原生会话（普通首轮、4 号检查点之后）都通过常驻 MCP + 项目 Rule/Skill 首轮 `workspace_prepare` 恢复，后一个读到 revision 5、4 个检查点和新的 next step。`hook_sessions.startup_context_emitted=true`（旧字段 `context_delivered`）不是模型交付证明。Cursor MCP 按项目/仓库启用一次。
 
 > 唯一有效的长期执行计划。创建于 2026-10-27。当前开发树已完成 Phase 0–14；Phase 10 增加架构记录受 revision/etag 保护的更新与遗忘、来源漂移保护、tombstone 和 knowledge/architecture 状态计数，Phase 11 把项目级状态与架构纠正/遗忘接入管理页，Phase 12 完成长期项目的有界任务历史、独立检查点、自动归档与非打断式低频 Hook，Phase 13 将 MCP 收敛为单一通用 22 工具面并完成产品价值复核，Phase 14 在真实 Codex/Cursor 会话验证新会话、检查点和压缩恢复。真实活动库已清除旧演示架构造成的 `graph_stale`，管理页已在真实浏览器完成 stale → 显式重扫纠正 → 遗忘闭环。`github-radar` 的四任务顺序链路、真实 `task_close`、文件编辑和旧 Stop 证据保留为历史；Codex CLI 与桌面 App 已产生成功 `SessionStart`/`SessionEnd` 收据；Cursor MCP 首轮恢复已验证，但模型可见启动注入和 `preCompact` 仍无通过证据。0.2.5 私有开发快照已提交推送；公开标签和 GitHub Release 尚未执行。除本文件外，不再新增逐轮 plan/report。
@@ -311,6 +313,8 @@
 - [x] `task_list` 改为默认可用的有界历史入口，支持状态、标题/目标/摘要查询、limit/offset 和总数；归档已完成审查任务与已取消任务，默认不混入活动队列。
 - [x] 检查点改为独立 Markdown 记录；任务正文和阶段收束不再无限追加。`task_read` 对 phases、checkpoints、WorkUnits 返回有界摘要与总数，并支持显式分页读取历史。
 - [x] 统一 Hook 热路径：Codex、Cursor 默认只注册会话生命周期事件；文件编辑、工具调用和每轮原话召回改走常驻 MCP，`setup` 清理旧的高频受管事件，不提供“轻量版/全量版”双轨。
+- [x] 2026-11-02 Codex 压缩恢复 P1：真实 3 次 `contextCompaction` 未触发旧 `SessionStart(compact)`；增加有界 `PreCompact` 快照和 pending `UserPromptSubmit` 恢复，未改变 Cursor、22 工具或 `PREPARE_REQUIRED`。
+- [ ] 当前 Codex 定义重载后，在真实会话确认工具目录可用、PreCompact 自动捕获、首个用户输入收到恢复块，并观察纠正后的检查点不再沿用过期结论。
 - [x] 活动库迁移保持原始 Markdown 不丢失；真实项目验证长期队列、归档检索和恢复路径，运行定向与全量回归。
 - [x] 更新 API、README、Agent guide、continuity Skill 与 CURRENT_STATE；同步本机客户端资源，并记录需要重载 MCP 才能使用新接口的边界。
 
@@ -393,6 +397,14 @@
 - [x] 增加 `tests/test_startup.py`，验证导入 `memweave.server` 不加载重型 `memweave.services`；更新 Setup/Hook 文案断言。
 - [x] 冷启动三次：`tools/list` 1.372/1.367/1.337 秒，均为 22 工具；首次 `status` 3.622/3.502/3.543 秒，`workspace_prepare` 均 ready。`memweave.server` 导入由 2.75 秒降至 1.52 秒。
 - [x] 定向 43 项（Hooks/Setup/Toolset/Workspace gate）与 13 项真实 stdio MCP/Hook-MCP 全部通过；`clients doctor` 修复受管资源后复检 8/8，Codex/Cursor/worktree `check --probe` 均 22 工具；全量 219 tests / 1 skipped / OK（656.644 秒）。
+
+### Codex 压缩恢复审查收尾（2026-11-02）
+
+- [x] 恢复文本纳入最新检查点 findings；默认准备只返回近期归档标识摘要，不追加重复任务正文或无查询的文件清单。
+- [x] 压缩快照只保存工具名称，不保存命令和工具参数；捕获及消费不启动搜索索引，包括已有 pending 的 `SessionStart(compact)`。
+- [x] 删除不再注册的逐工具、逐编辑、Stop 与逐轮检索实现及其旧测试，保留安装迁移清理。
+- [x] 36 项不同的定向用例通过（含相关修改后重跑，共 39 次成功执行）：纠正可见、合成凭据不落库、索引不可用仍可捕获/恢复、跨客户端生命周期、worktree、历史切片、安装迁移、22 工具与 prepare 硬门；未跑全量回归。`compileall`、`git diff --check` 通过，Codex `clients doctor` 4/4 ready。
+- 19:59:52 本地时间产生真实 `PreCompact` 收据并写入 revision 6，本会话压缩后实际收到相符恢复块。该样本发生在本批修订前；新实现的下一次真实用户输入恢复、同回合自动续跑仍需分别观察，不能由子进程测试推断普遍交付。
 
 ## 风险与止损
 

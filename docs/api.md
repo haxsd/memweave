@@ -4,7 +4,9 @@
 
 当前 MCP 只有一个 22 个工具的通用面；下表描述的全部业务 action 仍可通过 CLI 使用。诊断探针、项目列表、完整上下文读取、架构遗忘和恢复入口不暴露给 Agent，分别走 CLI、内部探针或管理页。`workspace_prepare` 获取默认工作集，`memory_search` 返回当前知识版本与 etag；`memory_read`、`context_get`、`project_list`、`graph_forget` 和恢复动作仍保留在 CLI/管理路径。不提供 `core/full` 或轻量/全量选择，旧 `--toolset` 参数只为迁移兼容并被忽略。
 
-Hook 在内部复用同一只读 `workspace_prepare`：会话开始只恢复唯一 `current` 任务、运行中/阻塞 WorkUnit、待审查项和近期归档概况；queued 任务不会抢占。默认不注册逐轮 Stop。当前请求相关的原话检索和任务维护由 Agent 在常驻 MCP 中调用 `workspace_prepare`/`memory_search`；不再注册 `Stop`、`UserPromptSubmit`、`PostToolUse`、`afterMCPExecution` 或 `afterFileEdit`。Hook 不新增 MCP 工具，也不把原话写入业务记录或收据。Cursor 的 `additional_context` 不等于模型已收到；常驻 MCP 可用时，首个正常请求必须先恢复任务，不能等待启动块或要求用户重述。Agent 面 MCP 进程会硬拒绝：在本进程对某项目成功 `workspace_prepare`（`ready`/`no_active_task`）之前，其他项目工具返回 `PREPARE_REQUIRED`；`status`/`project_register`/`workspace_prepare` 不受限。CLI 与管理页默认不启用该硬门。
+会话开始时 Hook 复用只读 `workspace_prepare`，只恢复唯一 `current` 任务、运行中/阻塞 WorkUnit、待审查项和近期归档概况；queued 任务不会抢占。Codex 额外以 `PreCompact` 保存有界工作快照、以 `UserPromptSubmit` 消费 pending 快照，二者不启动搜索索引。快照可包含最近用户/助手文本摘录与工具名称，不包含命令、工具参数或输出；收据仍只保留元数据。默认不注册 `Stop`、`PostToolUse`、`afterMCPExecution` 或 `afterFileEdit`。普通检索和任务维护由 Agent 在常驻 MCP 中完成。Cursor 的 `additional_context` 不等于模型已收到；常驻 MCP 可用时，首个正常请求必须先恢复任务，不能等待启动块或要求用户重述。Agent 面 MCP 进程会硬拒绝：在本进程对某项目成功 `workspace_prepare`（`ready`/`no_active_task`）之前，其他项目工具返回 `PREPARE_REQUIRED`；`status`/`project_register`/`workspace_prepare` 不受限。CLI 与管理页默认不启用该硬门。
+
+默认恢复文本包含最新检查点的有界 `findings`，不追加重复任务正文；无显式查询时不列出无关文件节点。知识检索使用 `basic_memory_sqlite_fts5`，不为仅返回计数而额外展开关系上下文。`workspace_prepare.history` 最多包含 5 条归档的 `id/title/status/revision/archived_at/lifecycle`；完整摘要仍通过 `task_list` 或 `task_read` 显式读取。
 
 CLI、MCP 和网页共享 `Service`。CLI `call` 使用下表 action；MCP 使用 `memweave_` 前缀，状态工具名是 `memweave_system_status`。标准成功返回 `{status:"ok",data:...}`，失败为领域错误。MCP 使用协议工具错误，CLI 错误写 stderr 且退出码为 1。
 

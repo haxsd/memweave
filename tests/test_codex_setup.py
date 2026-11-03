@@ -39,14 +39,16 @@ class CodexSetupTests(unittest.TestCase):
         installed = self.command("setup")
         config = tomllib.loads((self.root / ".codex/config.toml").read_text(encoding="utf-8"))
         self.assertIn("memweave", config["mcp_servers"])
+        self.assertTrue(config["mcp_servers"]["memweave"]["required"])
+        self.assertEqual(config["mcp_servers"]["memweave"]["startup_readiness"], "catalog")
         self.assertTrue(config["features"]["hooks"])
         self.assertTrue((self.root / ".agents/skills/memweave-continuity/SKILL.md").is_file())
         hooks = json.loads((self.root / ".codex/hooks.json").read_text(encoding="utf-8"))
         self.assertEqual(
             set(hooks["hooks"]),
-            {"SessionStart", "Interrupt", "SessionEnd"},
+            {"SessionStart", "PreCompact", "UserPromptSubmit", "Interrupt", "SessionEnd"},
         )
-        self.assertFalse({"UserPromptSubmit", "PostToolUse", "PreCompact"} & set(hooks["hooks"]))
+        self.assertFalse({"PostToolUse", "Stop"} & set(hooks["hooks"]))
         self.assertTrue(installed["required_actions"])
         self.assertEqual((self.root / "AGENTS.md").read_text(), original)
         checked = self.command("check", "--probe")
@@ -103,7 +105,10 @@ class CodexSetupTests(unittest.TestCase):
         self.assertEqual(self.command("check", success=False)["state"], "needs_attention")
         self.command("setup")
         repaired = json.loads(hooks_path.read_text(encoding="utf-8"))["hooks"]
-        self.assertEqual(set(repaired), {"SessionStart", "Interrupt", "SessionEnd"})
+        self.assertEqual(
+            set(repaired),
+            {"SessionStart", "PreCompact", "UserPromptSubmit", "Interrupt", "SessionEnd"},
+        )
 
     def test_modified_skill_is_reported_and_not_overwritten(self):
         self.command("setup")

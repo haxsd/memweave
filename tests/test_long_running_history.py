@@ -89,6 +89,7 @@ class LongRunningHistoryTests(unittest.TestCase):
         self.assertEqual(archived["items"][0]["id"], tasks[0]["id"])
         self.assertEqual(archived["items"][0]["lifecycle"], "archived")
         self.assertIsNotNone(archived["items"][0]["archived_at"])
+        self.assertIn("findings", archived["items"][0])
 
         current = self.call("task_list", project_id=self.project, limit=5)
         self.assertEqual(current["total"], 24)
@@ -102,6 +103,9 @@ class LongRunningHistoryTests(unittest.TestCase):
         self.assertEqual(len(prepared["tasks"]), 20)
         self.assertTrue(prepared["tasks_truncated"])
         self.assertEqual([item["id"] for item in prepared["history"]], [tasks[0]["id"]])
+        self.assertNotIn("findings", prepared["history"][0])
+        self.assertNotIn("goal", prepared["history"][0])
+        self.assertNotIn("History:", prepared["context"]["text"])
         self.assertNotIn("历史批次零", prepared["context"]["text"])
 
     def test_checkpoints_are_individual_records_with_bounded_pages(self):

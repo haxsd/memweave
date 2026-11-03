@@ -155,13 +155,14 @@ MCP 的 `memweave_memory_write` 默认写入 `candidate`，任务检查点、阶
 ## Hook 与恢复
 
 - SessionStart 恢复 current 任务、运行中/阻塞 WorkUnit 和近期归档概况；queued 不抢占。
+- Codex `PreCompact` 保存有界的压缩前快照；下一次 `UserPromptSubmit` 只在快照待恢复时注入。无 pending 时快速空返回，不做逐轮召回。
 - Cursor 必须以单项目根目录打开；`Add Folders` 形成的多根工作区不会由 MemWeave 注入。
 - Cursor 即使已有项目级 `mcp.json`，也可能需要在当前 Agent 会话中手动启用/连接 MCP 服务；工具列表里出现 `memweave_*` 后，才可认为该会话接通。
 - 默认不注册逐轮 Stop。待审查任务、阻塞 WorkUnit 和待审查阶段在 SessionStart 或显式 MCP 读取时出现；Agent 在任务/阶段的自然边界静默完成维护，不因例行维护打断用户。
 - 同一用户请求内的非破坏性步骤应连续执行到请求完成，不因完成一个子步骤、写入一次检查点或产生一个中间结果就交回控制权；只有真实阻塞、必须由用户决策或破坏性操作才返回。
 - MemWeave 不提供逐轮续跑 Hook。宿主何时结束一轮由客户端与 Agent 决定；本产品的责任是移除额外的中断源，而不是强制无限轮次或伪造“仍在执行”的状态。
 - SessionEnd 清理该会话的最小运行状态；Interrupt 只标记中断。
-- 当前安装不再注册 `UserPromptSubmit`、`PostToolUse`、`PreCompact`、`afterMCPExecution` 或 `afterFileEdit`。当前请求相关的召回由 Agent 在常驻 MCP 中调用 `workspace_prepare`/`memory_search`；修改后的旧配置需重新运行 setup 并重载客户端。
+- Codex 默认注册 `SessionStart`、`PreCompact`、`UserPromptSubmit`、`Interrupt` 和 `SessionEnd`；`PreCompact` 只保存压缩快照，`UserPromptSubmit` 只消费 pending 快照。Cursor 仍只注册 `sessionStart/sessionEnd`。不注册 `Stop`、`PostToolUse`、`afterMCPExecution`、`afterFileEdit` 或逐轮原话检索；当前请求相关的召回仍由常驻 MCP 完成。
 - Hook 收据和探针只证明事件被记录，不证明业务写入、桌面自动触发或模型已经遵从。历史桌面证据中的高频事件属于 Phase 12 前配置，不代表当前 Hook 面。
 
 ## 安全边界

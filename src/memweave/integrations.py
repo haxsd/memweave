@@ -9,7 +9,9 @@ from memweave.diagnostics import DiagnosticError
 
 
 CURSOR_HOOK_EVENTS = ("sessionStart", "sessionEnd")
-CODEX_HOOK_EVENTS = ("SessionStart", "Interrupt", "SessionEnd")
+CODEX_HOOK_EVENTS = (
+    "SessionStart", "PreCompact", "UserPromptSubmit", "Interrupt", "SessionEnd",
+)
 CURSOR_LEGACY_HOOK_EVENTS = (
     "stop", "preCompact", "afterMCPExecution", "afterFileEdit",
 )
@@ -32,6 +34,10 @@ def server_command(home: Path, toolset: str | None = None, *, diagnostic: bool =
     }
 
 
+def codex_server_command(home: Path) -> dict:
+    return {**server_command(home), "required": True, "startup_readiness": "catalog"}
+
+
 def client_configuration(client: str, kind: str, home: Path, toolset: str | None = None, *, root=None) -> str:
     server = server_command(home)
     if kind == "hooks":
@@ -52,7 +58,7 @@ def client_configuration(client: str, kind: str, home: Path, toolset: str | None
                     "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand " + encoded,
                     "timeout": 3 if event in ("Interrupt", "SessionEnd") else 10,
                 }
-                if event == "SessionStart":
+                if event in ("SessionStart", "UserPromptSubmit"):
                     entry["additionalContextLimit"] = 5000
                 group = {"hooks": [entry]}
                 if event == "SessionStart":
@@ -80,6 +86,8 @@ def client_configuration(client: str, kind: str, home: Path, toolset: str | None
         "[mcp_servers.memweave]",
         "command = " + json.dumps(server["command"], ensure_ascii=False),
         "args = " + json.dumps(server["args"], ensure_ascii=False),
+        'required = true',
+        'startup_readiness = "catalog"',
         "",
         "[mcp_servers.memweave.env]",
         'PYTHONUTF8 = "1"',

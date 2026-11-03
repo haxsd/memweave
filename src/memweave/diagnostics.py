@@ -170,8 +170,8 @@ class Diagnostics:
 
     def record_hook(self, client: str, event: str, payload: dict) -> dict:
         events = {
-            "cursor": ("sessionStart", "sessionEnd", "preCompact", "afterMCPExecution", "afterFileEdit", "stop"),
-            "codex": ("SessionStart", "UserPromptSubmit", "PostToolUse", "PreCompact", "Stop", "Interrupt", "SessionEnd"),
+            "cursor": ("sessionStart", "sessionEnd"),
+            "codex": ("SessionStart", "UserPromptSubmit", "PreCompact", "Interrupt", "SessionEnd"),
         }
         if event not in events.get(client, ()):
             raise DiagnosticError("UNSUPPORTED_CAPABILITY", "This client event has no verified adapter.")
@@ -203,3 +203,19 @@ class Diagnostics:
             "source": "hook_entrypoint",
             "desktop_verification": "unverified",
         })
+
+    def hook_state(self, session_id: str) -> dict:
+        if not self.database.is_file():
+            return {}
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT state FROM hook_sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+            if row is None:
+                return {}
+            state = json.loads(row["state"])
+            return state if isinstance(state, dict) else {}
+        except (DiagnosticError, sqlite3.Error, ValueError, TypeError, RecursionError):
+            return {}
