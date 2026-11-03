@@ -190,6 +190,18 @@ class CodexHookTests(unittest.TestCase):
                     self.assertIn(task["id"], restored["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.service.task_read(task["id"])["revision"], 3)
 
+    def test_compaction_persist_retries_once_when_task_moved_on(self):
+        task = self.task()
+        handler = CodexHooks(self.service.vault.diagnostics, self.root, service=self.service)
+        stale = self.service.task_read(task["id"], checkpoint_limit=1)
+        self.call("task_checkpoint", task_id=task["id"], expected_revision=stale["revision"],
+                  expected_etag=stale["etag"], findings="moved on", progress="p",
+                  next_step="n", operation_id="moved")
+        handler.persist_compaction((stale, "SNAPSHOT_AFTER_CONFLICT"), {"session_id": "s", "trigger": "auto"})
+        latest = self.service.task_read(task["id"])
+        self.assertIn("SNAPSHOT_AFTER_CONFLICT", latest["findings"])
+        self.assertIn("moved on", latest["findings"])
+
     def test_session_end_discards_pending_compaction(self):
         self.task()
         self.hook("PreCompact", trigger="auto")

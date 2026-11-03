@@ -182,6 +182,17 @@ class CodexHooks(CursorHooks):
         task, snapshot = pending
         if task is None:
             return
+        for attempt in range(2):
+            if attempt:
+                # Task moved on since PreCompact read it; re-read once and retry.
+                try:
+                    task = self.service.task_read(task["id"], checkpoint_limit=1)
+                except (DiagnosticError, OSError, ValueError, TypeError, KeyError):
+                    return
+            if self._write_compaction(task, snapshot, payload):
+                return
+
+    def _write_compaction(self, task, snapshot, payload):
         try:
             previous = task.get("findings", "").split("\n\n[Pre-compaction snapshot]")[0]
             findings = (
@@ -196,8 +207,9 @@ class CodexHooks(CursorHooks):
                 next_step=task.get("next_step") or "Re-read the latest files and continue from the snapshot.",
                 operation_id=self.compaction_operation_id(payload),
             )
+            return True
         except (DiagnosticError, OSError, ValueError, TypeError, KeyError):
-            pass
+            return False
 
     def compaction_operation_id(self, payload):
         value = "precompact-{}-{}-{}-{}".format(

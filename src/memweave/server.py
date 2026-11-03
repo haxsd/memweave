@@ -145,6 +145,8 @@ def create_server(
             loaded = get_service()
         except DiagnosticError as error:
             raise ToolError(str(error)) from error
+        except Exception as error:
+            raise ToolError(f"MemWeave service failed to start: {error}") from error
         return invoke(loaded.dispatch, action, parameters)
 
     @server.tool(annotations=read_only, structured_output=True)
