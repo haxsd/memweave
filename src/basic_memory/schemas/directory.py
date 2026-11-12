@@ -1,0 +1,54 @@
+"""Schemas for directory tree operations."""
+
+from datetime import datetime
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel
+
+DEFAULT_DIRECTORY_PAGE_SIZE = 10
+MAX_DIRECTORY_PAGE_SIZE = 200
+
+type DirectorySortOrder = Literal[
+    "title_asc",
+    "title_desc",
+    "updated_asc",
+    "updated_desc",
+]
+
+
+class DirectoryNode(BaseModel):
+    """Directory node in file system."""
+
+    name: str
+    file_path: Optional[str] = None  # Original path without leading slash (matches DB)
+    directory_path: str  # Path with leading slash for directory navigation
+    type: Literal["directory", "file"]
+    children: List["DirectoryNode"] = []  # Default to empty list
+    title: Optional[str] = None
+    permalink: Optional[str] = None
+    external_id: Optional[str] = None  # UUID (primary API identifier for v2)
+    entity_id: Optional[int] = None  # Internal numeric ID
+    note_type: Optional[str] = None
+    content_type: Optional[str] = None
+    # Short format name ("pdf", "png", ...) stored in a non-Markdown file entity's
+    # metadata at index time. None for notes, directories, and unrecognized types.
+    format: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+    @property
+    def has_children(self) -> bool:
+        return bool(self.children)
+
+
+class DirectoryListResponse(BaseModel):
+    """One bounded page of directory-listing results."""
+
+    nodes: List[DirectoryNode]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+# Support for recursive model
+DirectoryNode.model_rebuild()

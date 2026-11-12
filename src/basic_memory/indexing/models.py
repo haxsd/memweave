@@ -1,0 +1,995 @@
+"""Typed models for the reusable indexing execution path."""
+
+from __future__ import annotations
+
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
+from typing import override, Any, Protocol, TYPE_CHECKING
+
+from basic_memory.indexing.embedding_index_planning import (
+    EmbeddingIndexJobRequest,
+    EmbeddingIndexTarget,
+)
+from basic_memory.indexing.file_index_planning import (
+    FileIndexDecision,
+    FileIndexDecisionStatus,
+)
+from basic_memory.markdown.sections import MarkdownSection
+from basic_memory.read_cache.contract import ReadCacheChange
+from basic_memory.indexing.project_index_progress import (
+    ProjectIndexBatchCounterUpdate,
+    ProjectIndexCounters,
+    ProjectIndexFileOutcome,
+    apply_project_index_batch_outcomes,
+    summarize_project_index_file_outcomes,
+)
+from basic_memory.runtime.jobs import RuntimeStorageFileIndexMode
+from basic_memory.runtime.note_object_metadata import (
+    RuntimeNoteObjectMetadataMap,
+    RuntimeNoteObjectProvenance,
+    db_version_from_object_metadata,
+    file_checksum_from_object_metadata,
+)
+from basic_memory.runtime.storage import (
+    NoteExternalId,
+    ProjectExternalId,
+    ProjectName,
+    RuntimeFileChecksum,
+    RuntimeFilePath,
+    RuntimeNoteActorKind,
+    RuntimeNoteActorName,
+    RuntimeNoteChangeSource,
+    RuntimeNoteContentChecksum,
+    StorageEtag,
+    normalize_storage_etag,
+)
+from basic_memory.temporal import TemporalAssertion
+
+if TYPE_CHECKING:  # pragma: no cover
+    from basic_memory.models import Entity
+
+
+@dataclass(slots=True)
+class IndexFileMetadata:
+    """Storage-agnostic metadata for a file queued for indexing."""
+
+    path: str
+    size: int
+    checksum: str | None = None
+    content_type: str | None = None
+    last_modified: datetime | None = None
+    created_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class IndexInputFile(IndexFileMetadata):
+    """Fully loaded file payload consumed by the batch executor."""
+
+    content: bytes | None = None
+
+
+@dataclass(slots=True)
+class IndexBatch:
+    """A deterministic batch of files bounded by count and total bytes."""
+
+    paths: list[str]
+    total_bytes: int
+
+
+@dataclass(slots=True)
+class IndexProgress:
+    """Batch indexing progress emitted to callers such as the CLI."""
+
+    files_total: int
+    files_processed: int
+    batches_total: int
+    batches_completed: int
+    current_batch_bytes: int = 0
+    files_per_minute: float = 0.0
+    eta_seconds: float | None = None
+
+
+@dataclass(slots=True)
+class IndexFrontmatterUpdate:
+    """A typed frontmatter write request for a single file."""
+
+    path: str
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class IndexFrontmatterWriteResult:
+    """Typed result for a frontmatter write performed during indexing."""
+
+    checksum: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class RelationTargetRequest:
+    """One relation target to resolve, and the note a path target is relative to.
+
+    Identity targets (titles, permalinks, external ids) mean the same thing from
+    every note, so they carry no source and one lookup serves them all. A path
+    target means one file per source note, so its source path is part of the key.
+    """
+
+    link_text: str
+    source_path: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedRelation:
+    """One parsed outgoing relation waiting for generation-owned publication."""
+
+    relation_type: str
+    target_name: str
+    context: str | None
+    target_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedObservation:
+    """One parsed observation waiting for generation-owned publication."""
+
+    content: str
+    category: str | None
+    context: str | None
+    tags: list[str] | None
+    # Authored valid time (SPEC-82). Published as its own projection keyed on the
+    # observation row this write creates, never as observation columns.
+    temporal: tuple[TemporalAssertion, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedSection:
+    """One heading-bounded body span waiting for generation-owned publication."""
+
+    heading: str
+    level: int
+    heading_path: str
+    duplicate_index: int
+    start_line: int
+    end_line: int
+    start_offset: int
+    end_offset: int
+
+
+def indexed_sections_from_markdown(
+    sections: Sequence[MarkdownSection],
+) -> tuple[IndexedSection, ...]:
+    """Flatten parsed section paths into the publishable projection shape."""
+    return tuple(
+        IndexedSection(
+            heading=section.heading,
+            level=section.level,
+            heading_path=section.heading_path,
+            duplicate_index=section.duplicate_index,
+            start_line=section.start_line,
+            end_line=section.end_line,
+            start_offset=section.start_offset,
+            end_offset=section.end_offset,
+        )
+        for section in sections
+    )
+
+
+@dataclass(slots=True)
+class IndexedEntity:
+    """Stable output describing one file that finished indexing successfully."""
+
+    path: str
+    entity_id: int
+    permalink: str | None
+    checksum: str
+    # Byte length of the stored content this pass read and parsed (the loaded
+    # input file's bytes, before any frontmatter normalization rewrite).
+    indexed_bytes: int
+    content_type: str | None = None
+    markdown_content: str | None = None
+    observations: tuple[IndexedObservation, ...] = ()
+    sections: tuple[IndexedSection, ...] = ()
+    relations: tuple[IndexedRelation, ...] = ()
+    resolve_relations: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class RelationGenerationBatchResult:
+    """Relation publication and legacy resolution outcome for one indexed batch."""
+
+    errors: tuple[tuple[str, str], ...] = ()
+    relations_resolved: int = 0
+    relations_unresolved: int = 0
+
+
+class FileIndexOperation(StrEnum):
+    """Database operation used for one indexed markdown file."""
+
+    created = "created"
+    updated = "updated"
+
+
+def file_index_operation_from_note_object_metadata(
+    metadata: RuntimeNoteObjectMetadataMap | None,
+) -> FileIndexOperation | None:
+    """Infer the file-index operation from accepted note object metadata."""
+    db_version = db_version_from_object_metadata(metadata)
+    if db_version is None:
+        return None
+    return FileIndexOperation.created if db_version == 1 else FileIndexOperation.updated
+
+
+@dataclass(frozen=True, slots=True)
+class FileIndexResult:
+    """Result for one successfully indexed file."""
+
+    file_path: str
+    entity_id: int
+    external_id: str
+    title: str
+    permalink: str | None
+    # The storage checksum of the bytes indexed (an S3 ETag in cloud, the content
+    # sha256 locally); recorded as entity.checksum.
+    checksum: str
+    # sha256 of the markdown indexed, comparable with a note object's bm-file-checksum;
+    # None for regular (non-note) files.
+    content_checksum: RuntimeNoteContentChecksum | None
+    operation: FileIndexOperation
+    # Byte length of the stored content the indexer read and indexed. For both
+    # Markdown and regular files this is the full stored object read from storage.
+    indexed_bytes: int
+    # The indexed snapshot committed successfully, but a newer accepted note
+    # generation won before derived relations could be published. The next
+    # coalesced write owns convergence; callers must not enqueue stale followups.
+    content_superseded: bool = False
+    # The entity's stored MIME type. Indexers always set it through from_fields;
+    # None only appears on results built directly by older callers.
+    content_type: str | None = None
+    # The row is new, or its title or permalink differ from before this pass. Name
+    # lookups and the links rendered in other notes may have changed. Defaults to
+    # True so a result that cannot tell retires the whole project's reads.
+    identity_changed: bool = True
+    # Notes whose incoming links this pass republished (see RelationPublishOutcome).
+    detached_note_ids: frozenset[str] = frozenset()
+
+    @property
+    def read_cache_change(self) -> ReadCacheChange:
+        """The cached reads this index pass made stale."""
+        if self.identity_changed:
+            return ReadCacheChange.whole_project()
+        return ReadCacheChange.note_content({self.external_id, *self.detached_note_ids})
+
+    @classmethod
+    def from_fields(
+        cls,
+        *,
+        file_path: str,
+        entity_id: int,
+        external_id: object,
+        title: object,
+        permalink: object,
+        checksum: str,
+        content_checksum: RuntimeNoteContentChecksum | None,
+        operation: FileIndexOperation,
+        indexed_bytes: int,
+        content_type: str,
+        content_superseded: bool = False,
+        identity_changed: bool = True,
+        detached_note_ids: frozenset[str] = frozenset(),
+    ) -> FileIndexResult:
+        """Validate entity fields loaded for a completed file-index result.
+
+        Identity fields arrive as raw ORM values; a blank or non-string value
+        is a broken index row, so the job fails here instead of publishing a
+        malformed result downstream.
+        """
+        return cls(
+            file_path=file_path,
+            entity_id=entity_id,
+            external_id=_required_file_index_result_text(
+                external_id,
+                field_name="external_id",
+                file_path=file_path,
+            ),
+            title=_required_file_index_result_text(
+                title,
+                field_name="title",
+                file_path=file_path,
+            ),
+            permalink=_optional_file_index_result_text(
+                permalink,
+                field_name="permalink",
+                file_path=file_path,
+            ),
+            checksum=checksum,
+            content_checksum=content_checksum,
+            operation=operation,
+            indexed_bytes=indexed_bytes,
+            content_superseded=content_superseded,
+            content_type=content_type,
+            identity_changed=identity_changed,
+            detached_note_ids=detached_note_ids,
+        )
+
+
+def _required_file_index_result_text(
+    value: object,
+    *,
+    field_name: str,
+    file_path: str,
+) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"Indexed entity for {file_path} is missing {field_name}")
+    return value.strip()
+
+
+def _optional_file_index_result_text(
+    value: object,
+    *,
+    field_name: str,
+    file_path: str,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeError(f"Indexed entity for {file_path} has invalid {field_name}")
+    if not value.strip():
+        raise RuntimeError(f"Indexed entity for {file_path} has blank {field_name}")
+    return value.strip()
+
+
+class IndexFileJobStatus(StrEnum):
+    """Normal outcomes for an index-file job."""
+
+    processed = "processed"
+    current = "current"
+    missing = "missing"
+    failed = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class IndexFileJobResult:
+    """Summary of what happened while processing one file-index job."""
+
+    status: IndexFileJobStatus
+    reason: str
+    entity_id: int | None = None
+    note_external_id: str | None = None
+    title: str | None = None
+    permalink: str | None = None
+    entity_checksum: str | None = None
+    # sha256 of the indexed markdown, the same kind of checksum an accepted write
+    # records. entity_checksum is the storage checksum, an S3 ETag in cloud, so
+    # only this one can identify a note version across writers.
+    content_checksum: RuntimeNoteContentChecksum | None = None
+    operation: FileIndexOperation | None = None
+    actor_user_profile_id: str | None = None
+    actor_kind: str | None = None
+    actor_name: str | None = None
+    live_update_source: str | None = None
+    # Accepted DB version mirrored on the trusted object metadata (#1589):
+    # carried into note-level live updates so consumers can decide
+    # echo-vs-out-of-band by version arithmetic. None when the metadata was
+    # absent or failed checksum validation.
+    db_version: int | None = None
+    # True when the stored object changed after this job read it: a newer write
+    # landed mid-job, so this result describes superseded content (issue #1445).
+    # That write's own storage notification indexes the newer content.
+    content_superseded: bool = False
+    # Bytes of stored content this job actually indexed, for work-unit billing.
+    # Only a processed, non-superseded file reports bytes; current, missing,
+    # failed, and superseded outcomes report 0.
+    indexed_bytes: int = 0
+    # The indexed entity's stored MIME type, set on processed and current results
+    # that name an entity. Consumers decide follow-up work (document extraction)
+    # from this stored type rather than re-deriving it from the file extension.
+    content_type: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IndexFileEmbeddingJobContext:
+    """Index-file facts needed to decide whether embeddings should be queued."""
+
+    project_id: int
+    index_embeddings: bool
+    result: IndexFileJobResult
+
+
+def plan_index_file_embedding_job(
+    context: IndexFileEmbeddingJobContext,
+) -> EmbeddingIndexJobRequest | None:
+    """Plan single-entity embedding work after one file-index job."""
+    if not context.index_embeddings:
+        return None
+    if context.result.status != IndexFileJobStatus.processed:
+        return None
+    if context.result.content_superseded:
+        return None
+    if context.result.entity_id is None:
+        raise RuntimeError("index_file processed without an entity id")
+    if context.result.entity_checksum is None:
+        raise RuntimeError("index_file processed without an entity checksum")
+
+    return EmbeddingIndexJobRequest(
+        project_id=context.project_id,
+        entity_id=context.result.entity_id,
+        entity_checksum=context.result.entity_checksum,
+    )
+
+
+class IndexFileNoteLiveUpdateType(StrEnum):
+    """Note-level live-update events produced by file indexing."""
+
+    note_created = "note.created"
+    note_updated = "note.updated"
+
+
+@dataclass(frozen=True, slots=True)
+class IndexFileNoteLiveUpdateContext:
+    """Queue-neutral context needed to plan one note-level file-index update."""
+
+    project_external_id: ProjectExternalId | None
+    project_name: ProjectName | None
+    file_path: RuntimeFilePath
+    mode: RuntimeStorageFileIndexMode
+    object_etag: StorageEtag | None = None
+    object_size: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IndexFileNoteLiveUpdatePlan:
+    """Typed note-level update that an adapter can publish through its transport."""
+
+    event_type: IndexFileNoteLiveUpdateType
+    source: RuntimeNoteChangeSource
+    project_external_id: ProjectExternalId
+    project_name: ProjectName
+    note_external_id: NoteExternalId
+    note_path: RuntimeFilePath
+    note_version_etag: StorageEtag | None
+    content_checksum: RuntimeNoteContentChecksum | None
+    file_checksum: StorageEtag | None
+    file_size_bytes: int | None
+    title: str
+    permalink: str
+    actor_user_profile_id: str | None = None
+    actor_kind: RuntimeNoteActorKind | None = None
+    actor_name: RuntimeNoteActorName | None = None
+    # Accepted DB version from trusted object metadata (#1589); None when the
+    # metadata was absent or failed checksum validation.
+    db_version: int | None = None
+
+
+DEFAULT_INDEX_FILE_NOTE_LIVE_UPDATE_SOURCE: RuntimeNoteChangeSource = "s3_webhook"
+
+
+def index_file_job_result_from_decision(
+    decision: FileIndexDecision,
+) -> IndexFileJobResult:
+    """Convert a terminal file-index decision into a job result."""
+    if decision.status == FileIndexDecisionStatus.current:
+        return IndexFileJobResult(
+            status=IndexFileJobStatus.current,
+            reason=decision.reason,
+        )
+    if decision.status == FileIndexDecisionStatus.missing:
+        return IndexFileJobResult(
+            status=IndexFileJobStatus.missing,
+            reason=decision.reason,
+        )
+    raise RuntimeError(f"Unexpected file index decision: {decision.status}")
+
+
+def index_file_job_result_from_indexed_file(
+    indexed_file: FileIndexResult,
+    *,
+    live_update_plan: IndexedFileLiveUpdatePlan | None = None,
+) -> IndexFileJobResult:
+    """Convert a successful file-index result into the queue job result."""
+    operation = indexed_file.operation
+    if live_update_plan is not None and live_update_plan.operation is not None:
+        operation = live_update_plan.operation
+    content_superseded = indexed_file.content_superseded or (
+        live_update_plan.content_superseded if live_update_plan is not None else False
+    )
+
+    return IndexFileJobResult(
+        status=IndexFileJobStatus.processed,
+        reason=f"file indexed: {indexed_file.file_path}",
+        entity_id=indexed_file.entity_id,
+        note_external_id=indexed_file.external_id,
+        title=indexed_file.title,
+        permalink=indexed_file.permalink,
+        entity_checksum=indexed_file.checksum,
+        content_checksum=indexed_file.content_checksum,
+        content_type=indexed_file.content_type,
+        operation=operation,
+        actor_user_profile_id=(
+            live_update_plan.actor_user_profile_id if live_update_plan is not None else None
+        ),
+        actor_kind=live_update_plan.actor_kind if live_update_plan is not None else None,
+        actor_name=live_update_plan.actor_name if live_update_plan is not None else None,
+        live_update_source=(
+            live_update_plan.live_update_source if live_update_plan is not None else None
+        ),
+        db_version=live_update_plan.db_version if live_update_plan is not None else None,
+        content_superseded=content_superseded,
+        # A superseded result describes content a newer write replaced; that
+        # write's own job bills its bytes, so this one reports none.
+        indexed_bytes=0 if content_superseded else indexed_file.indexed_bytes,
+    )
+
+
+def plan_index_file_note_live_update(
+    context: IndexFileNoteLiveUpdateContext,
+    result: IndexFileJobResult,
+) -> IndexFileNoteLiveUpdatePlan | None:
+    """Plan a note-level live update for one externally observed file index.
+
+    Workflow-scoped bulk indexing must not publish per-note updates — runtimes
+    that track workflow membership (cloud) apply that gate before building this
+    context.
+    """
+    if context.mode != RuntimeStorageFileIndexMode.observed_object:
+        return None
+    if result.status == IndexFileJobStatus.current and result.live_update_source is None:
+        return None
+    if result.status not in (IndexFileJobStatus.processed, IndexFileJobStatus.current):
+        return None
+    if result.permalink is None:
+        return None
+
+    project_external_id = _required_index_file_note_live_update_text(
+        context.project_external_id,
+        field_name="project_external_id",
+    )
+    project_name = _required_index_file_note_live_update_text(
+        context.project_name,
+        field_name="project_name",
+    )
+    note_external_id = _required_index_file_note_live_update_text(
+        result.note_external_id,
+        field_name="note_external_id",
+    )
+    title = _required_index_file_note_live_update_text(
+        result.title,
+        field_name="title",
+    )
+    permalink = _required_index_file_note_live_update_text(
+        result.permalink,
+        field_name="permalink",
+    )
+    if result.operation is None:
+        raise RuntimeError("Observed_object index_file result is missing operation")
+
+    event_type = (
+        IndexFileNoteLiveUpdateType.note_created
+        if result.operation == FileIndexOperation.created
+        else IndexFileNoteLiveUpdateType.note_updated
+    )
+    normalized_etag = (
+        normalize_storage_etag(context.object_etag) if context.object_etag is not None else None
+    )
+    return IndexFileNoteLiveUpdatePlan(
+        event_type=event_type,
+        source=result.live_update_source or DEFAULT_INDEX_FILE_NOTE_LIVE_UPDATE_SOURCE,
+        project_external_id=project_external_id,
+        project_name=project_name,
+        note_external_id=note_external_id,
+        note_path=context.file_path,
+        note_version_etag=normalized_etag,
+        # Superseded content (a newer own-stack write overwrote the object
+        # mid-job) publishes as a state-refresh only: a content_checksum here
+        # would invite the collaboration relay to reconcile open documents to
+        # the stale version. The newer write's own webhook job carries the
+        # current checksum.
+        content_checksum=None if result.content_superseded else result.content_checksum,
+        file_checksum=normalized_etag,
+        file_size_bytes=context.object_size,
+        title=title,
+        permalink=permalink,
+        actor_user_profile_id=result.actor_user_profile_id,
+        actor_kind=result.actor_kind,
+        actor_name=result.actor_name,
+        # Superseded content also withholds the version: like content_checksum
+        # above, a stale version must not invite consumers to reconcile to it.
+        # Contract: this is a HINT, not ground truth. Object metadata carries
+        # the version of the write that produced the object, so it can LAG the
+        # accepted row (a content-identical accept bumps db_version without a
+        # new materialization) but can never exceed it. A lagging version on
+        # identical content reads as an echo downstream, which is the correct
+        # skip; consumers must take authoritative reads (which return the DB
+        # row's version) as the decision-grade value (PR #1144 review).
+        db_version=None if result.content_superseded else result.db_version,
+    )
+
+
+def _required_index_file_note_live_update_text(
+    value: str | None,
+    *,
+    field_name: str,
+) -> str:
+    if value is None or not value.strip():
+        raise RuntimeError(f"Observed_object index_file result is missing {field_name}")
+    return value.strip()
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentMaterializedNoteEntity:
+    """Indexed entity state needed to build a current materialized note result."""
+
+    entity_id: int
+    external_id: str
+    title: str
+    permalink: str
+    # entity.checksum: the storage checksum of the indexed object.
+    storage_checksum: RuntimeFileChecksum | None
+    # note_content.file_checksum: sha256 of the markdown the index holds.
+    content_checksum: RuntimeNoteContentChecksum | None
+    # entity.content_type: the stored MIME type of the indexed object.
+    content_type: str
+
+    @classmethod
+    def from_fields(
+        cls,
+        *,
+        entity_id: int,
+        external_id: object,
+        title: object,
+        permalink: object,
+        storage_checksum: object,
+        content_checksum: object,
+        content_type: str,
+        file_path: str,
+    ) -> CurrentMaterializedNoteEntity:
+        """Validate entity fields loaded for a current materialized note.
+
+        The entity permalink is nullable in the ORM, but a current markdown note
+        must carry one for its live-update identity, so a missing permalink is a
+        broken index row rather than a plannable state.
+        """
+        return cls(
+            entity_id=entity_id,
+            external_id=_required_current_materialized_note_text(
+                external_id,
+                field_name="external_id",
+                file_path=file_path,
+            ),
+            title=_required_current_materialized_note_text(
+                title,
+                field_name="title",
+                file_path=file_path,
+            ),
+            permalink=_required_current_materialized_note_text(
+                permalink,
+                field_name="permalink",
+                file_path=file_path,
+            ),
+            storage_checksum=str(storage_checksum) if storage_checksum is not None else None,
+            content_checksum=str(content_checksum) if content_checksum is not None else None,
+            content_type=content_type,
+        )
+
+
+def _required_current_materialized_note_text(
+    value: object,
+    *,
+    field_name: str,
+    file_path: str,
+) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"Current entity for {file_path} is missing {field_name}")
+    return value.strip()
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentMaterializedNotePlan:
+    """Planned current-file result, or a request to load the indexed entity first."""
+
+    job_result: IndexFileJobResult
+    requires_entity: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedFileLiveUpdatePlan:
+    """Supersession and trusted provenance for one freshly indexed file.
+
+    Provenance fields are set only when the object's bm-file-checksum matches the
+    content this job indexed (#1589).
+    """
+
+    content_superseded: bool
+    actor_user_profile_id: str | None = None
+    actor_kind: str | None = None
+    actor_name: str | None = None
+    db_version: int | None = None
+    live_update_source: RuntimeNoteChangeSource | None = None
+    operation: FileIndexOperation | None = None
+
+
+def plan_current_materialized_note_result(
+    *,
+    reason: str,
+    file_path: str,
+    object_checksum: RuntimeFileChecksum,
+    object_metadata: RuntimeNoteObjectMetadataMap | None,
+    entity: CurrentMaterializedNoteEntity | None,
+) -> CurrentMaterializedNotePlan:
+    """Plan a current file-index result for a DB-first materialized note."""
+    current_result = IndexFileJobResult(status=IndexFileJobStatus.current, reason=reason)
+
+    provenance = RuntimeNoteObjectProvenance.from_object_metadata(object_metadata)
+    if provenance.source is None:
+        return CurrentMaterializedNotePlan(job_result=current_result)
+
+    live_update_operation = file_index_operation_from_note_object_metadata(object_metadata)
+    if live_update_operation is None:
+        return CurrentMaterializedNotePlan(job_result=current_result)
+
+    if entity is None:
+        return CurrentMaterializedNotePlan(job_result=current_result, requires_entity=True)
+
+    # Each comparison stays within one kind of checksum. The storage checksums say the
+    # index holds this object; the content checksums say the object's provenance
+    # describes the markdown the index holds, so it can be trusted (#1589).
+    object_content_checksum = file_checksum_from_object_metadata(object_metadata)
+    provenance_describes_indexed_note = (
+        object_checksum == entity.storage_checksum
+        and object_content_checksum is not None
+        and object_content_checksum == entity.content_checksum
+    )
+    if not provenance_describes_indexed_note:
+        return CurrentMaterializedNotePlan(job_result=current_result)
+
+    return CurrentMaterializedNotePlan(
+        job_result=IndexFileJobResult(
+            status=IndexFileJobStatus.current,
+            reason=reason,
+            entity_id=entity.entity_id,
+            note_external_id=entity.external_id,
+            title=entity.title,
+            permalink=entity.permalink,
+            entity_checksum=entity.storage_checksum,
+            content_checksum=entity.content_checksum,
+            content_type=entity.content_type,
+            operation=live_update_operation,
+            actor_user_profile_id=provenance.actor_user_profile_id,
+            actor_kind=provenance.actor_kind,
+            actor_name=provenance.actor_name,
+            live_update_source=provenance.source,
+            db_version=provenance.db_version,
+        ),
+    )
+
+
+def plan_indexed_file_live_update_metadata(
+    *,
+    indexed_file: FileIndexResult,
+    object_checksum: RuntimeFileChecksum,
+    object_metadata: RuntimeNoteObjectMetadataMap | None,
+) -> IndexedFileLiveUpdatePlan:
+    """Plan supersession and trusted actor/source metadata for a freshly indexed file.
+
+    `object_checksum` is the storage checksum of the object as it stands after indexing,
+    the same kind as `indexed_file.checksum` on every backend.
+    """
+    # A different stored object means a newer write replaced the file after this job read
+    # it. That write's own storage notification indexes the newer content, whoever wrote it.
+    if object_checksum != indexed_file.checksum:
+        return IndexedFileLiveUpdatePlan(content_superseded=True)
+
+    # Object metadata is trusted only when its content checksum names the markdown this
+    # job indexed (#1589); a sync client can re-upload different bytes with stale metadata.
+    object_content_checksum = file_checksum_from_object_metadata(object_metadata)
+    if object_content_checksum is None or object_content_checksum != indexed_file.content_checksum:
+        return IndexedFileLiveUpdatePlan(content_superseded=False)
+
+    provenance = RuntimeNoteObjectProvenance.from_object_metadata(object_metadata)
+    return IndexedFileLiveUpdatePlan(
+        content_superseded=False,
+        actor_user_profile_id=provenance.actor_user_profile_id,
+        actor_kind=provenance.actor_kind,
+        actor_name=provenance.actor_name,
+        live_update_source=provenance.source,
+        db_version=provenance.db_version,
+        operation=file_index_operation_from_note_object_metadata(object_metadata),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class IndexFileBatchJobResult:
+    """Summary of what happened while processing one file-index batch job."""
+
+    total_files: int
+    processed_files: int
+    missing_files: int
+    failed_files: int
+    file_results: tuple[IndexFileJobResult, ...]
+    vector_targets: tuple[EmbeddingIndexTarget, ...]
+
+    @property
+    def indexed_bytes(self) -> int:
+        """Stored bytes actually indexed across this batch's file results."""
+        return sum(result.indexed_bytes for result in self.file_results)
+
+
+def project_index_file_outcome_from_job_result(
+    result: IndexFileJobResult,
+) -> ProjectIndexFileOutcome:
+    """Map one file job result to the aggregate project-index outcome."""
+    return ProjectIndexFileOutcome(result.status.value)
+
+
+def project_index_file_outcomes_from_job_results(
+    results: Sequence[IndexFileJobResult],
+) -> tuple[ProjectIndexFileOutcome, ...]:
+    """Map file job results to aggregate project-index outcomes."""
+    return tuple(project_index_file_outcome_from_job_result(result) for result in results)
+
+
+def apply_project_index_batch_job_results(
+    *,
+    counters: ProjectIndexCounters,
+    recorded_batch_indexes: Sequence[int],
+    batch_index: int,
+    batch_count: int,
+    results: Sequence[IndexFileJobResult],
+) -> ProjectIndexBatchCounterUpdate:
+    """Apply one batch's file job results exactly once to aggregate counters."""
+    return apply_project_index_batch_outcomes(
+        counters=counters,
+        recorded_batch_indexes=recorded_batch_indexes,
+        batch_index=batch_index,
+        batch_count=batch_count,
+        outcomes=project_index_file_outcomes_from_job_results(results),
+    )
+
+
+def build_index_file_batch_job_result(
+    *,
+    target_paths: Sequence[str],
+    terminal_results: Mapping[str, IndexFileJobResult],
+    indexed_files: Sequence[IndexedEntity],
+    errors: Mapping[str, str],
+    index_embeddings: bool,
+    embedding_eligible_paths: Collection[str],
+) -> IndexFileBatchJobResult:
+    """Build an ordered batch result after content reads and indexing complete."""
+    indexed_by_path = {indexed.path: indexed for indexed in indexed_files}
+    ordered_file_results: list[IndexFileJobResult] = []
+    vector_targets: list[EmbeddingIndexTarget] = []
+
+    for file_path in target_paths:
+        indexed = indexed_by_path.get(file_path)
+        if indexed is not None and index_embeddings and file_path in embedding_eligible_paths:
+            vector_targets.append(
+                EmbeddingIndexTarget(
+                    entity_id=indexed.entity_id,
+                    entity_checksum=indexed.checksum,
+                )
+            )
+
+        if file_path in errors:
+            ordered_file_results.append(
+                IndexFileJobResult(
+                    status=IndexFileJobStatus.failed,
+                    reason=f"file indexing failed: {file_path}: {errors[file_path]}",
+                    entity_id=indexed.entity_id if indexed is not None else None,
+                    entity_checksum=indexed.checksum if indexed is not None else None,
+                )
+            )
+        elif indexed is not None:
+            ordered_file_results.append(
+                IndexFileJobResult(
+                    status=IndexFileJobStatus.processed,
+                    reason=f"file indexed: {file_path}",
+                    entity_id=indexed.entity_id,
+                    entity_checksum=indexed.checksum,
+                    content_type=indexed.content_type,
+                    indexed_bytes=indexed.indexed_bytes,
+                )
+            )
+        else:
+            terminal_result = terminal_results.get(file_path)
+            if terminal_result is None:
+                raise RuntimeError(f"Missing file index result for {file_path}")
+            ordered_file_results.append(terminal_result)
+
+    outcome_summary = summarize_project_index_file_outcomes(
+        project_index_file_outcomes_from_job_results(ordered_file_results)
+    )
+    return IndexFileBatchJobResult(
+        total_files=outcome_summary.total_files,
+        processed_files=outcome_summary.processed_files,
+        missing_files=outcome_summary.missing_files,
+        failed_files=outcome_summary.failed_files,
+        file_results=tuple(ordered_file_results),
+        vector_targets=tuple(vector_targets),
+    )
+
+
+@dataclass(slots=True)
+class SyncedMarkdownFile:
+    """Canonical result for syncing one markdown file end-to-end."""
+
+    entity: Entity
+    checksum: str
+    markdown_content: str
+    file_path: str
+    content_type: str
+    updated_at: datetime
+    size: int
+    # Byte length of the stored content this pass read and indexed; 0 when the
+    # file was found unchanged and nothing was re-indexed.
+    indexed_bytes: int
+    observations: tuple[IndexedObservation, ...] = ()
+    sections: tuple[IndexedSection, ...] = ()
+    relations: tuple[IndexedRelation, ...] = ()
+    resolve_relations: bool = True
+
+
+@dataclass(slots=True)
+class IndexingBatchResult:
+    """Outcome for one batch execution."""
+
+    indexed: list[IndexedEntity] = field(default_factory=list)
+    errors: list[tuple[str, str]] = field(default_factory=list)
+    relations_resolved: int = 0
+    relations_unresolved: int = 0
+    search_indexed: int = 0
+
+
+class IndexFileWriter(Protocol):
+    """Narrow protocol for frontmatter writes during indexing."""
+
+    async def write_frontmatter(
+        self, update: IndexFrontmatterUpdate
+    ) -> IndexFrontmatterWriteResult: ...
+
+
+class IndexFrontmatterStorageResult(Protocol):
+    """Storage write result shape needed by the indexing writer adapter."""
+
+    @property
+    def checksum(self) -> str: ...
+
+    @property
+    def content(self) -> str: ...
+
+
+class IndexFrontmatterStorage(Protocol):
+    """Storage capability that can rewrite markdown frontmatter."""
+
+    async def update_frontmatter_with_result(
+        self,
+        path: str,
+        updates: dict[str, Any],
+    ) -> IndexFrontmatterStorageResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StorageIndexFileWriter(IndexFileWriter):
+    """Adapt a storage service's frontmatter rewrite API to the indexing protocol."""
+
+    storage: IndexFrontmatterStorage
+
+    @override
+    async def write_frontmatter(
+        self, update: IndexFrontmatterUpdate
+    ) -> IndexFrontmatterWriteResult:
+        result = await self.storage.update_frontmatter_with_result(
+            update.path,
+            update.metadata,
+        )
+        return IndexFrontmatterWriteResult(
+            checksum=result.checksum,
+            content=result.content,
+        )
+
+
+class IndexEntitySearchWriter(Protocol):
+    """Narrow protocol for search writes during indexing."""
+
+    async def index_entity_data(self, entity: Entity, content: str | None = None) -> None: ...

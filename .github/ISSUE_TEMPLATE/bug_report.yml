@@ -1,0 +1,49 @@
+name: Bug 报告
+description: 报告可复现的安装、MCP、任务或存储问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        不要粘贴访问令牌、完整 transcript、记忆库原文或私有仓库内容。请使用最小脱敏片段。
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题摘要
+      description: 发生了什么，影响哪个客户端或命令？
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 提供最小、可重复的命令或操作顺序。
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期与实际
+      description: 分别写清预期结果和实际结果。
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: 版本与环境
+      description: MemWeave、Python、操作系统和客户端版本。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏证据
+      description: 可附 `check --json`、doctor 摘要或最小日志；先移除本机个人信息。
+    validations:
+      required: false

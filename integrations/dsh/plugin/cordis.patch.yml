@@ -1,0 +1,7 @@
+# MemWeave — local task-continuity memory layer (stdio MCP).
+# Mounts the local MemWeave server through the in-box DSH MCP client bridge.
+# DSH owns transport, cancellation and tool registration; the Python process
+# only serves the memweave_* tools and persists Markdown under the shared vault.
+- insert:
+    - id: mcp-memweave
+      name: '@local/dsh-memweave'

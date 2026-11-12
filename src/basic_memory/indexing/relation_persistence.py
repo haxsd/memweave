@@ -1,0 +1,375 @@
+"""Publish a note's derived graph under one accepted content generation.
+
+The publication carries the complete observation, temporal, section, and relation
+projections through one note_content fence lifecycle and one durable retry marker.
+
+The graph tables are eventually consistent projections, not part of the accepted write's
+transaction. Publication runs after the content commit; a stale fence makes every statement
+a no-op (the newer generation owns convergence); a crashed or failed publication is repaired
+by a later index pass republishing the same generation. Readers must tolerate a note whose
+projections briefly lag its accepted content. This is deliberate: pulling these writes back
+into one shared transaction — or adding cross-table locks to close the lag — is what caused
+the #1213/#1214 deadlock and duplication incidents.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from itertools import batched
+from typing import Protocol
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from basic_memory import db
+from basic_memory.indexing.models import IndexedObservation, IndexedRelation, IndexedSection
+from basic_memory.repository.memory_time_index_repository import (
+    AcceptedTemporalAssertion,
+    TemporalGenerationWriteResult,
+)
+from basic_memory.repository.note_section_repository import (
+    AcceptedSectionWrite,
+    SectionGenerationWriteResult,
+)
+from basic_memory.repository.observation_repository import (
+    AcceptedObservationWrite,
+    ObservationGenerationWriteResult,
+)
+from basic_memory.repository.relation_repository import (
+    RELATION_GENERATION_WRITE_STATEMENT_SIZE,
+    AcceptedRelationWrite,
+    RelationGenerationWriteResult,
+)
+from basic_memory.runtime.storage import ProjectId, RuntimeEntityId, RuntimeNoteContentVersion
+from basic_memory.schemas.search import SearchItemType
+
+
+class RelationGenerationStore(Protocol):
+    """Repository operations needed to publish one relation generation."""
+
+    async def begin_relation_generation_publication(
+        self,
+        session: AsyncSession,
+        *,
+        entity_id: int,
+        generation: int,
+    ) -> RelationGenerationWriteResult: ...
+
+    async def upsert_relation_generation(
+        self,
+        session: AsyncSession,
+        *,
+        entity_id: int,
+        generation: int,
+        relations: Sequence[AcceptedRelationWrite],
+    ) -> RelationGenerationWriteResult: ...
+
+    async def cleanup_relation_generations(
+        self,
+        session: AsyncSession,
+        *,
+        entity_id: int,
+        generation: int,
+        published_identities: frozenset[tuple[str, str]],
+    ) -> RelationGenerationWriteResult: ...
+
+    async def resolved_target_note_ids(
+        self,
+        session: AsyncSession,
+        *,
+        entity_id: int,
+    ) -> frozenset[str]: ...
+
+
+class ObservationGenerationStore(Protocol):
+    """Repository operation needed to replace one observation generation."""
+
+    async def replace_observations_for_generation(
+        self,
+        session: AsyncSession,
+        *,
+        entity_id: int,
+        generation: int,
+        observations: Sequence[AcceptedObservationWrite],
+    ) -> ObservationGenerationWriteResult: ...
+
+
+class SectionGenerationStore(Protocol):
+    """Repository operation needed to replace one section generation."""
+
+    async def replace_sections_for_generation(
+        self,
+        session: AsyncSession,
+        *,
+        entity_id: int,
+        generation: int,
+        sections: Sequence[AcceptedSectionWrite],
+    ) -> SectionGenerationWriteResult: ...
+
+
+class TemporalGenerationStore(Protocol):
+    """Repository operation needed to replace one temporal generation."""
+
+    async def replace_assertions_for_generation(
+        self,
+        session: AsyncSession,
+        *,
+        entity_id: int,
+        generation: int,
+        assertions: Sequence[AcceptedTemporalAssertion],
+    ) -> TemporalGenerationWriteResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RelationGenerationPublication:
+    """Derived graph intent authorized by one accepted note-content generation."""
+
+    project_id: ProjectId
+    entity_id: RuntimeEntityId
+    generation: RuntimeNoteContentVersion
+    relations: tuple[IndexedRelation, ...]
+    observations: tuple[IndexedObservation, ...] = ()
+    sections: tuple[IndexedSection, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RelationPublishOutcome:
+    """Whether a publication kept its generation, and which other notes it touched.
+
+    Publication rewrites every outgoing link of the source unresolved until the
+    resolution pass runs, so each note those links pointed to loses an incoming
+    relation now. Callers retire those notes' cached responses whatever the
+    generation outcome, since earlier statements may already have committed.
+    """
+
+    generation_is_current: bool
+    detached_note_ids: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class RelationGenerationPublisher:
+    """Commit observations, valid time, sections, relations, and cleanup under fences."""
+
+    relation_repository: RelationGenerationStore
+    observation_repository: ObservationGenerationStore
+    section_repository: SectionGenerationStore
+    temporal_repository: TemporalGenerationStore
+    session_maker: async_sessionmaker[AsyncSession]
+
+    async def publish(
+        self,
+        *,
+        entity_id: int,
+        generation: int,
+        relations: Sequence[IndexedRelation],
+        observations: Sequence[IndexedObservation] = (),
+        sections: Sequence[IndexedSection] = (),
+    ) -> RelationPublishOutcome:
+        """Publish one generation and report the other notes it detached links from."""
+        relations_by_identity: dict[tuple[str, str], IndexedRelation] = {}
+        for relation in relations:
+            if relation.target_id is not None and relation.target_id != entity_id:
+                raise ValueError("Only the source entity may be pre-resolved during publication")
+            identity = relation.relation_type, relation.target_name
+            relations_by_identity.setdefault(identity, relation)
+
+        ordered_relations: list[AcceptedRelationWrite] = []
+        resolved_identities: set[tuple[str, int]] = set()
+        for _, relation in sorted(relations_by_identity.items()):
+            if relation.target_id is not None:
+                resolved_identity = relation.relation_type, relation.target_id
+                # Constraint: safe aliases have distinct authored-name identities but share the
+                # resolved relation uniqueness domain. Keep the lexical first alias so input order
+                # cannot decide which valid source representation is published.
+                if resolved_identity in resolved_identities:
+                    continue
+                resolved_identities.add(resolved_identity)
+            ordered_relations.append(
+                AcceptedRelationWrite(
+                    relation_type=relation.relation_type,
+                    target_name=relation.target_name,
+                    context=relation.context,
+                    target_id=relation.target_id,
+                )
+            )
+
+        # Read before writing: the upsert below clears every target this source's
+        # links resolve to, so afterwards there is no record of which notes they were.
+        async with db.scoped_session(self.session_maker) as session:
+            detached_note_ids = await self.relation_repository.resolved_target_note_ids(
+                session,
+                entity_id=entity_id,
+            )
+        generation_is_current = await self._publish_relations(
+            entity_id=entity_id,
+            generation=generation,
+            ordered_relations=ordered_relations,
+            observations=observations,
+            sections=sections,
+        )
+        return RelationPublishOutcome(
+            generation_is_current=generation_is_current,
+            detached_note_ids=detached_note_ids,
+        )
+
+    async def _publish_relations(
+        self,
+        *,
+        entity_id: int,
+        generation: int,
+        ordered_relations: Sequence[AcceptedRelationWrite],
+        observations: Sequence[IndexedObservation],
+        sections: Sequence[IndexedSection],
+    ) -> bool:
+        """Return whether every statement retained ownership of ``generation``."""
+        # Commit retry intent before the first independently committed chunk. If
+        # any later statement fails, change detection will re-drive this source.
+        async with db.scoped_session(self.session_maker) as session:
+            publication = await self.relation_repository.begin_relation_generation_publication(
+                session,
+                entity_id=entity_id,
+                generation=generation,
+            )
+        if not publication.generation_is_current:
+            return False
+
+        if not await self._publish_observations(
+            entity_id=entity_id,
+            generation=generation,
+            observations=observations,
+        ):
+            return False
+
+        # Sections mirror the observation projection: one fenced wipe-and-recreate in
+        # its own short transaction, where an empty desired set still wipes stale rows.
+        accepted_sections = tuple(
+            AcceptedSectionWrite(
+                heading=section.heading,
+                level=section.level,
+                heading_path=section.heading_path,
+                duplicate_index=section.duplicate_index,
+                start_line=section.start_line,
+                end_line=section.end_line,
+                start_offset=section.start_offset,
+                end_offset=section.end_offset,
+            )
+            for section in sections
+        )
+        async with db.scoped_session(self.session_maker) as session:
+            section_result = await self.section_repository.replace_sections_for_generation(
+                session,
+                entity_id=entity_id,
+                generation=generation,
+                sections=accepted_sections,
+            )
+        if not section_result.generation_is_current:
+            return False
+
+        for relation_chunk in batched(
+            ordered_relations,
+            RELATION_GENERATION_WRITE_STATEMENT_SIZE,
+        ):
+            async with db.scoped_session(self.session_maker) as session:
+                result = await self.relation_repository.upsert_relation_generation(
+                    session,
+                    entity_id=entity_id,
+                    generation=generation,
+                    relations=relation_chunk,
+                )
+            if not result.generation_is_current:
+                return False
+
+        # Cleanup is intentionally its own transaction. An empty desired set still
+        # reaches this statement and removes every row older than the claimed generation.
+        async with db.scoped_session(self.session_maker) as session:
+            cleanup = await self.relation_repository.cleanup_relation_generations(
+                session,
+                entity_id=entity_id,
+                generation=generation,
+                published_identities=frozenset(
+                    (relation.relation_type, relation.target_name) for relation in ordered_relations
+                ),
+            )
+        return cleanup.generation_is_current
+
+    async def _publish_observations(
+        self,
+        *,
+        entity_id: int,
+        generation: int,
+        observations: Sequence[IndexedObservation],
+    ) -> bool:
+        """Replace observations and their authored valid time under one fence.
+
+        Observations fit one statement batch, so their fenced replacement owns one
+        short transaction. An empty desired set must still execute, for both writes,
+        to wipe the prior projections.
+
+        Constraint: the temporal projection addresses observations by row id, and
+        those ids are minted by the insert here. Unlike sections and observations,
+        which key on the stable entity_id, this write cannot be deferred to a
+        transaction of its own: a same-generation republish landing between two
+        commits would wipe and re-mint the observation rows, leaving temporal rows
+        addressing ids that no longer exist and that no later pass repairs. One
+        transaction under one held fence keeps a row and its valid time atomic. That
+        is a narrow exception earned by the id dependency, not a licence to widen the
+        other statements.
+        """
+        accepted_observations = tuple(
+            AcceptedObservationWrite(
+                content=observation.content,
+                category=observation.category,
+                context=observation.context,
+                tags=observation.tags,
+                temporal=observation.temporal,
+            )
+            for observation in observations
+        )
+        async with db.scoped_session(self.session_maker) as session:
+            observation_result = (
+                await self.observation_repository.replace_observations_for_generation(
+                    session,
+                    entity_id=entity_id,
+                    generation=generation,
+                    observations=accepted_observations,
+                )
+            )
+            if not observation_result.generation_is_current:
+                return False
+
+            temporal_result = await self.temporal_repository.replace_assertions_for_generation(
+                session,
+                entity_id=entity_id,
+                generation=generation,
+                assertions=_accepted_temporal_assertions(
+                    observations,
+                    observation_result.observation_ids,
+                ),
+            )
+        return temporal_result.generation_is_current
+
+
+def _accepted_temporal_assertions(
+    observations: Sequence[IndexedObservation],
+    observation_ids: Sequence[int],
+) -> tuple[AcceptedTemporalAssertion, ...]:
+    """Pair each authored assertion with the observation row that now carries it.
+
+    Both sequences are in document order, so position is the pairing. A length
+    mismatch means the observation write returned ids for a different set of rows
+    than it was given, which would silently attach valid time to the wrong statement.
+    """
+    if len(observation_ids) != len(observations):
+        raise ValueError(
+            f"Observation publication returned {len(observation_ids)} row ids "
+            f"for {len(observations)} observations"
+        )
+    return tuple(
+        AcceptedTemporalAssertion(
+            source_type=SearchItemType.OBSERVATION.value,
+            source_id=observation_id,
+            assertion=assertion,
+        )
+        for observation, observation_id in zip(observations, observation_ids)
+        for assertion in observation.temporal
+    )

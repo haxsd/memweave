@@ -1,0 +1,10 @@
+from basic_memory.repository.repository import Repository
+from basic_memory.models.project import Project
+
+
+class ProjectInfoRepository(Repository[Project]):
+    """Repository for statistics queries."""
+
+    def __init__(self):
+        # Initialize with Project model as a reference
+        super().__init__(Project)

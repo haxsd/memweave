@@ -1,0 +1,888 @@
+"""Runtime-neutral note-content mutation service facade."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
+from typing import Literal, Protocol, assert_never
+from uuid import UUID
+
+from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from basic_memory.file_utils import ParseError, has_frontmatter, parse_frontmatter
+
+from basic_memory.indexing.accepted_note_mutation_runner import (
+    ACCEPTED_NOTE_DELETE_SOURCE,
+    AcceptedNoteBaseChecksumConflict,
+    AcceptedNoteCreateMutation,
+    AcceptedNoteDeleteMutation,
+    AcceptedNoteEditMutation,
+    AcceptedNoteMoveMutation,
+    AcceptedNoteMutationActor,
+    AcceptedNoteMutationChange,
+    AcceptedNoteMutationDependencies,
+    AcceptedNoteMutationRejected,
+    AcceptedNoteMutationRejection,
+    AcceptedNoteMutationResult,
+    AcceptedNoteUpdateMutation,
+    load_accepted_note_mutation_project,
+    resolve_accepted_note_schema_directory,
+    run_accepted_note_create,
+    run_accepted_note_delete,
+    run_accepted_note_edit,
+    run_accepted_note_move,
+    run_accepted_note_update,
+)
+from basic_memory.indexing.accepted_note_write_runner import (
+    refresh_accepted_note_search_index,
+)
+from basic_memory.indexing.relation_persistence import (
+    RelationGenerationPublication,
+    RelationGenerationPublisher,
+)
+from basic_memory.runtime.note_content import (
+    RuntimeAcceptedNoteChange,
+    RuntimeNoteContentResponsePayload,
+)
+from basic_memory.read_cache import (
+    ReadCacheChange,
+    ReadCacheChangeRecorder,
+    ReadCacheInvalidator,
+    finish_project_read_cache_invalidation,
+    finish_read_cache_invalidation,
+)
+from basic_memory.services.read_cache_changes import accepted_note_read_cache_change
+from basic_memory.schemas.base import Entity as EntitySchema
+from basic_memory.schemas.request import EditEntityRequest
+from basic_memory.repository.entity_repository import EntityRepository
+from basic_memory.services.note_write_outcomes import (
+    AlreadyExists,
+    Created,
+    Updated,
+    TargetMoved,
+    Locked,
+    Rejected,
+    RevisionConflict,
+    NoteLocation,
+    WriteOutcome,
+)
+
+AcceptedNoteChange = RuntimeAcceptedNoteChange[RuntimeNoteContentResponsePayload]
+# The dataclass uses slots, so its default lives on instances, not the class.
+STALE_BASE_CHECKSUM_MESSAGE = AcceptedNoteBaseChecksumConflict(db_checksum=None).message
+
+
+class NoteContentMutationFreshener(Protocol):
+    """Refresh current runtime file state before mutating an existing note."""
+
+    async def freshen_note_content(
+        self,
+        *,
+        project_external_id: str,
+        entity_external_id: str,
+    ) -> ReadCacheChange:
+        """Converge the note's observed file state; return the reads that made stale."""
+        ...
+
+
+type NoteContentMutationKind = Literal["create", "update", "edit", "move", "delete"]
+
+
+@dataclass(frozen=True, slots=True)
+class NoteContentMutationActorContext:
+    """Who and what originated one accepted note mutation."""
+
+    user_profile_id: UUID | None
+    source: str
+    actor_kind: str | None = None
+    actor_name: str | None = None
+    # Display name stamped into created_by/updated_by frontmatter. Routes never
+    # set it; only a resolver that authenticated the caller can supply it.
+    author: str | None = None
+
+
+class NoteContentMutationActorResolver(Protocol):
+    """Resolve the actor context for one mutation at the runtime boundary.
+
+    Routes pass through whatever actor values they were called with; a runtime
+    adapter (e.g. cloud) can replace them with request-derived identity — user
+    profile, source header, MCP actor headers — without subclassing the service.
+    """
+
+    def resolve_mutation_actor(
+        self,
+        *,
+        mutation_kind: NoteContentMutationKind,
+        requested: NoteContentMutationActorContext,
+    ) -> NoteContentMutationActorContext: ...
+
+
+# Route adapters place error.detail directly into the HTTP response body, so it
+# is either a plain message string or an already-serialized structured detail
+# (currently only the base-checksum conflict wire dict, issue #1445).
+type NoteContentMutationErrorDetail = str | dict[str, str | None]
+
+
+class NoteContentMutationServiceError(Exception):
+    """Structured note-content mutation service error for route adapters."""
+
+    def __init__(self, status_code: int, detail: NoteContentMutationErrorDetail) -> None:
+        super().__init__(str(detail))
+        self.status_code = status_code
+        self.detail = detail
+
+
+def note_content_mutation_error_from_rejection(
+    rejection: AcceptedNoteMutationRejection,
+) -> NoteContentMutationServiceError:
+    """Map core accepted-note mutation rejections into route-facing errors."""
+    detail = rejection.detail
+    # This mapping is the wire boundary: typed rejection details serialize to the
+    # JSON dict that HTTP routes place verbatim into the 4xx response body.
+    return NoteContentMutationServiceError(
+        rejection.kind.http_status_code,
+        detail if isinstance(detail, str) else detail.as_json_dict(),
+    )
+
+
+def accepted_note_mutation_actor(
+    *,
+    user_profile_id: UUID | None,
+    actor_kind: str | None,
+    actor_name: str | None,
+    author: str | None = None,
+) -> AcceptedNoteMutationActor:
+    """Build the typed accepted-note actor passed to core mutation runners."""
+    return AcceptedNoteMutationActor(
+        user_profile_id=user_profile_id,
+        kind=actor_kind,
+        name=actor_name,
+        author=author,
+    )
+
+
+@asynccontextmanager
+async def accepted_note_transaction(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncSession]:
+    """Open one DB transaction for an accepted note mutation."""
+    async with session_maker() as session:
+        async with session.begin():
+            yield session
+
+
+class NoteContentMutationService:
+    """Accept note mutations into DB state through core-owned mutation runners."""
+
+    def __init__(
+        self,
+        *,
+        session_maker: async_sessionmaker[AsyncSession],
+        mutation_dependencies: AcceptedNoteMutationDependencies,
+        content_freshener: NoteContentMutationFreshener | None = None,
+        actor_resolver: NoteContentMutationActorResolver | None = None,
+        read_cache: ReadCacheInvalidator | None = None,
+    ) -> None:
+        self.session_maker = session_maker
+        self.mutation_dependencies = mutation_dependencies
+        self.content_freshener = content_freshener
+        self.actor_resolver = actor_resolver
+        self.read_cache = read_cache
+
+    async def on_accepted_mutation(
+        self,
+        session: AsyncSession,
+        *,
+        project_external_id: str,
+        change: AcceptedNoteMutationChange,
+        mutation_kind: NoteContentMutationKind,
+        source: str,
+    ) -> None:
+        """Contribute to the accept transaction, before it commits.
+
+        A no-op here, and the only supported way to write a row atomically with
+        an accepted note. `accepted_note_transaction` opens and closes inside the
+        mutation methods, so a caller that needs its own row to land with the
+        note -- a hosted deployment recording a durable marker, say -- otherwise
+        has to re-implement the whole method body to reach inside the
+        transaction, and then silently owns a copy of it.
+
+        The mutation's own identifying context is passed in rather than left for
+        the subclass to re-derive: the project is addressed by external id here,
+        while the accepted change carries only the tenant-internal integer, and
+        the source has already been through the actor resolver.
+
+        Raising rolls the accepted mutation back with it, which is the intended
+        behaviour: a marker that cannot be written must not leave a note
+        accepted as though it had been.
+        """
+        return None
+
+    async def _publish_relation_generation(
+        self,
+        publication: RelationGenerationPublication | None,
+    ) -> frozenset[str]:
+        """Publish accepted graph intent after note-content commit.
+
+        Returns the other notes whose incoming links the publication rewrote.
+        """
+        if publication is None:
+            return frozenset()
+
+        repository = self.mutation_dependencies.write_repositories.relation_repository(
+            publication.project_id
+        )
+        observation_repository = (
+            self.mutation_dependencies.write_repositories.observation_repository(
+                publication.project_id
+            )
+        )
+        section_repository = self.mutation_dependencies.write_repositories.section_repository(
+            publication.project_id
+        )
+        temporal_repository = self.mutation_dependencies.write_repositories.temporal_repository(
+            publication.project_id
+        )
+        publisher = RelationGenerationPublisher(
+            relation_repository=repository,
+            observation_repository=observation_repository,
+            section_repository=section_repository,
+            temporal_repository=temporal_repository,
+            session_maker=self.session_maker,
+        )
+        outcome = await publisher.publish(
+            entity_id=publication.entity_id,
+            generation=publication.generation,
+            relations=publication.relations,
+            observations=publication.observations,
+            sections=publication.sections,
+        )
+        return outcome.detached_note_ids
+
+    async def _finish_mutation(
+        self,
+        result: AcceptedNoteMutationResult,
+        cache_change: ReadCacheChangeRecorder,
+    ) -> AcceptedNoteChange:
+        """Run post-commit derived work, record what it made stale, expose the response."""
+        if result.search_row is not None:
+            try:
+                await refresh_accepted_note_search_index(
+                    self.session_maker,
+                    row=result.search_row,
+                    repositories=self.mutation_dependencies.write_repositories,
+                )
+            except Exception:
+                # Trigger: the hot search refresh fails after accepted content committed.
+                # Why: the row is derived state, rewritten by the note's materialization
+                #   index; failing the response would report a committed write as failed
+                #   and strand that materialization (#1681).
+                # Outcome: preserve the accepted change and log the repairable failure.
+                logger.exception(
+                    "Search refresh failed after accepted note commit; continuing "
+                    "materialization: entity_id={}",
+                    result.search_row.entity_id,
+                )
+        try:
+            detached_note_ids = await self._publish_relation_generation(result.relation_publication)
+        except Exception:
+            # Publication may have rewritten some links before failing, and which
+            # notes it reached is unknown.
+            cache_change.record(ReadCacheChange.whole_project())
+            publication = result.relation_publication
+            # Trigger: derived graph publication fails after accepted content committed.
+            # Why: failing the response would strand file materialization even though the
+            # canonical DB write succeeded; a later index pass can republish the same generation.
+            # Outcome: preserve the accepted change and surface the repairable failure in logs.
+            logger.exception(
+                "Graph publication failed after accepted note commit; continuing "
+                "materialization: entity_id={} generation={}",
+                publication.entity_id if publication is not None else None,
+                publication.generation if publication is not None else None,
+            )
+        else:
+            cache_change.record(
+                accepted_note_read_cache_change(
+                    result.change.project_change,
+                    identity_changed=result.identity_changed,
+                    detached_note_ids=detached_note_ids,
+                )
+            )
+        return result.change
+
+    @asynccontextmanager
+    async def _mutation_cache_scope(
+        self,
+        project_external_id: str,
+        *,
+        freshened: ReadCacheChange,
+    ) -> AsyncIterator[ReadCacheChangeRecorder]:
+        """Retire what the mutation recorded once it can publish authoritative state.
+
+        ``freshened`` is what converging the note's file state published before the
+        mutation began; it is stale whether or not the mutation is accepted.
+        """
+        recorder = ReadCacheChangeRecorder()
+        read_cache = self.read_cache
+        if read_cache is None:
+            yield recorder
+            return
+
+        try:
+            yield recorder
+        except AcceptedNoteMutationRejected:
+            # A rejection commits nothing of its own.
+            await finish_read_cache_invalidation(read_cache, project_external_id, freshened)
+            raise
+        except BaseException:
+            # Transaction exit can raise after its commit reached the database, and
+            # nothing describes that commit, so retire the whole project.
+            await finish_project_read_cache_invalidation(read_cache, project_external_id)
+            raise
+        change = recorder.change
+        if change.is_empty:
+            # Every accepted mutation records itself in _finish_mutation; one that did
+            # not is a gap in this service, and must not leave older reads visible.
+            change = ReadCacheChange.whole_project()
+        await finish_read_cache_invalidation(read_cache, project_external_id, change | freshened)
+
+    def _resolve_actor(
+        self,
+        mutation_kind: NoteContentMutationKind,
+        *,
+        user_profile_id: UUID | None,
+        source: str,
+        actor_kind: str | None,
+        actor_name: str | None,
+    ) -> NoteContentMutationActorContext:
+        requested = NoteContentMutationActorContext(
+            user_profile_id=user_profile_id,
+            source=source,
+            actor_kind=actor_kind,
+            actor_name=actor_name,
+        )
+        if self.actor_resolver is None:
+            return requested
+        return self.actor_resolver.resolve_mutation_actor(
+            mutation_kind=mutation_kind,
+            requested=requested,
+        )
+
+    async def freshen_existing_note_content(
+        self,
+        *,
+        project_external_id: str,
+        entity_external_id: str,
+    ) -> ReadCacheChange:
+        """Converge observed file state and return the reads that made stale."""
+        if self.content_freshener is None:
+            return ReadCacheChange()
+
+        try:
+            return await self.content_freshener.freshen_note_content(
+                project_external_id=project_external_id,
+                entity_external_id=entity_external_id,
+            )
+        except BaseException:
+            # Freshening can commit entity and note-content state before a later
+            # indexing follow-up raises. Invalidate before propagating so those
+            # partial publications cannot stay hidden behind older cached reads.
+            if self.read_cache is not None:
+                await finish_project_read_cache_invalidation(
+                    self.read_cache,
+                    project_external_id,
+                )
+            raise
+
+    async def write_note(
+        self,
+        *,
+        project_external_id: str,
+        data: EntitySchema,
+        overwrite: bool,
+        entity_repository: EntityRepository,
+        permalink_candidates: Sequence[str],
+        user_profile_id: UUID | None,
+        source: str,
+        expected_checksum: str | None = None,
+    ) -> WriteOutcome:
+        """Create at a path or replace its current owner, without search resolution.
+
+        Retained exact permalinks only identify a moved target when the requested
+        path has no owner. Rejections leave the transaction before becoming values,
+        so the existing rollback, cache invalidation, and publication rules still apply.
+
+        ``expected_checksum`` makes a replacement conditional on the accepted
+        revision the caller read. It is checked inside the update transaction, so
+        a write that lands after the caller's read wins and this one reports a
+        revision conflict instead of replacing it.
+        """
+        target: NoteLocation | None = None
+        try:
+            async with accepted_note_transaction(self.session_maker) as session:
+                project = await load_accepted_note_mutation_project(
+                    session,
+                    project_external_id=project_external_id,
+                    dependencies=self.mutation_dependencies,
+                )
+                if entity_repository.project_id != project.id:
+                    raise ValueError("Write repository must belong to the requested project")
+                data = await resolve_accepted_note_schema_directory(
+                    session,
+                    project_id=project.id,
+                    data=data,
+                    dependencies=self.mutation_dependencies,
+                )
+                existing = await entity_repository.get_by_file_path(
+                    session,
+                    data.file_path,
+                    load_relations=False,
+                )
+                if existing is not None:
+                    existing_note = NoteLocation(
+                        str(existing.external_id),
+                        existing.title,
+                        existing.file_path,
+                        existing.permalink,
+                    )
+                    # The refusal names the note at the path. A permalink derived from
+                    # the request can belong to a different note, such as one moved
+                    # away from this path that kept its permalink (#1634).
+                    if not overwrite:
+                        return AlreadyExists(data.file_path, existing_note)
+                    target = existing_note
+                elif overwrite:
+                    # A supplied frontmatter permalink is the identity preparation
+                    # would use. Check it before generated path aliases to avoid
+                    # creating a suffixed shadow of a moved custom-permalink note.
+                    if data.content and has_frontmatter(data.content):
+                        permalink = parse_frontmatter(data.content).get("permalink")
+                        if isinstance(permalink, str) and permalink:
+                            permalink_candidates = (permalink, *permalink_candidates)
+                    for permalink in permalink_candidates:
+                        moved = await entity_repository.get_by_permalink(
+                            session,
+                            permalink,
+                            load_relations=False,
+                        )
+                        if moved is not None:
+                            return TargetMoved(
+                                NoteLocation(
+                                    str(moved.external_id),
+                                    moved.title,
+                                    moved.file_path,
+                                    moved.permalink,
+                                )
+                            )
+                    # The caller expected to replace a revision, but no note owns the
+                    # path. Creating one would resurrect a note deleted after the read.
+                    if expected_checksum is not None:
+                        return RevisionConflict(data.file_path, current_db_checksum=None)
+
+            # Dispatch through the public operations so runtime overrides retain
+            # their pre-acceptance work as well as the in-transaction hook.
+            match target:
+                case None:
+                    change = await self.create_note(
+                        project_external_id=project_external_id,
+                        data=data,
+                        user_profile_id=user_profile_id,
+                        source=source,
+                    )
+                    return Created(change)
+                case NoteLocation(external_id=entity_id, file_path=target_path):
+                    # A conditional replacement must still find the note at the path it
+                    # was addressed by; an unconditional one keeps Core's PUT semantics.
+                    change = await self.update_note(
+                        project_external_id=project_external_id,
+                        entity_external_id=entity_id,
+                        data=data,
+                        user_profile_id=user_profile_id,
+                        source=source,
+                        base_checksum=expected_checksum,
+                        base_file_path=target_path if expected_checksum is not None else None,
+                    )
+                    return Updated(change)
+                case _:
+                    assert_never(target)
+        except AcceptedNoteMutationRejected as error:
+            return Rejected(error.rejection)
+        except ParseError as error:
+            raise NoteContentMutationServiceError(400, str(error)) from error
+        except NoteContentMutationServiceError as error:
+            # Legacy create/update adapters expose structured service errors.
+            # Translate their recoverable outcomes once; preserve other refusals.
+            match error.status_code, error.detail:
+                case 423, _:
+                    return Locked(str(error.detail))
+                case 409, _ if target is None:
+                    # A concurrent create claimed the path after the lookup above.
+                    # Name the note that won it, so the refusal never falls back to
+                    # an identifier derived from the request (#1634).
+                    async with self.session_maker() as session:
+                        winner = await entity_repository.get_by_file_path(
+                            session, data.file_path, load_relations=False
+                        )
+                    return AlreadyExists(
+                        data.file_path,
+                        NoteLocation(
+                            str(winner.external_id),
+                            winner.title,
+                            winner.file_path,
+                            winner.permalink,
+                        )
+                        if winner is not None
+                        else None,
+                    )
+                # update_note reports a moved base revision in the stable
+                # base-checksum wire shape (issue #1445); it is an expected outcome.
+                case 409, {
+                    "message": str() as message,
+                    "db_checksum": (str() | None) as current,
+                } if expected_checksum is not None and message == STALE_BASE_CHECKSUM_MESSAGE:
+                    # The pre-lock lookup can predate the winning write, which may have
+                    # retitled the note, so name it as it reads now (#1719). A note
+                    # deleted under the update lock has no current revision and no name.
+                    current_note: NoteLocation | None = None
+                    if target is not None and current is not None:
+                        async with self.session_maker() as session:
+                            winner = await entity_repository.get_by_external_id(
+                                session, target.external_id, load_relations=False
+                            )
+                        if winner is not None:
+                            current_note = NoteLocation(
+                                str(winner.external_id),
+                                winner.title,
+                                winner.file_path,
+                                winner.permalink,
+                            )
+                    return RevisionConflict(
+                        data.file_path,
+                        current_db_checksum=current,
+                        note=current_note,
+                    )
+                case _:
+                    raise
+
+    async def create_note(
+        self,
+        *,
+        project_external_id: str,
+        data: EntitySchema,
+        user_profile_id: UUID | None,
+        source: str,
+        actor_kind: str | None = None,
+        actor_name: str | None = None,
+    ) -> AcceptedNoteChange:
+        """POST a new markdown note into accepted DB state."""
+        try:
+            return await self._accept_write(
+                AcceptedNoteCreateMutation(
+                    project_external_id=project_external_id,
+                    data=data,
+                    actor=AcceptedNoteMutationActor(user_profile_id, actor_kind, actor_name),
+                    source=source,
+                )
+            )
+        except AcceptedNoteMutationRejected as error:
+            raise note_content_mutation_error_from_rejection(error.rejection) from error
+
+    async def update_note(
+        self,
+        *,
+        project_external_id: str,
+        entity_external_id: str,
+        data: EntitySchema,
+        user_profile_id: UUID | None,
+        source: str,
+        base_checksum: str | None = None,
+        actor_kind: str | None = None,
+        actor_name: str | None = None,
+        base_file_path: str | None = None,
+        replace_frontmatter: bool = False,
+    ) -> AcceptedNoteChange:
+        """PUT a markdown note by creating or replacing accepted DB state.
+
+        ``base_checksum`` is an optional optimistic-concurrency precondition: the
+        db_checksum the caller last synced. When supplied, the update runner
+        rejects the write with a structured 409 if the accepted checksum has
+        moved, so the caller rebases instead of clobbering the newer write
+        (issue #1445). It stays optional so callers without a synced base still
+        write.
+
+        ``base_file_path`` pins the path the caller expected the note to own. A
+        move can leave the checksum unchanged, so a path-addressed replacement
+        passes both, and a moved note is rejected with the same structured 409.
+
+        ``replace_frontmatter`` says ``data`` is the whole document: the written
+        frontmatter is exactly what it supplies, so a key it leaves out is deleted.
+        By default the current note's other frontmatter keys are kept (#1768).
+        """
+        try:
+            return await self._accept_write(
+                AcceptedNoteUpdateMutation(
+                    project_external_id=project_external_id,
+                    entity_external_id=entity_external_id,
+                    data=data,
+                    actor=AcceptedNoteMutationActor(user_profile_id, actor_kind, actor_name),
+                    source=source,
+                    base_checksum=base_checksum,
+                    base_file_path=base_file_path,
+                    replace_frontmatter=replace_frontmatter,
+                )
+            )
+        except AcceptedNoteMutationRejected as error:
+            raise note_content_mutation_error_from_rejection(error.rejection) from error
+
+    async def _accept_write(
+        self,
+        request: AcceptedNoteCreateMutation | AcceptedNoteUpdateMutation,
+    ) -> AcceptedNoteChange:
+        """Share actor resolution, transaction ownership and publication for full writes."""
+        kind: NoteContentMutationKind
+        match request:
+            case AcceptedNoteCreateMutation():
+                kind = "create"
+            case AcceptedNoteUpdateMutation():
+                kind = "update"
+            case _:
+                assert_never(request)
+        actor = self._resolve_actor(
+            kind,
+            user_profile_id=request.actor.user_profile_id,
+            source=request.source,
+            actor_kind=request.actor.kind,
+            actor_name=request.actor.name,
+        )
+        request = replace(
+            request,
+            actor=accepted_note_mutation_actor(
+                user_profile_id=actor.user_profile_id,
+                actor_kind=actor.actor_kind,
+                actor_name=actor.actor_name,
+                author=actor.author,
+            ),
+            source=actor.source,
+        )
+        freshened = ReadCacheChange()
+        if isinstance(request, AcceptedNoteUpdateMutation):
+            freshened = await self.freshen_existing_note_content(
+                project_external_id=request.project_external_id,
+                entity_external_id=request.entity_external_id,
+            )
+        async with self._mutation_cache_scope(
+            request.project_external_id,
+            freshened=freshened,
+        ) as cache_change:
+            async with accepted_note_transaction(self.session_maker) as session:
+                match request:
+                    case AcceptedNoteCreateMutation():
+                        result = await run_accepted_note_create(
+                            session,
+                            request=request,
+                            dependencies=self.mutation_dependencies,
+                        )
+                    case AcceptedNoteUpdateMutation():
+                        result = await run_accepted_note_update(
+                            session,
+                            request=request,
+                            dependencies=self.mutation_dependencies,
+                        )
+                    case _:
+                        assert_never(request)
+                await self.on_accepted_mutation(
+                    session,
+                    project_external_id=request.project_external_id,
+                    change=result.change,
+                    mutation_kind=kind,
+                    source=actor.source,
+                )
+            return await self._finish_mutation(result, cache_change)
+
+    async def edit_note(
+        self,
+        *,
+        project_external_id: str,
+        entity_external_id: str,
+        data: EditEntityRequest,
+        user_profile_id: UUID | None,
+        source: str,
+        base_checksum: str | None = None,
+        actor_kind: str | None = None,
+        actor_name: str | None = None,
+    ) -> AcceptedNoteChange:
+        """PATCH a markdown note using the latest accepted DB content as the base.
+
+        ``base_checksum`` is the same optional optimistic-concurrency
+        precondition ``update_note`` takes: the db_checksum the caller last
+        read. When supplied, an accepted revision that has moved since is
+        rejected with a structured 409 so the caller rebases rather than
+        patching a note it never saw. It stays optional because the ordinary
+        PATCH caller -- an assistant appending to a note through MCP -- has no
+        synced revision to condition on.
+
+        The runner checks it against the row it locks for the edit and maps a
+        lost compare-and-set to the same structured 409, so every guarded
+        refusal comes from one place.
+        """
+        actor_context = self._resolve_actor(
+            "edit",
+            user_profile_id=user_profile_id,
+            source=source,
+            actor_kind=actor_kind,
+            actor_name=actor_name,
+        )
+        try:
+            freshened = await self.freshen_existing_note_content(
+                project_external_id=project_external_id,
+                entity_external_id=entity_external_id,
+            )
+            async with self._mutation_cache_scope(
+                project_external_id,
+                freshened=freshened,
+            ) as cache_change:
+                async with accepted_note_transaction(self.session_maker) as session:
+                    result = await run_accepted_note_edit(
+                        session,
+                        request=AcceptedNoteEditMutation(
+                            project_external_id=project_external_id,
+                            entity_external_id=entity_external_id,
+                            data=data,
+                            actor=accepted_note_mutation_actor(
+                                user_profile_id=actor_context.user_profile_id,
+                                actor_kind=actor_context.actor_kind,
+                                actor_name=actor_context.actor_name,
+                                author=actor_context.author,
+                            ),
+                            source=actor_context.source,
+                            base_checksum=base_checksum,
+                        ),
+                        dependencies=self.mutation_dependencies,
+                    )
+                    await self.on_accepted_mutation(
+                        session,
+                        project_external_id=project_external_id,
+                        change=result.change,
+                        mutation_kind="edit",
+                        source=actor_context.source,
+                    )
+                accepted = await self._finish_mutation(result, cache_change)
+        except AcceptedNoteMutationRejected as error:
+            raise note_content_mutation_error_from_rejection(error.rejection) from error
+        return accepted
+
+    async def move_note(
+        self,
+        *,
+        project_external_id: str,
+        entity_external_id: str,
+        destination_path: str,
+        user_profile_id: UUID | None,
+        source: str,
+        actor_kind: str | None = None,
+        actor_name: str | None = None,
+        base_checksum: str | None = None,
+    ) -> AcceptedNoteChange:
+        """Move a note by accepting the new path before runtime materialization.
+
+        ``base_checksum`` is the optional db_checksum the caller last read; a stale
+        value refuses the move with the same structured 409 edits use.
+        """
+        actor_context = self._resolve_actor(
+            "move",
+            user_profile_id=user_profile_id,
+            source=source,
+            actor_kind=actor_kind,
+            actor_name=actor_name,
+        )
+        try:
+            freshened = await self.freshen_existing_note_content(
+                project_external_id=project_external_id,
+                entity_external_id=entity_external_id,
+            )
+            async with self._mutation_cache_scope(
+                project_external_id,
+                freshened=freshened,
+            ) as cache_change:
+                async with accepted_note_transaction(self.session_maker) as session:
+                    result = await run_accepted_note_move(
+                        session,
+                        request=AcceptedNoteMoveMutation(
+                            project_external_id=project_external_id,
+                            entity_external_id=entity_external_id,
+                            destination_path=destination_path,
+                            actor=accepted_note_mutation_actor(
+                                user_profile_id=actor_context.user_profile_id,
+                                actor_kind=actor_context.actor_kind,
+                                actor_name=actor_context.actor_name,
+                                author=actor_context.author,
+                            ),
+                            source=actor_context.source,
+                            base_checksum=base_checksum,
+                        ),
+                        dependencies=self.mutation_dependencies,
+                    )
+                accepted = await self._finish_mutation(result, cache_change)
+        except AcceptedNoteMutationRejected as error:
+            raise note_content_mutation_error_from_rejection(error.rejection) from error
+        return accepted
+
+    async def delete_note(
+        self,
+        *,
+        project_external_id: str,
+        entity_external_id: str,
+        user_profile_id: UUID | None = None,
+        source: str = ACCEPTED_NOTE_DELETE_SOURCE,
+        actor_kind: str | None = None,
+        actor_name: str | None = None,
+        base_checksum: str | None = None,
+    ) -> AcceptedNoteChange:
+        """DELETE the DB note and return the runtime follow-up change.
+
+        The actor inputs default to an unidentified caller, so a delete with no
+        actor writes the same journal row it always has. The resolver sees
+        ``source`` like every other mutation, but the journal keeps recording
+        deletes under ``ACCEPTED_NOTE_DELETE_SOURCE``: only the actor is new here.
+
+        ``base_checksum`` is the optional db_checksum the caller last read. A stale
+        value, or a note that is already gone, refuses the delete with a 409.
+        """
+        actor_context = self._resolve_actor(
+            "delete",
+            user_profile_id=user_profile_id,
+            source=source,
+            actor_kind=actor_kind,
+            actor_name=actor_name,
+        )
+        try:
+            freshened = await self.freshen_existing_note_content(
+                project_external_id=project_external_id,
+                entity_external_id=entity_external_id,
+            )
+            async with self._mutation_cache_scope(
+                project_external_id,
+                freshened=freshened,
+            ) as cache_change:
+                async with accepted_note_transaction(self.session_maker) as session:
+                    result = await run_accepted_note_delete(
+                        session,
+                        request=AcceptedNoteDeleteMutation(
+                            project_external_id=project_external_id,
+                            entity_external_id=entity_external_id,
+                            actor=accepted_note_mutation_actor(
+                                user_profile_id=actor_context.user_profile_id,
+                                actor_kind=actor_context.actor_kind,
+                                actor_name=actor_context.actor_name,
+                                author=actor_context.author,
+                            ),
+                            base_checksum=base_checksum,
+                        ),
+                        dependencies=self.mutation_dependencies,
+                    )
+                accepted = await self._finish_mutation(result, cache_change)
+        except AcceptedNoteMutationRejected as error:
+            raise note_content_mutation_error_from_rejection(error.rejection) from error
+        return accepted

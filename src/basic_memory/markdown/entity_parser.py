@@ -1,0 +1,444 @@
+"""Parser for markdown files into Entity objects.
+
+Uses markdown-it with plugins to parse structured data from markdown content.
+"""
+
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import dateparser
+import frontmatter
+from loguru import logger
+from markdown_it import MarkdownIt
+
+from basic_memory.markdown.plugins import observation_plugin, relation_plugin
+from basic_memory.markdown.path_links import markdown_link_path
+from basic_memory.markdown.schemas import (
+    EntityFrontmatter,
+    EntityMarkdown,
+    FrontmatterState,
+    Observation,
+    Relation,
+)
+from basic_memory.markdown.sections import scan_sections
+from basic_memory.schemas.document import DocumentSourceV1
+from basic_memory.utils import parse_tags
+
+
+md = MarkdownIt().use(observation_plugin).use(relation_plugin)
+
+
+def normalize_frontmatter_value(value: Any) -> Any:
+    """Normalize frontmatter values to safe types for processing.
+
+    PyYAML automatically converts various string-like values into native Python types:
+    - Date strings ("2025-10-24") → datetime.date objects
+    - Numbers ("1.0") → int or float
+    - Booleans ("true") → bool
+    - Lists → list objects
+
+    This can cause AttributeError when code expects strings and calls string methods
+    like .strip() on these values (see GitHub issue #236).
+
+    This function normalizes all frontmatter values to safe types:
+    - Dates/datetimes → ISO format strings
+    - Numbers (int/float) → strings
+    - Booleans → strings ("True"/"False")
+    - Lists → preserved as lists, but items are recursively normalized
+    - Dicts → preserved as dicts, but values are recursively normalized
+    - Strings → kept as-is
+    - None → kept as None
+
+    Args:
+        value: The frontmatter value to normalize
+
+    Returns:
+        The normalized value safe for string operations
+
+    Example:
+        >>> normalize_frontmatter_value(datetime.date(2025, 10, 24))
+        '2025-10-24'
+        >>> normalize_frontmatter_value([datetime.date(2025, 10, 24), "tag", 123])
+        ['2025-10-24', 'tag', '123']
+        >>> normalize_frontmatter_value(True)
+        'True'
+    """
+    # Convert date/datetime objects to ISO format strings
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+
+    # Convert boolean to string (must come before int check since bool is subclass of int)
+    if isinstance(value, bool):
+        return str(value)
+
+    # Convert numbers to strings
+    if isinstance(value, (int, float)):
+        return str(value)
+
+    # Recursively process lists (preserve as list, normalize items)
+    if isinstance(value, list):
+        return [normalize_frontmatter_value(item) for item in value]
+
+    # Recursively process dicts (preserve as dict, normalize values)
+    if isinstance(value, dict):
+        return {key: normalize_frontmatter_value(val) for key, val in value.items()}
+
+    # Keep strings and None as-is
+    return value
+
+
+def _coerce_to_string(value: Any) -> str:
+    """Coerce a frontmatter value to a string.
+
+    YAML can parse scalar-looking fields as lists when the author uses block
+    sequence syntax.  For fields like ``title`` and ``type`` that *must* be
+    strings, this helper converts lists to a comma-separated string and any
+    other non-string type via ``str()``.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        # Join list items, converting each to string first
+        return ", ".join(str(item) for item in value)
+    return str(value)
+
+
+def normalize_frontmatter_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Normalize all values in frontmatter metadata dict.
+
+    Converts date/datetime objects to ISO format strings to prevent
+    AttributeError when code expects strings (GitHub issue #236).
+
+    Args:
+        metadata: The frontmatter metadata dictionary
+
+    Returns:
+        A new dictionary with all values normalized
+    """
+    return {key: normalize_frontmatter_value(value) for key, value in metadata.items()}
+
+
+def _iso_timestamp(value: Any) -> datetime | None:
+    """Return the ISO 8601 datetime a frontmatter value spells, or None if it spells none."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _parse_frontmatter_timestamp(
+    metadata: dict[str, Any],
+    field_name: str,
+    *,
+    fallback: datetime,
+    file_path: Path,
+) -> datetime:
+    """Parse one canonical semantic timestamp after YAML value normalization."""
+    value = metadata.get(field_name)
+    if value is None:
+        return fallback
+
+    # Trigger: the field holds something other than an ISO 8601 string, such as a
+    #          template placeholder (`{{date}}`) or freeform text from an import.
+    # Why: the timestamp is metadata about the note, not its content. Rejecting it
+    #      would leave the whole note out of the index over one unreadable field.
+    # Outcome: index the note with the file-time fallback and warn with the path so
+    #          the author can fix the value.
+    timestamp = _iso_timestamp(value)
+    if timestamp is None:
+        logger.warning(
+            f"Invalid ISO 8601 value for frontmatter field '{field_name}' in "
+            f"{file_path.as_posix()}: {value!r}. Using the file timestamp instead."
+        )
+        return fallback
+
+    # ISO date-only and naive datetime values describe local wall-clock time.
+    # Explicit offsets are already unambiguous and must remain unchanged.
+    if timestamp.utcoffset() is None:
+        return timestamp.astimezone()
+    return timestamp
+
+
+@dataclass
+class EntityContent:
+    content: str
+    observations: list[Observation] = field(default_factory=list)
+    relations: list[Relation] = field(default_factory=list)
+
+
+def parse(content: str) -> EntityContent:
+    """Parse markdown content into EntityMarkdown."""
+
+    # Parse content for observations and relations using markdown-it
+    observations = []
+    relations = []
+
+    if content:
+        for token in md.parse(content):
+            # MarkdownIt owns link syntax, including escapes, reference links and
+            # code exclusion. A Markdown link is recorded as the path its author
+            # wrote; it resolves against the note's own path later, like any other
+            # relation, so parsing needs no idea of where the bytes came from.
+            for child in token.children or []:
+                if child.type == "link_open":
+                    href = child.attrGet("href")
+                    assert isinstance(href, str)
+                    target = markdown_link_path(href) if href else None
+                    if target is not None:
+                        relations.append(Relation(type="links_to", target=target))
+            # check for observations and relations
+            if token.meta:
+                if "observation" in token.meta:
+                    obs = token.meta["observation"]
+                    observation = Observation.model_validate(obs)
+                    observations.append(observation)
+                if "relations" in token.meta:
+                    rels = token.meta["relations"]
+                    relations.extend([Relation.model_validate(r) for r in rels])
+
+    return EntityContent(
+        content=content,
+        observations=observations,
+        relations=relations,
+    )
+
+
+# def parse_tags(tags: Any) -> list[str]:
+#     """Parse tags into list of strings."""
+#     if isinstance(tags, (list, tuple)):
+#         return [str(t).strip() for t in tags if str(t).strip()]
+#     return [t.strip() for t in tags.split(",") if t.strip()]
+
+
+class EntityParser:
+    """Parser for markdown files into Entity objects."""
+
+    def __init__(self, base_path: Path):
+        """Initialize parser with base path for relative permalink generation."""
+        self.base_path = base_path.resolve()
+
+    def parse_date(self, value: Any) -> Optional[datetime]:
+        """Parse date strings using dateparser for maximum flexibility.
+
+        Supports human friendly formats like:
+        - 2024-01-15
+        - Jan 15, 2024
+        - 2024-01-15 10:00 AM
+        - yesterday
+        - 2 days ago
+        """
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            parsed = dateparser.parse(value)
+            if parsed:
+                return parsed
+        return None
+
+    async def parse_file(self, path: Path | str) -> EntityMarkdown:
+        """Parse markdown file into EntityMarkdown."""
+
+        # Check if the path is already absolute
+        if (
+            isinstance(path, Path)
+            and path.is_absolute()
+            or (isinstance(path, str) and Path(path).is_absolute())
+        ):
+            absolute_path = Path(path)
+        else:
+            absolute_path = self.get_file_path(path)
+
+        # Parse frontmatter and content using python-frontmatter
+        file_content = absolute_path.read_text(encoding="utf-8")
+        return await self.parse_file_content(absolute_path, file_content)
+
+    def get_file_path(self, path):
+        """Get absolute path for a file using the base path for the project."""
+        return self.base_path / path
+
+    async def parse_file_content(self, absolute_path, file_content):
+        """Parse markdown content from file stats.
+
+        Delegates to parse_markdown_content() for actual parsing logic.
+        Exists for backwards compatibility with code that passes file paths.
+        """
+        # Extract file stat info for timestamps
+        file_stats = absolute_path.stat()
+
+        # Delegate to parse_markdown_content with timestamps from file stats
+        return await self.parse_markdown_content(
+            file_path=absolute_path,
+            content=file_content,
+            mtime=file_stats.st_mtime,
+            ctime=file_stats.st_ctime,
+        )
+
+    async def parse_markdown_content(
+        self,
+        file_path: Path,
+        content: str,
+        mtime: Optional[float] = None,
+        ctime: Optional[float] = None,
+    ) -> EntityMarkdown:
+        """Parse markdown content without requiring file to exist on disk.
+
+        Useful for parsing content from S3 or other remote sources where the file
+        is not available locally.
+
+        Args:
+            file_path: Path for metadata (doesn't need to exist on disk)
+            content: Markdown content as string
+            mtime: Optional modification time (Unix timestamp)
+            ctime: Optional creation time (Unix timestamp)
+
+        Returns:
+            EntityMarkdown with parsed content
+        """
+        # Strip BOM before parsing (can be present in files from Windows or certain sources)
+        # See issue #452
+        from basic_memory.file_utils import (
+            ParseError,
+            has_frontmatter,
+            parse_frontmatter,
+            strip_bom,
+        )
+
+        content = strip_bom(content)
+
+        # PostgreSQL rejects null bytes (0x00) in text columns.
+        # Some markdown files (e.g. Claude agent definitions) contain embedded nulls.
+        content = content.replace("\x00", "")
+
+        # Parse frontmatter with proper error handling for malformed YAML.
+        # We use frontmatter.parse() instead of frontmatter.loads() because
+        # loads() does Post(content, handler, **metadata), which crashes when
+        # the YAML contains reserved keys like 'content' or 'handler'.
+        # See basic-memory-cloud#375.
+        # Classify before splitting. python-frontmatter strips a fenced block that
+        # is valid YAML but not a mapping (a bare scalar, a list) as if it were
+        # metadata, silently discarding its text; parse_frontmatter applies the
+        # rule every writer here enforces, so a block it rejects is body (#1451).
+        frontmatter_state: FrontmatterState = "absent"
+        if has_frontmatter(content):
+            try:
+                parse_frontmatter(content)
+                frontmatter_state = "present"
+            except ParseError as e:
+                logger.warning(
+                    f"Failed to parse YAML frontmatter in {file_path}: {e}. "
+                    f"Treating file as plain markdown without frontmatter."
+                )
+                frontmatter_state = "malformed"
+        if frontmatter_state == "present":
+            fm_metadata, fm_content = frontmatter.parse(content)
+            post = frontmatter.Post(fm_content)
+            post.metadata.update(fm_metadata)
+        else:
+            # Use Post(content) not Post(content, metadata={})
+            # The latter creates {"metadata": {}} in the metadata dict (issue #528)
+            post = frontmatter.Post(content)
+
+        # Normalize frontmatter values
+        metadata = normalize_frontmatter_metadata(post.metadata)
+
+        # Ensure required string fields are always strings.
+        # YAML can parse these as lists when authors use block sequence syntax
+        # (e.g. "title:\n  - My Title"), causing 'list' has no attribute 'strip'
+        # downstream.  See basic-memory-cloud#376.
+        title = metadata.get("title")
+        if title is not None:
+            title = _coerce_to_string(title)
+        if not title or title == "None":
+            metadata["title"] = file_path.stem
+        else:
+            metadata["title"] = title
+
+        note_type = metadata.get("type")
+        if note_type is not None:
+            note_type = _coerce_to_string(note_type)
+        metadata["type"] = note_type if note_type is not None else "note"
+
+        tags = parse_tags(metadata.get("tags", []))  # pyright: ignore
+        if tags:
+            metadata["tags"] = tags
+
+        # Raw extraction text is useful for retrieval but is untrusted semantic input.
+        # The ingestion contract sets this explicit opt-out so arbitrary PDF syntax cannot
+        # mint observations or relations before the bounded enrichment pass.
+        entity_frontmatter = EntityFrontmatter(metadata=metadata)
+        semantic_setting = metadata.get("bm_parse_semantics")
+        parse_semantics = not (
+            semantic_setting is False
+            or (isinstance(semantic_setting, str) and semantic_setting.lower() == "false")
+        )
+        entity_content = (
+            parse(post.content) if parse_semantics else EntityContent(content=post.content)
+        )
+
+        # Extraction provenance comes from the validated source contract, not raw body syntax.
+        # Project it even before enrichment without changing extraction bytes or page offsets.
+        if metadata.get("schema") == "schema/document-extraction":
+            source = DocumentSourceV1.model_validate(post.metadata.get("source"))
+            provenance = Relation(type="derived_from", target=str(source.entity_external_id))
+            if provenance not in entity_content.relations:
+                entity_content.relations.append(provenance)
+
+        # The parser reports only a qualifier the author plainly meant: an unknown kind,
+        # an unterminated quote, or a date the one-token rule truncated. None of those
+        # reach the index, so this warning is how an author learns the line needs fixing.
+        # Text that simply is not a date is ordinary content and says nothing here. The
+        # typed `temporal_error` field carries the same message to programmatic callers;
+        # this layer adds the path.
+        # `as_posix()` rather than the Path itself: Basic Memory names files with
+        # forward slashes everywhere (entity.file_path, permalinks, search rows), so a
+        # Windows `WindowsPath` rendering `decisions\cache-layer.md` would print a path
+        # the author cannot find in any other surface.
+        for observation in entity_content.observations:
+            if observation.temporal_error:
+                logger.warning(
+                    f"Temporal qualifier ignored in {file_path.as_posix()}: "
+                    f"{observation.temporal_error}"
+                )
+
+        # Sections are structural, not semantic: they index the body for range reads,
+        # so the bm_parse_semantics opt-out above must not suppress them.
+        sections = scan_sections(post.content)
+
+        # Canonical frontmatter timestamps describe note semantics. File times are
+        # only compatibility fallbacks for notes that do not declare them.
+        now = datetime.now().astimezone()
+        created_fallback = (
+            datetime.fromtimestamp(ctime, tz=UTC).astimezone() if ctime is not None else now
+        )
+        modified_fallback = (
+            datetime.fromtimestamp(mtime, tz=UTC).astimezone() if mtime is not None else now
+        )
+        created = _parse_frontmatter_timestamp(
+            metadata,
+            "created",
+            fallback=created_fallback,
+            file_path=file_path,
+        )
+        modified = _parse_frontmatter_timestamp(
+            metadata,
+            "modified",
+            fallback=modified_fallback,
+            file_path=file_path,
+        )
+
+        return EntityMarkdown(
+            frontmatter=entity_frontmatter,
+            frontmatter_state=frontmatter_state,
+            content=post.content,
+            observations=entity_content.observations,
+            relations=entity_content.relations,
+            sections=list(sections),
+            created=created,
+            modified=modified,
+        )

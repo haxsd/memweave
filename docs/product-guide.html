@@ -1,0 +1,1041 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MemWeave · 产品与设计导览</title>
+<meta name="description" content="MemWeave 的产品逻辑与设计导览：任务工作记忆、长期知识、项目身份、恢复与接入。">
+<style>
+  :root {
+    --bg: #1e1e1e;
+    --bg-2: #252526;
+    --bg-3: #2d2d30;
+    --code: #1b1b1c;
+    --text: #f0f0f0;
+    --muted: #b8b8b8;
+    --faint: #8a8a8a;
+    --accent: #4ea1ff;
+    --accent-soft: rgba(78, 161, 255, 0.14);
+    --green: #4ec9b0;
+    --orange: #d7ba7d;
+    --purple: #c586c0;
+    --red: #f48771;
+    --border: rgba(255, 255, 255, 0.12);
+    --border-strong: rgba(255, 255, 255, 0.2);
+    --radius: 12px;
+    --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 70px; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(900px 400px at 15% -10%, rgba(78, 161, 255, 0.1), transparent 70%),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre { font-family: var(--mono); }
+  .wrap { width: min(1180px, calc(100% - 40px)); margin: 0 auto; }
+
+  .skip {
+    position: absolute; left: -999px; top: 12px; z-index: 100;
+    background: var(--accent); color: #111; padding: 8px 12px; border-radius: 6px;
+  }
+  .skip:focus { left: 12px; }
+
+  .hero { padding: 72px 0 40px; }
+  .eyebrow {
+    margin: 0; color: var(--faint); font-size: 12px; font-weight: 700;
+    letter-spacing: 0.14em; text-transform: uppercase;
+  }
+  h1 {
+    margin: 10px 0 0; max-width: 980px;
+    font-size: clamp(32px, 5vw, 50px); line-height: 1.12; letter-spacing: -0.02em;
+  }
+  .lede {
+    max-width: 820px; margin: 16px 0 0; color: var(--muted);
+    font-size: clamp(15px, 1.8vw, 18px); line-height: 1.8;
+  }
+
+  .topnav {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(30, 30, 30, 0.92);
+    backdrop-filter: blur(12px);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-inner { display: flex; align-items: center; gap: 16px; height: 54px; }
+  .brand { flex: 0 0 auto; font-size: 13px; font-weight: 800; letter-spacing: 0.02em; color: var(--text); }
+  .brand:hover { text-decoration: none; color: var(--accent); }
+  .nav-links { display: flex; align-items: center; gap: 2px; overflow-x: auto; scrollbar-width: none; }
+  .nav-links::-webkit-scrollbar { display: none; }
+  .nav-links a {
+    flex: 0 0 auto; padding: 6px 8px; border-radius: 6px;
+    color: var(--faint); font-size: 12px; white-space: nowrap;
+  }
+  .nav-links a:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); text-decoration: none; }
+  .nav-links a.active { color: var(--text); background: var(--accent-soft); }
+
+  main { padding-bottom: 8px; }
+  .section { padding: 56px 0 48px; border-top: 1px solid var(--border); }
+  main > .section:first-child { border-top: 0; }
+  .chapter-no {
+    margin: 0; color: var(--accent); font-size: 12px; font-weight: 700;
+    letter-spacing: 0.1em; text-transform: uppercase;
+  }
+  h2 { margin: 8px 0 10px; font-size: clamp(24px, 3.2vw, 34px); line-height: 1.25; letter-spacing: -0.01em; }
+  h3 { margin: 0; font-size: 15px; line-height: 1.4; }
+  .lead { max-width: 900px; margin: 0; color: var(--muted); font-size: 15px; line-height: 1.85; }
+  .takeaway {
+    margin: 24px 0 0; padding: 14px 16px;
+    border-left: 3px solid var(--accent); background: var(--bg-2);
+    border-radius: 0 8px 8px 0; color: var(--muted); line-height: 1.75;
+  }
+  .takeaway strong { color: var(--text); }
+
+  .frame {
+    margin-top: 22px; padding: 18px;
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  .frame-head { margin-bottom: 12px; }
+  .frame-head p { margin: 4px 0 0; color: var(--faint); font-size: 12px; line-height: 1.6; }
+
+  .grid { display: grid; gap: 12px; }
+  .cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .walk-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .card {
+    padding: 14px; background: var(--bg-3);
+    border: 1px solid var(--border); border-radius: 10px;
+  }
+  .card p { margin: 8px 0 0; color: var(--muted); font-size: 13px; line-height: 1.75; }
+  .kicker { margin: 0; color: var(--accent); font-size: 13px; font-weight: 700; line-height: 1.5; }
+  .muted { color: var(--faint); font-size: 12px; }
+  .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; }
+  .tag {
+    display: inline-block; padding: 3px 8px;
+    border: 1px solid var(--border-strong); border-radius: 999px;
+    color: var(--muted); font-size: 11px; white-space: nowrap;
+  }
+  .arr { color: var(--faint); font-size: 12px; }
+
+  .diagram { display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; }
+  .diagram .box { flex: 1 1 180px; min-width: 0; }
+  .diagram .arrow { display: flex; align-items: center; justify-content: center; color: var(--faint); font-size: 16px; }
+  .box {
+    padding: 10px 12px; background: var(--bg-3);
+    border: 1px solid var(--border); border-radius: 9px;
+  }
+  .box.accent { border-color: rgba(78, 161, 255, 0.55); background: var(--accent-soft); }
+  .box strong { display: block; font-size: 12px; }
+  .box span { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+
+  .project-shell { padding: 12px; background: var(--bg-3); border: 1px solid var(--border-strong); border-radius: 10px; }
+  .project-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .project-head strong { font-size: 12px; }
+  .project-head .path { color: var(--faint); font-size: 11px; font-family: var(--mono); }
+  .project-children { margin-top: 8px; padding-left: 10px; border-left: 1px dashed var(--border-strong); }
+  .project-children > .muted { display: block; margin: 0; }
+  .project-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
+  .project-card { padding: 10px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; }
+  .project-card strong { display: block; font-size: 12px; }
+  .project-card span { display: block; margin-top: 2px; color: var(--faint); font-size: 11px; }
+
+  .state-svg { display: block; width: 100%; height: auto; margin-top: 4px; }
+  .state-svg text { font-family: var(--sans); }
+  .diagram-scroll { overflow-x: auto; margin-top: 10px; }
+  .sequence-svg { display: block; width: 100%; min-width: 760px; height: auto; }
+  .sequence-svg text { font-family: var(--sans); }
+  .coverage { display: grid; gap: 6px; margin-top: 12px; }
+  .coverage-row {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg-3); font-size: 12px;
+  }
+  .coverage-row.boundary { border-left: 3px solid var(--accent); }
+  .coverage-row.continuous { border-left: 3px solid var(--green); }
+  .coverage-label { font-weight: 700; color: var(--text); }
+  .coverage-items { color: var(--muted); }
+  .coverage-note { margin-left: auto; color: var(--faint); font-size: 11px; }
+
+  .record-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .record { padding: 12px; background: var(--bg-3); border: 1px solid var(--border); border-radius: 10px; }
+  .record-head { display: flex; align-items: flex-start; gap: 8px; }
+  .num {
+    flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; border-radius: 50%;
+    background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 700;
+  }
+  .record-head h3 { margin: 0; font-size: 13px; }
+  .record-head .path { display: block; margin-top: 2px; color: var(--accent); font-family: var(--mono); font-size: 10.5px; word-break: break-all; }
+  .record > p { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
+  pre {
+    margin: 0; padding: 10px; background: var(--code);
+    border: 1px solid var(--border); border-radius: 8px;
+    overflow-x: auto; color: var(--muted); font-size: 10.5px; line-height: 1.6;
+  }
+  pre code { font-size: inherit; }
+
+  .callout {
+    margin-top: 10px; padding: 10px 12px;
+    border: 1px dashed var(--border-strong); border-radius: 8px;
+    color: var(--muted); font-size: 12px; line-height: 1.7;
+  }
+
+  .lifecycle { display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: wrap; }
+  .lifecycle .box { flex: 0 1 180px; text-align: center; }
+  .lifecycle .arrow { color: var(--faint); }
+
+  .budget-wrap { margin-top: 12px; }
+  .budget-bar { display: flex; height: 38px; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; }
+  .budget-bar span {
+    display: flex; align-items: center; justify-content: center;
+    min-width: 0; overflow: hidden; padding: 0 6px;
+    color: #111; font-size: 11px; font-weight: 700; white-space: nowrap;
+  }
+  .seg-task { background: #4ea1ff; }
+  .seg-reboot { background: #4ec9b0; }
+  .seg-units { background: #c586c0; }
+  .seg-knowledge { background: #d7ba7d; }
+  .seg-graph { background: #9a9a9a; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .list { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; line-height: 1.8; }
+  .list li { margin: 5px 0; }
+
+  .table-wrap { margin-top: 12px; overflow-x: auto; }
+  table { width: 100%; min-width: 680px; border-collapse: collapse; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; font-size: 12px; line-height: 1.65; }
+  th { color: var(--faint); font-weight: 700; }
+  td { color: var(--muted); }
+  tbody tr:last-child td { border-bottom: 0; }
+  .dot { display: inline-block; width: 7px; height: 7px; margin-right: 5px; border-radius: 50%; vertical-align: 1px; }
+  .dot.yes { background: var(--accent); }
+  .dot.partial { background: var(--orange); }
+  .dot.no { background: var(--faint); }
+
+  .code-map { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .map-stack { display: flex; flex-direction: column; gap: 6px; }
+  .map-box { padding: 8px 10px; background: var(--bg-3); border: 1px solid var(--border); border-radius: 8px; }
+  .map-box strong { display: block; font-size: 12px; }
+  .map-box span { display: block; margin-top: 2px; color: var(--faint); font-size: 11px; }
+  .map-arrow { color: var(--faint); text-align: center; font-size: 12px; line-height: 1; }
+
+  .footer { padding: 28px 0 44px; border-top: 1px solid var(--border); color: var(--faint); font-size: 12px; line-height: 1.8; }
+  .footer p { margin: 4px 0; }
+
+  @media (max-width: 900px) {
+    html { scroll-padding-top: 96px; }
+    .cols-3, .cols-2, .record-grid, .two-col, .code-map, .walk-grid { grid-template-columns: 1fr; }
+    .project-grid { grid-template-columns: 1fr; }
+    .split { grid-template-columns: 1fr; }
+    .diagram .arrow { display: none; }
+    .hero { padding-top: 48px; }
+    .section { padding: 42px 0 36px; }
+    .nav-inner { height: auto; padding: 8px 0; align-items: flex-start; flex-direction: column; gap: 6px; }
+    .nav-links { width: 100%; padding-bottom: 2px; }
+  }
+
+  @media (max-width: 520px) {
+    .wrap { width: min(100% - 24px, 1180px); }
+    .frame { padding: 14px; }
+    .budget-bar span { font-size: 0; }
+    .budget-bar span::before { content: ""; }
+  }
+
+  @media print {
+    .topnav { position: static; }
+    body { background: #fff; color: #111; }
+    .card, .frame, .box, .record, .project-shell, .project-card, .map-box { background: #fff; }
+    .lead, .card p, .record > p, .list, td { color: #333; }
+    a { color: #0645ad; }
+  }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">跳到正文</a>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <p class="eyebrow">产品与设计导览</p>
+    <h1>MemWeave 贯穿项目的整个生命周期</h1>
+    <p class="lede">
+      AI 推进一个项目时，上下文会满、会话会换、工具也会换。MemWeave 把任务做到哪、试过什么、下一步做什么记在本机，并把值得复用的经验沉淀下来，让下一次能接着干。
+    </p>
+  </div>
+</header>
+
+<nav class="topnav" aria-label="章节导航">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">MemWeave</a>
+    <div class="nav-links">
+      <a href="#ch-00">00 优势</a>
+      <a href="#ch-01">01 项目</a>
+      <a href="#ch-02">02 任务</a>
+      <a href="#ch-03">03 记录</a>
+      <a href="#ch-04">04 并行</a>
+      <a href="#ch-05">05 收束</a>
+      <a href="#ch-06">06 召回</a>
+      <a href="#ch-07">07 接入</a>
+    </div>
+  </div>
+</nav>
+
+<main id="main" class="wrap">
+
+  <section id="ch-00" class="section" data-chapter>
+    <p class="chapter-no">00 / 优势</p>
+    <h2>长任务不跑偏，项目和经验都能接上</h2>
+    <p class="lead">
+      推进一个长任务时，上下文会越来越长，还会经历多次压缩。AI 可能忘记目标、重复试错，甚至偏离方向；如果中途换了会话或客户端，任务状态又断了。
+    </p>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>三个直接好处</h3>
+        <p>一个解决长任务跑偏，一个解决换会话/客户端断线，一个解决经验留不下来。</p>
+      </div>
+      <div class="grid cols-3">
+        <article class="card">
+          <p class="kicker">01 长任务不跑偏</p>
+          <p>任务做久了，AI 容易忘记目标、重复试错，甚至被中间细节带偏。</p>
+          <p>MemWeave 把目标、失败和下一步记在本机，每次压缩或新会话后都带回来，减少这种偏移。</p>
+          <div class="flow">
+            <span class="tag">长上下文</span><span class="arr">→</span>
+            <span class="tag">多次压缩</span><span class="arr">→</span>
+            <span class="tag">目标 / 失败 / 下一步</span>
+          </div>
+        </article>
+        <article class="card">
+          <p class="kicker">02 项目记忆跨会话、跨客户端</p>
+          <p>项目原本在一个工具里推进，下一次开新会话，或换到另一个 MCP 客户端，仍然接着同一个项目、同一个任务。</p>
+          <p>不需要重新解释目标、进度和失败；换的是工具或会话，不是任务。</p>
+          <div class="flow">
+            <span class="tag">工具 A</span><span class="arr">→</span>
+            <span class="tag">工具 B</span><span class="arr">→</span>
+            <span class="tag">同一个任务</span>
+          </div>
+          <p class="muted" style="margin-top:8px">同一个项目，同一个任务。</p>
+        </article>
+        <article class="card">
+          <p class="kicker">03 任务沉淀经验，用户记忆跨项目</p>
+          <p>每个任务结束时，把值得复用的结论审核后沉淀为项目经验；下次遇到类似工作，可以直接复用，不用重新摸索。</p>
+          <p>用户明确要求保留的偏好或经验，可以跨项目使用；只有显式启用才进入上下文。</p>
+          <div class="flow">
+            <span class="tag">任务结束</span><span class="arr">→</span>
+            <span class="tag">证据审查</span><span class="arr">→</span>
+            <span class="tag">项目经验</span>
+          </div>
+          <p class="muted" style="margin-top:8px">用户记忆：跨项目，显式启用。</p>
+        </article>
+      </div>
+    </div>
+
+    <p class="takeaway">
+      <strong>一句话：</strong>MemWeave 不替你写代码。它把任务的目标、失败和下一步记在本机，让 AI 在长任务压缩后、换会话或换客户端时仍然能接着做；任务结束后，还能把项目经验沉淀下来。
+    </p>
+  </section>
+
+  <section id="ch-01" class="section" data-chapter>
+    <p class="chapter-no">01 / 项目</p>
+    <h2>项目就是你打开的那个文件夹</h2>
+    <p class="lead">
+      多个客户端能接上同一个项目，前提是它们认的是同一个项目身份。项目身份不是客户端账号，也不是聊天会话，而是你打开的那个绝对文件夹。子目录可以再登记成独立项目；登记后它只读自己，不需要知道父项目。父项目本来就能看到全部代码，也可以直接当一个项目推进；需要快速了解已登记的子项目时，再读它们的摘要。
+    </p>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>项目身份跟着文件夹走</h3>
+        <p>客户端只是读取入口；同一个文件夹，不管从哪个工具打开，都是同一个项目。</p>
+      </div>
+      <div class="diagram">
+        <div class="box">
+          <strong>不同客户端</strong>
+          <span>AI 工具 A</span>
+          <span>AI 工具 B</span>
+          <span>AI 工具 C</span>
+        </div>
+        <div class="arrow">→</div>
+        <div class="box accent">
+          <strong>同一个文件夹</strong>
+          <span>绝对路径 = 项目身份</span>
+          <span style="font-family:var(--mono)">C:\code\A</span>
+        </div>
+        <div class="arrow">→</div>
+        <div class="box">
+          <strong>同一个项目</strong>
+          <span>任务 / 检查点 / 阶段 / 知识</span>
+          <span>换客户端，不换项目</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>同一个文件夹，可以只登记 A，也可以登记子目录</h3>
+        <p>登记 B/C 后，它们是独立项目，A 不接管；A 本来就能看到全部代码，也可以直接推进。</p>
+      </div>
+      <div class="project-shell">
+        <div class="project-head">
+          <div>
+            <strong>A 项目（已登记）</strong>
+            <span class="path">C:\code\A</span>
+          </div>
+          <span class="muted">current = A-1</span>
+        </div>
+        <div class="project-children">
+          <span class="muted">services\</span>
+          <div class="project-grid">
+            <div class="project-card">
+              <strong>B 独立项目（可选登记）</strong>
+              <span>current = B-1</span>
+              <span>只读自己</span>
+            </div>
+            <div class="project-card">
+              <strong>C 独立项目（可选登记）</strong>
+              <span>current = C-1</span>
+              <span>只读自己</span>
+            </div>
+          </div>
+          <span class="muted" style="display:block;margin-top:6px">docs\（未登记，属于 A）</span>
+        </div>
+      </div>
+      <p class="lead" style="margin-top:16px">
+        B、C 登记后就是独立项目：任务、检查点、知识都只属于自己，恢复时不需要读 A。A 能看到全部代码，不登记 B/C 也能直接当一个大项目推进；读 B/C 摘要只是可选的加速。worktree 是 A 的执行别名，不同 clone 是另一个项目。
+      </p>
+    </div>
+
+    <p class="takeaway">
+      <strong>一句话：</strong>同一个文件夹是同一个项目；登记子目录只是让它成为独立项目，不会让它依赖父项目。父项目可以直接当一个大项目推进，需要时再读子项目摘要。
+    </p>
+  </section>
+
+  <section id="ch-02" class="section" data-chapter>
+    <p class="chapter-no">02 / 任务</p>
+    <h2>一次只推进一个主任务</h2>
+    <p class="lead">
+      任务不是一条待办，而是一份可恢复的契约：目标、验收、阶段、下一步和契约摘要。顶层任务顺序化，任务内部才并行；无关工作走侧任务，不抢主队列。
+    </p>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>任务状态机</h3>
+        <p>新任务进入 current 或 queued；current 完成后进入 completed，审查后归档；queued 在 current 关闭后补位。</p>
+      </div>
+      <svg class="state-svg" viewBox="0 0 800 250" role="img" aria-label="任务状态机：新任务进入 current 或 queued；current 完成后进入 completed，再审查归档；取消后直接归档；queued 在 current 关闭后成为 current">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a8a8a"></path>
+          </marker>
+        </defs>
+        <g font-family="var(--sans)" font-size="12">
+          <rect x="10" y="30" width="150" height="56" rx="8" fill="#2d2d30" stroke="#3a3a3a"></rect>
+          <text x="85" y="54" text-anchor="middle" fill="#f0f0f0" font-size="13">新任务</text>
+          <text x="85" y="72" text-anchor="middle" fill="#b8b8b8" font-size="10">新目标</text>
+
+          <rect x="220" y="30" width="150" height="56" rx="8" fill="rgba(78,161,255,.14)" stroke="#4ea1ff"></rect>
+          <text x="295" y="54" text-anchor="middle" fill="#f0f0f0" font-size="13">current</text>
+          <text x="295" y="72" text-anchor="middle" fill="#b8b8b8" font-size="10">唯一主任务</text>
+
+          <rect x="430" y="30" width="150" height="56" rx="8" fill="#2d2d30" stroke="#3a3a3a"></rect>
+          <text x="505" y="54" text-anchor="middle" fill="#f0f0f0" font-size="13">completed</text>
+          <text x="505" y="72" text-anchor="middle" fill="#b8b8b8" font-size="10">等待经验审查</text>
+
+          <rect x="640" y="30" width="150" height="56" rx="8" fill="#2d2d30" stroke="#3a3a3a"></rect>
+          <text x="715" y="54" text-anchor="middle" fill="#f0f0f0" font-size="13">archived</text>
+          <text x="715" y="72" text-anchor="middle" fill="#b8b8b8" font-size="10">审查后归档</text>
+
+          <rect x="220" y="170" width="150" height="56" rx="8" fill="#2d2d30" stroke="#3a3a3a"></rect>
+          <text x="295" y="194" text-anchor="middle" fill="#f0f0f0" font-size="13">queued</text>
+          <text x="295" y="212" text-anchor="middle" fill="#b8b8b8" font-size="10">按位置排队</text>
+
+          <rect x="430" y="170" width="150" height="56" rx="8" fill="#2d2d30" stroke="#3a3a3a"></rect>
+          <text x="505" y="194" text-anchor="middle" fill="#f0f0f0" font-size="13">cancelled</text>
+          <text x="505" y="212" text-anchor="middle" fill="#b8b8b8" font-size="10">取消 · 直接归档</text>
+
+          <line x1="160" y1="58" x2="220" y2="58" stroke="#8a8a8a" marker-end="url(#arrow)"></line>
+          <text x="190" y="76" text-anchor="middle" fill="#8a8a8a" font-size="10">无 current</text>
+
+          <path d="M 85 86 L 85 198 L 220 198" fill="none" stroke="#8a8a8a" marker-end="url(#arrow)"></path>
+          <text x="95" y="145" fill="#8a8a8a" font-size="10">已有 current → 排队</text>
+
+          <line x1="295" y1="170" x2="295" y2="86" stroke="#8a8a8a" marker-end="url(#arrow)"></line>
+          <text x="285" y="132" text-anchor="end" fill="#8a8a8a" font-size="10">current 关闭后</text>
+
+          <line x1="370" y1="58" x2="430" y2="58" stroke="#8a8a8a" marker-end="url(#arrow)"></line>
+          <text x="400" y="76" text-anchor="middle" fill="#8a8a8a" font-size="10">完成</text>
+
+          <line x1="580" y1="58" x2="640" y2="58" stroke="#8a8a8a" marker-end="url(#arrow)"></line>
+          <text x="610" y="76" text-anchor="middle" fill="#8a8a8a" font-size="10">审查完成</text>
+
+          <path d="M 370 86 L 430 170" fill="none" stroke="#8a8a8a" marker-end="url(#arrow)"></path>
+          <text x="440" y="135" fill="#8a8a8a" font-size="10">取消</text>
+        </g>
+      </svg>
+      <div class="grid cols-2" style="margin-top:10px">
+        <div class="card">
+          <h3>side 侧任务</h3>
+          <p>不进入主队列；完成后同样进入 completed 审查，取消后直接归档；关闭时不影响 current / queued。</p>
+        </div>
+        <div class="card">
+          <h3>phase 收束</h3>
+          <p>只是阶段边界，current 不变，不关闭任务。</p>
+        </div>
+      </div>
+    </div>
+
+    <p class="lead" style="margin-top:18px">
+      同一时间只有一个主任务。已有主任务时，新目标先排队；主任务完成或取消后，排在最前面的任务自动接上。侧任务有自己的目标、验收和进度，但不占主队列；阶段收束只结束一个阶段，任务状态不变。目标和验收被外部改动时，系统会提示先确认，不会悄悄按旧目标继续。
+    </p>
+
+    <p class="takeaway">
+      <strong>一句话：</strong>顶层任务顺序化，任务内部才并行；无关工作走侧任务，不抢主队列。
+    </p>
+  </section>
+
+  <section id="ch-03" class="section" data-chapter>
+    <p class="chapter-no">03 / 记录</p>
+    <h2>任务状态在本机留下什么</h2>
+    <p class="lead">
+      创建任务时有一个任务文件，执行中按需留下检查点，阶段、并行单元和知识各自另存。任务文件保留最新状态，检查点文件保留历史快照。
+    </p>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>一条任务会留下什么</h3>
+        <p>下面是同一个任务在五个文件里的片段；每个文件分成“文件头”和“正文”两部分，省略了其余元数据。</p>
+      </div>
+      <div class="record-grid">
+        <article class="record">
+          <div class="record-head">
+            <span class="num">1</span>
+            <div><h3>创建任务</h3><span class="path">tasks/task_20261111-1519.md</span></div>
+          </div>
+          <p>目标、验收、最新状态 · 1 个 / 任务</p>
+          <div class="split">
+            <pre>---
+{
+  "title": "修复登录页的报错",
+  "status": "current",
+  "goal": "登录失败时给出明确提示",
+  "acceptance": ["错误提示可见", "不影响正常登录"]
+}
+---</pre>
+            <pre># 修复登录页的报错
+
+## Goal
+登录失败时给出明确提示</pre>
+          </div>
+        </article>
+
+        <article class="record">
+          <div class="record-head">
+            <span class="num">2</span>
+            <div><h3>检查点</h3><span class="path">checkpoints/checkpoint_&lt;id&gt;.md</span></div>
+          </div>
+          <p>进展、失败、验证、下一步 · 每次 1 个</p>
+          <div class="split">
+            <pre>---
+{
+  "task_id": "task_20261111-1519",
+  "sequence": 2
+}
+---</pre>
+            <pre>## Progress
+已复现：令牌过期时没有提示。
+
+## Failures
+第一次只改了按钮文案，没覆盖过期分支。
+
+## Next step
+补过期分支的提示并验证。</pre>
+          </div>
+        </article>
+
+        <article class="record">
+          <div class="record-head">
+            <span class="num">3</span>
+            <div><h3>阶段</h3><span class="path">phases/phase_&lt;id&gt;.md</span></div>
+          </div>
+          <p>阶段总结；任务状态不变 · 每阶段 1 个</p>
+          <div class="split">
+            <pre>---
+{
+  "title": "登录错误提示",
+  "sequence": 1
+}
+---</pre>
+            <pre>## Summary
+错误提示已覆盖密码错误和令牌过期。
+
+## Next step
+补网络异常分支。</pre>
+          </div>
+        </article>
+
+        <article class="record">
+          <div class="record-head">
+            <span class="num">4</span>
+            <div><h3>并行单元</h3><span class="path">work_units/work_unit_&lt;id&gt;.md</span></div>
+          </div>
+          <p>负责人、状态、进展、阻塞 · 每单元 1 个</p>
+          <div class="split">
+            <pre>---
+{
+  "title": "补过期分支",
+  "owner": "agent-b",
+  "status": "running"
+}
+---</pre>
+            <pre>## Progress
+已定位到 refresh 失败分支。</pre>
+          </div>
+        </article>
+
+        <article class="record">
+          <div class="record-head">
+            <span class="num">5</span>
+            <div><h3>完成并审查</h3><span class="path">knowledge/memory_&lt;id&gt;.md</span></div>
+          </div>
+          <p>有可复用结论时 · 每条 1 个</p>
+          <div class="split">
+            <pre>---
+{
+  "title": "登录错误提示要区分原因",
+  "kind": "lesson",
+  "scope": "project"
+}
+---</pre>
+            <pre>## 结论
+错误提示要区分密码错误、令牌过期和网络异常。</pre>
+          </div>
+        </article>
+      </div>
+      <div class="callout">取消的任务直接归档，不产生知识文件。</div>
+    </div>
+
+    <p class="lead" style="margin-top:18px">
+      阶段不是任务状态，而是任务内部的一段边界。阶段收束会写一个阶段文件，任务状态不变，也不会推进队列；检查点更轻，是执行中的一次快照。阶段通常在一个可验收的中间结果完成时收束。
+    </p>
+
+    <p class="takeaway">
+      <strong>一句话：</strong>任务文件保留最新状态，检查点文件保留历史快照；阶段文件标记任务内部的边界，工作单元文件记录并行分工；有可复用结论时，知识文件在审查通过后产生。
+    </p>
+  </section>
+
+  <section id="ch-04" class="section" data-chapter>
+    <p class="chapter-no">04 / 并行</p>
+    <h2>一个 current 任务，也能正常用多个子代理</h2>
+    <p class="lead">
+      单 current 限制的是项目顶层同时只有一个主任务，不是只能有一个 Agent。父 Agent 持有这个任务，把工作拆成若干 WorkUnit，分派给子代理；子代理只更新自己的单元，父 Agent 统一合并、验证和关闭。
+    </p>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>父任务分派，子代理各做一块</h3>
+        <p>current 是协调边界，不是并发上限；WorkUnit 才是任务内部的并行层。</p>
+      </div>
+      <div class="box accent" style="text-align:center">
+        <strong>父 Agent · current 任务</strong>
+        <span>持有执行权 · 拆分 WorkUnit · 分派和解阻</span>
+        <span>合并代码 · 整体验证 · 写任务级检查点 · 关闭任务</span>
+      </div>
+      <div class="map-arrow" style="margin:8px 0">↓</div>
+      <div class="grid cols-3">
+        <div class="box">
+          <strong>WorkUnit A</strong>
+          <span>后端 · 运行中</span>
+          <span>令牌过期分支</span>
+          <span>只写本单元</span>
+        </div>
+        <div class="box">
+          <strong>WorkUnit B</strong>
+          <span>前端 · 运行中</span>
+          <span>错误提示 UI</span>
+          <span>只写本单元</span>
+        </div>
+        <div class="box">
+          <strong>WorkUnit C</strong>
+          <span>测试 · 阻塞</span>
+          <span>等待接口约定</span>
+          <span>阻塞原因写在单元里</span>
+        </div>
+      </div>
+      <div class="callout">
+        父 Agent 先有 current 任务并拿到执行权；子代理不各自 resume 主任务，也不创建第二个 current。
+      </div>
+    </div>
+
+    <p class="lead" style="margin-top:18px">
+      正常用法是“父 Agent 编排，子代理执行”。父 Agent 先确认当前任务的目标、验收和文件边界，再按可独立交付的部分创建 WorkUnit：每个单元写清楚 owner、负责范围、要交付什么、怎么验证。子代理拿到任务 ID 和单元 ID 后，只更新自己的进度、阻塞和验证结果；不要改任务状态、验收或别人的单元。
+    </p>
+
+    <p class="lead" style="margin-top:12px">
+      子代理完成后，父 Agent 读所有单元，解决冲突，合并代码，跑整体测试，再写任务级检查点。子代理的局部测试通过，不等于任务验收通过；只有父 Agent 能关闭任务。这样项目层始终只有一个 current，并行发生在任务内部，不会出现多个主任务互相抢上下文。
+    </p>
+
+    <p class="lead" style="margin-top:12px">
+      WorkUnit 保护记录，不保护文件。拆并行时优先选互不重叠的文件或 worktree；如果多个子代理必须改同一文件，就串行，或者先分叉工作树再合并。与原任务无关的工作不要硬塞进 WorkUnit，走 side 任务；side 任务不占主队列。
+    </p>
+
+    <p class="lead" style="margin-top:12px">
+      一个具体例子：current 是“登录失败提示”。父 Agent 拆成后端过期分支、前端提示 UI、回归测试三个 WorkUnit，分别交给三个子代理；父 Agent 保留验收和关闭权，最后合并、跑测试、写检查点。子代理只负责自己那一块，不需要知道其他单元的全部细节。
+    </p>
+
+    <p class="takeaway">
+      <strong>一句话：</strong>单 current 是项目层的协调边界；任务内部用 WorkUnit 分派子代理，父 Agent 负责合并、验证和关闭。
+    </p>
+  </section>
+
+  <section id="ch-05" class="section" data-chapter>
+    <p class="chapter-no">05 / 收束</p>
+    <h2>任务结束后，项目经验和用户经验分别怎么产生</h2>
+    <p class="lead">
+      任务关闭只说明这次工作结束，不会自动产生长期知识。任务里的发现、失败和验证，先要经过一次独立的证据审查：值得复用的结论写成候选，确认后才生效。项目经验和用户经验走同一条审核路径，但来源、范围和复用方式不同。
+    </p>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>两条来源，同一套审核</h3>
+        <p>项目经验来自任务证据；用户经验来自用户明确要求。两者都不能跳过候选和审查。</p>
+      </div>
+      <div class="grid cols-2">
+        <div class="card">
+          <p class="kicker">项目经验 · 同项目复用</p>
+          <p>任务里的目标、失败、验证和检查点是原材料。任务结束后，审查出值得复用的结论，写成项目候选；确认生效后，后续同类任务可以召回。</p>
+          <div class="flow">
+            <span class="tag">任务证据</span><span class="arr">→</span>
+            <span class="tag">审查</span><span class="arr">→</span>
+            <span class="tag">候选</span><span class="arr">→</span>
+            <span class="tag">生效</span>
+          </div>
+          <p class="muted" style="margin-top:10px">项目经验默认只在同一项目内复用，不自动进入其他项目。</p>
+        </div>
+        <div class="card">
+          <p class="kicker">用户经验 · 跨项目偏好</p>
+          <p>只有用户明确要求长期记住的偏好或规则，才会产生用户经验。它不能从项目事实自动推断，也不能拿项目结论冒充用户偏好。</p>
+          <div class="flow">
+            <span class="tag">用户明确要求</span><span class="arr">→</span>
+            <span class="tag">审查</span><span class="arr">→</span>
+            <span class="tag">候选</span><span class="arr">→</span>
+            <span class="tag">生效</span>
+          </div>
+          <p class="muted" style="margin-top:10px">用户经验可以跨项目，但只有显式开启用户偏好时才进入上下文，不是默认注入。</p>
+        </div>
+      </div>
+      <div class="callout" style="margin-top:14px">
+        两条路共享同一套状态：候选不进入默认上下文；显式审核后生效，才进入默认召回；退役后退出默认召回但保留记录。任务、检查点和并行单元都不能直接升级为知识。
+      </div>
+    </div>
+
+    <p class="lead" style="margin-top:18px">
+      例如：一次“登录失败提示”的任务，审查后可能留下“错误提示要区分原因”这条项目经验；而“以后所有项目都用中文回复”只能来自用户明确要求，不能从某次任务推断。两者都要先候选、再显式审核，区别只是作用范围和复用边界。
+    </p>
+
+    <p class="takeaway">
+      <strong>一句话：</strong>项目经验从任务证据来，用户经验从用户明确要求来；两条路都不能跳过候选和审查。
+    </p>
+  </section>
+
+  <section id="ch-06" class="section" data-chapter>
+    <p class="chapter-no">06 / 召回</p>
+    <h2>恢复时，AI 从哪儿找回进度，凭什么相信它</h2>
+    <p class="lead">
+      新会话、压缩后或换客户端恢复时，MemWeave 不会把全部历史塞回去。它从本机记录里按优先级装回当前任务的最小上下文，并尽量让每条内容都能追溯来源、判断是否过期。
+    </p>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>一次恢复按顺序装回什么</h3>
+        <p>任务 brief 有硬下限；后面的内容按剩余空间裁剪，截断会明确标注。</p>
+      </div>
+      <div class="grid cols-2">
+        <div class="map-box">
+          <strong>1. 当前任务</strong>
+          <span>目标、验收、下一步；恢复摘要回答“在哪、已完成、失败、下一步”</span>
+        </div>
+        <div class="map-box">
+          <strong>2. 并行进度</strong>
+          <span>WorkUnit 的进展、阻塞和验证；任务知道哪些子代理卡住了</span>
+        </div>
+        <div class="map-box">
+          <strong>3. 相关知识</strong>
+          <span>按任务标题/目标或本次 query 检索，只装生效知识；没有匹配就不装</span>
+        </div>
+        <div class="map-box">
+          <strong>4. 代码结构</strong>
+          <span>架构和文件证据；帮助判断知识是否还适用，不替代真实代码</span>
+        </div>
+      </div>
+      <div class="budget-wrap">
+        <div class="budget-bar" role="img" aria-label="上下文预算示意：任务 brief 32%，恢复摘要 18%，WorkUnit 20%，相关知识 20%，结构证据 10%">
+          <span class="seg-task" style="flex:32">任务 brief</span>
+          <span class="seg-reboot" style="flex:18">恢复摘要</span>
+          <span class="seg-units" style="flex:20">WorkUnit</span>
+          <span class="seg-knowledge" style="flex:20">相关知识</span>
+          <span class="seg-graph" style="flex:10">结构证据</span>
+        </div>
+      </div>
+      <p class="muted" style="margin-top:8px">示意比例，不是真实测量；真实预算是 500–32000 字符，默认 12000。任务 brief 不能被挤出。</p>
+    </div>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>这些内容从哪里来</h3>
+        <p>不是从模型记忆里“想起来”，而是从三类本机数据里取。</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>层</th><th>里面是什么</th><th>在召回里的作用</th><th>权威性</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Markdown 记录</td>
+              <td>任务、检查点、阶段、并行单元、知识正文和来源</td>
+              <td>最终读到的内容；带 revision/etag</td>
+              <td>权威记录</td>
+            </tr>
+            <tr>
+              <td>SQLite FTS5 索引</td>
+              <td>从 Markdown 建出的全文索引</td>
+              <td>按 query、项目、范围、状态找候选</td>
+              <td>派生索引，可重建</td>
+            </tr>
+            <tr>
+              <td>项目结构图</td>
+              <td>文件哈希、架构节点、扫描时间</td>
+              <td>判断知识是否还适用于当前代码</td>
+              <td>支撑证据，不是结论</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout" style="margin-top:12px">
+        召回路径：任务标题/目标或本次 query → SQLite 索引找候选 → 回到 Markdown 读当前记录 → 结构图核对是否过期 → 装进上下文。
+      </div>
+    </div>
+
+    <h3 style="margin:26px 0 8px;font-size:17px">检索实际怎么走</h3>
+    <p class="lead">
+      恢复时，任务、检查点和并行单元不是“搜”出来的，而是按当前任务 ID 直接读 Markdown：任务正文保存最新状态，检查点保留历史顺序。只有知识需要检索：用任务标题/目标或本次 query 去 SQLite FTS5 索引找候选，索引按笔记类型、项目、范围和状态过滤；默认只查生效知识，候选和退役不会返回。索引返回文件路径和分数，最终仍回 Markdown 读当前记录，所以索引不是第二份事实来源。
+    </p>
+
+    <div class="grid cols-2" style="margin-top:14px">
+      <div class="card">
+        <p class="kicker">产品能保证</p>
+        <p>默认只召回同一项目的生效知识，用户偏好等可选内容必须显式开启；候选和退役不进来；每条结果回读当前 Markdown 和 revision/etag；索引损坏可重建；没有匹配就不注入兜底；截断会明确标注。</p>
+      </div>
+      <div class="card">
+        <p class="kicker">产品不能保证</p>
+        <p>知识是否仍然正确、是否还适用于当前代码、同义词或跨语言是否能召回。这些要靠来源/证据、结构图新鲜度和实际代码/测试核对；搜索命中不等于事实成立。</p>
+      </div>
+    </div>
+
+    <p class="lead" style="margin-top:14px">
+      所以“召回”不是把记忆倒出来，而是：从 Markdown 取当前事实，用 SQLite 索引找相关候选，用结构图判断是否过期，最后把最小上下文交给 Agent；Agent 仍然要用现实核对。
+    </p>
+
+    <p class="takeaway">
+      <strong>一句话：</strong>Markdown 是权威记录，SQLite 是找候选的派生索引；召回负责找得准、带得少，最后是否正确仍要回到代码和测试核对。
+    </p>
+  </section>
+
+  <section id="ch-07" class="section" data-chapter>
+    <p class="chapter-no">07 / 接入</p>
+    <h2>接入之后，一次会话是怎么运行的</h2>
+    <p class="lead">
+      MemWeave 不是另一个要你打开的页面。你照常在客户端里打开项目、开始对话；启动通道先让 Agent 接上这个项目的当前任务，然后才进入工作。不同客户端只是启动方式不同，任务和知识模型不变。
+    </p>
+    <p class="lead" style="margin-top:10px">
+      完整接入 = MCP 核心 + Skill/Rule 行为契约 + 可工作的启动通道；只有工具只能算已连接。
+    </p>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>完整接入的三层</h3>
+        <p>只有 MCP 工具时，只能算“已连接”，不能算完整体验。</p>
+      </div>
+      <div class="box" style="text-align:center">
+        <strong>启动通道</strong>
+        <span>Hook / always-on Rule / 手动首轮指令</span>
+      </div>
+      <div class="map-arrow" style="margin:6px 0">↓</div>
+      <div class="box" style="text-align:center">
+        <strong>行为契约</strong>
+        <span>Skill：何时恢复、检查点、收尾、提炼</span>
+      </div>
+      <div class="map-arrow" style="margin:6px 0">↓</div>
+      <div class="box accent" style="text-align:center">
+        <strong>MCP 核心</strong>
+        <span>22 工具、任务/知识模型、项目身份</span>
+      </div>
+    </div>
+
+    <div class="frame">
+      <div class="frame-head">
+        <h3>用一个真实任务走一遍</h3>
+        <p>项目 C:\code\A · 当前任务「登录失败时没有提示」· 下一步「补令牌过期分支」</p>
+      </div>
+      <div class="coverage">
+        <div class="coverage-row boundary">
+          <span class="coverage-label">Hook / Rule 触达</span>
+          <span class="coverage-items">会话开始 · 压缩 · 中断 · 结束</span>
+          <span class="coverage-note">只在边界</span>
+        </div>
+        <div class="coverage-row continuous">
+          <span class="coverage-label">MCP / Skill 触达</span>
+          <span class="coverage-items">首轮准备 · 检查点 · WorkUnit · 收尾 · 知识审查</span>
+          <span class="coverage-note">任务内持续</span>
+        </div>
+      </div>
+      <p class="muted" style="margin-top:8px">有 Hook 的宿主由 Hook 触达边界；没有 Hook 的宿主由 always-on Rule 或手动首轮指令触达。任务内的持续部分始终走 MCP / Skill。</p>
+      <div class="diagram-scroll">
+        <svg class="sequence-svg" viewBox="0 0 1000 560" role="img" aria-label="一次会话的时序：用户打开项目，启动通道提醒 Agent，Agent 通过 MCP 读取任务和写检查点，压缩后再次恢复">
+          <defs>
+            <marker id="seq-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a8a8a"></path>
+            </marker>
+          </defs>
+          <g font-size="12" fill="#b8b8b8">
+            <line x1="100" y1="54" x2="100" y2="540" stroke="#3a3a3a" stroke-dasharray="4 4"></line>
+            <line x1="300" y1="54" x2="300" y2="540" stroke="#3a3a3a" stroke-dasharray="4 4"></line>
+            <line x1="500" y1="54" x2="500" y2="540" stroke="#3a3a3a" stroke-dasharray="4 4"></line>
+            <line x1="700" y1="54" x2="700" y2="540" stroke="#3a3a3a" stroke-dasharray="4 4"></line>
+            <line x1="900" y1="54" x2="900" y2="540" stroke="#3a3a3a" stroke-dasharray="4 4"></line>
+
+            <rect x="45" y="14" width="110" height="28" rx="6" fill="#2d2d30" stroke="#555"></rect>
+            <text x="100" y="33" text-anchor="middle" fill="#f0f0f0">用户</text>
+            <rect x="240" y="14" width="120" height="28" rx="6" fill="rgba(78,161,255,.14)" stroke="#4ea1ff"></rect>
+            <text x="300" y="33" text-anchor="middle" fill="#f0f0f0">启动通道</text>
+            <rect x="445" y="14" width="110" height="28" rx="6" fill="rgba(215,186,125,.12)" stroke="#d7ba7d"></rect>
+            <text x="500" y="33" text-anchor="middle" fill="#f0f0f0">Agent</text>
+            <rect x="640" y="14" width="120" height="28" rx="6" fill="rgba(78,201,176,.12)" stroke="#4ec9b0"></rect>
+            <text x="700" y="33" text-anchor="middle" fill="#f0f0f0">MCP 核心</text>
+            <rect x="825" y="14" width="150" height="28" rx="6" fill="rgba(197,134,192,.12)" stroke="#c586c0"></rect>
+            <text x="900" y="33" text-anchor="middle" fill="#f0f0f0">Markdown / 索引</text>
+
+            <text x="12" y="76" fill="#8a8a8a" font-size="10">新会话</text>
+            <text x="12" y="170" fill="#8a8a8a" font-size="10">首轮</text>
+            <text x="12" y="305" fill="#8a8a8a" font-size="10">工作</text>
+            <text x="12" y="420" fill="#8a8a8a" font-size="10">压缩 / 下次</text>
+
+            <line x1="40" y1="145" x2="960" y2="145" stroke="#333" stroke-dasharray="2 6"></line>
+            <line x1="40" y1="285" x2="960" y2="285" stroke="#333" stroke-dasharray="2 6"></line>
+            <line x1="40" y1="390" x2="960" y2="390" stroke="#333" stroke-dasharray="2 6"></line>
+
+            <line x1="100" y1="90" x2="300" y2="90" stroke="#8a8a8a" marker-end="url(#seq-arrow)"></line>
+            <text x="200" y="83" text-anchor="middle" fill="#b8b8b8" font-size="11">打开项目 / 开始会话</text>
+
+            <line x1="300" y1="120" x2="500" y2="120" stroke="#4ea1ff" marker-end="url(#seq-arrow)"></line>
+            <text x="400" y="113" text-anchor="middle" fill="#4ea1ff" font-size="11">Hook / Rule：先接上项目</text>
+
+            <line x1="500" y1="160" x2="700" y2="160" stroke="#d7ba7d" marker-end="url(#seq-arrow)"></line>
+            <text x="600" y="153" text-anchor="middle" fill="#d7ba7d" font-size="11">prepare（当前项目）</text>
+
+            <line x1="700" y1="190" x2="900" y2="190" stroke="#4ec9b0" marker-end="url(#seq-arrow)"></line>
+            <text x="800" y="183" text-anchor="middle" fill="#4ec9b0" font-size="11">读任务 / 检查点 / 知识</text>
+
+            <line x1="700" y1="220" x2="500" y2="220" stroke="#4ec9b0" marker-end="url(#seq-arrow)"></line>
+            <text x="600" y="213" text-anchor="middle" fill="#4ec9b0" font-size="11">返回当前任务 + 下一步</text>
+
+            <line x1="500" y1="250" x2="100" y2="250" stroke="#d7ba7d" marker-end="url(#seq-arrow)"></line>
+            <text x="300" y="243" text-anchor="middle" fill="#d7ba7d" font-size="11">登录失败提示 · 下一步补过期分支</text>
+
+            <line x1="500" y1="310" x2="700" y2="310" stroke="#d7ba7d" marker-end="url(#seq-arrow)"></line>
+            <text x="600" y="303" text-anchor="middle" fill="#d7ba7d" font-size="11">写检查点（发现 / 失败 / 验证）</text>
+
+            <line x1="700" y1="340" x2="900" y2="340" stroke="#4ec9b0" marker-end="url(#seq-arrow)"></line>
+            <text x="800" y="333" text-anchor="middle" fill="#4ec9b0" font-size="11">Markdown + 索引</text>
+
+            <line x1="300" y1="410" x2="500" y2="410" stroke="#4ea1ff" marker-end="url(#seq-arrow)"></line>
+            <text x="400" y="403" text-anchor="middle" fill="#4ea1ff" font-size="11">压缩后：恢复提示</text>
+
+            <line x1="500" y1="440" x2="700" y2="440" stroke="#d7ba7d" marker-end="url(#seq-arrow)"></line>
+            <text x="600" y="433" text-anchor="middle" fill="#d7ba7d" font-size="11">再次 prepare</text>
+
+            <line x1="700" y1="470" x2="900" y2="470" stroke="#4ec9b0" marker-end="url(#seq-arrow)"></line>
+            <text x="800" y="463" text-anchor="middle" fill="#4ec9b0" font-size="11">重新读取当前任务</text>
+
+            <line x1="500" y1="500" x2="100" y2="500" stroke="#d7ba7d" marker-end="url(#seq-arrow)"></line>
+            <text x="300" y="493" text-anchor="middle" fill="#d7ba7d" font-size="11">核对代码 / 测试后继续</text>
+
+            <text x="310" y="365" fill="#8a8a8a" font-size="10">Hook 不写任务</text>
+          </g>
+        </svg>
+      </div>
+      <p class="muted" style="margin-top:8px">箭头按时间从上到下发生；移动端可横向滑动查看。</p>
+      <p class="lead" style="margin-top:12px">
+        这张图里，启动通道只出现两次：开始会话、压缩后恢复；中间的任务读取、检查点写入都走 MCP。Hook 不保存任务，MCP 也不会主动叫醒模型。
+      </p>
+    </div>
+
+    <p class="lead" style="margin-top:18px">
+      继续这个例子：用户隔天打开同一个项目，Agent 先调用准备动作，看到“补令牌过期分支”；再核对代码和测试，发现这个分支已经改过、测试也通过了，于是把下一步更新为“补网络异常分支”，而不是让用户重新解释或重做一遍。
+    </p>
+
+    <p class="lead" style="margin-top:12px">
+      所以 Hook 不是存储，也不是每轮都跑；它只在起点和压缩边界负责把 Agent 叫醒。行为契约负责规定什么时候准备、什么时候写检查点、什么时候收尾；MCP 核心负责真正读写任务、检查点和知识。没有 Hook 的客户端也能用同一套流程，只是启动和压缩恢复由 always-on Rule 或手动首轮指令完成。
+    </p>
+
+    <p class="takeaway">
+      <strong>一句话：</strong>启动通道只在起点和压缩边界叫醒；行为契约规定工作循环；MCP 核心负责真正读写。一次会话就是这三层在同一条时间线上的配合。
+    </p>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <p>MemWeave 产品与设计导览 · 单文件静态页，无外部依赖。</p>
+    <p>本页描述产品逻辑与当前实现边界；具体接口、字段和验证结果以仓库文档、代码与测试为准。</p>
+  </div>
+</footer>
+
+<script>
+  (() => {
+    const links = Array.from(document.querySelectorAll(".nav-links a"));
+    const sections = Array.from(document.querySelectorAll("section[data-chapter]"));
+    if (!links.length || !sections.length) return;
+
+    const byId = new Map(links.map((link) => [link.getAttribute("href").slice(1), link]));
+    const setActive = (id) => {
+      links.forEach((link) => {
+        const active = link === byId.get(id);
+        link.classList.toggle("active", active);
+        if (active) link.setAttribute("aria-current", "true");
+        else link.removeAttribute("aria-current");
+      });
+    };
+
+    let scheduled = false;
+    const update = () => {
+      scheduled = false;
+      const offset = 120;
+      let current = sections[0].id;
+      sections.forEach((section) => {
+        if (section.getBoundingClientRect().top <= offset) current = section.id;
+      });
+      setActive(current);
+    };
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = true;
+      window.requestAnimationFrame(update);
+    };
+
+    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    update();
+  })();
+</script>
+</body>
+</html>

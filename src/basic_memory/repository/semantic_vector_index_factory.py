@@ -1,0 +1,132 @@
+"""Composition-root factory for supported semantic vector indexes."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from typing import Literal, assert_never
+
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from basic_memory.config import BasicMemoryConfig, DatabaseBackend
+from basic_memory.repository.embedding_provider import (
+    EmbeddingProvider,
+    embedding_provider_identity,
+)
+from basic_memory.repository.semantic_errors import (
+    SemanticDependenciesMissingError,
+)
+from basic_memory.repository.semantic_vector_index import (
+    SemanticVectorIndex,
+    VectorIndexScope,
+)
+
+
+def resolve_semantic_vector_index_name(
+    app_config: BasicMemoryConfig,
+    database_backend: DatabaseBackend,
+) -> Literal["sqlite-vec", "pgvector", "milvus"]:
+    """Resolve the effective index while preserving sqlite-vec for local SQLite."""
+    if database_backend == DatabaseBackend.SQLITE:
+        return "sqlite-vec"
+    return app_config.semantic_vector_index
+
+
+def semantic_embedding_identity(provider: EmbeddingProvider) -> str:
+    """Return the same model identity used by manifest invalidation."""
+    return f"{type(provider).__name__}:{embedding_provider_identity(provider)}"
+
+
+def _serialize_query_value(value: str | tuple[str, ...] | None) -> str:
+    """Serialize SQLAlchemy URL query values without dropping repeated fields."""
+    if isinstance(value, tuple):
+        return "|".join(value)
+    return value or ""
+
+
+def _database_namespace(app_config: BasicMemoryConfig) -> str:
+    """Derive a stable, credential-free namespace from the authoritative database."""
+    if app_config.database_url:
+        url = make_url(app_config.database_url)
+        serialized_options = _serialize_query_value(url.query.get("options"))
+        search_path_match = re.search(
+            r"(?:^|\s)-c\s*search_path=([^\s]+)",
+            serialized_options,
+        )
+        search_path = search_path_match.group(1) if search_path_match else ""
+        locator = "|".join(
+            [
+                url.get_backend_name(),
+                url.host or "",
+                str(url.port or ""),
+                _serialize_query_value(url.query.get("host")),
+                _serialize_query_value(url.query.get("port")),
+                url.database or "",
+                url.username or "",
+                search_path,
+            ]
+        )
+    else:
+        locator = str((app_config.data_dir_path / "memory.db").resolve())
+    digest = hashlib.sha256(locator.encode("utf-8")).hexdigest()[:24]
+    return f"basic-memory-{digest}"
+
+
+def build_vector_index_scope(
+    app_config: BasicMemoryConfig,
+    provider: EmbeddingProvider,
+) -> VectorIndexScope:
+    """Build the storage identity handed to every vector adapter.
+
+    The database namespace and embedding schema; projects are named per operation.
+    """
+    return VectorIndexScope(
+        namespace=_database_namespace(app_config),
+        embedding_identity=semantic_embedding_identity(provider),
+        dimensions=provider.dimensions,
+    )
+
+
+def _create_milvus_index(
+    scope: VectorIndexScope,
+    app_config: BasicMemoryConfig,
+) -> SemanticVectorIndex:
+    """Load the first-party optional provider only when Milvus is selected."""
+    try:
+        from basic_memory.repository.milvus_config import MilvusSettings
+        from basic_memory.repository.milvus_index import MilvusVectorIndex
+    except ModuleNotFoundError as exc:
+        if exc.name != "pymilvus" and not (exc.name or "").startswith("pymilvus."):
+            raise
+        raise SemanticDependenciesMissingError(
+            "Milvus vector storage requires the optional PyMilvus dependencies. "
+            "Install with `pip install 'basic-memory[milvus]'`."
+        ) from exc
+
+    return MilvusVectorIndex(scope, MilvusSettings.from_config(app_config))
+
+
+def create_semantic_vector_index(
+    *,
+    session_maker: async_sessionmaker[AsyncSession],
+    app_config: BasicMemoryConfig,
+    database_backend: DatabaseBackend,
+    embedding_provider: EmbeddingProvider,
+) -> tuple[str, SemanticVectorIndex]:
+    """Create the vector adapter selected by the validated application config."""
+    name = resolve_semantic_vector_index_name(app_config, database_backend)
+    scope = build_vector_index_scope(app_config, embedding_provider)
+
+    if name == "sqlite-vec":
+        from basic_memory.repository.sqlite_vec_index import SQLiteVecIndex
+
+        return name, SQLiteVecIndex(session_maker, scope)
+    if name == "pgvector":
+        from basic_memory.repository.pgvector_index import PgVectorIndex
+
+        return name, PgVectorIndex(session_maker, scope)
+    if name == "milvus":
+        return name, _create_milvus_index(scope, app_config)
+
+    assert_never(name)

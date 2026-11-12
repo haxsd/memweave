@@ -1,0 +1,809 @@
+"""Service and helpers for resolving markdown links and permalink-like identifiers."""
+
+import uuid as uuid_mod
+from typing import Any, Optional, Tuple, Dict
+
+from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from basic_memory import db
+from basic_memory.config import BasicMemoryConfig
+from basic_memory.markdown.path_links import is_path_target, resolve_project_path
+from basic_memory.models import Entity, Project
+from basic_memory.repository.entity_repository import EntityRepository
+from basic_memory.repository.project_repository import ProjectRepository
+from basic_memory.services.exceptions import AmbiguousIdentifierError
+from basic_memory.services.note_placement import note_path_readings
+from basic_memory.repository.search_repository import create_search_repository
+from basic_memory.schemas.search import SearchQuery, SearchItemType
+from basic_memory.services.search_service import SearchService
+from basic_memory.utils import (
+    build_permalink_resolution_candidates,
+    generate_permalink,
+    normalize_project_reference,
+)
+from basic_memory.workspace_context import (
+    workspace_slug_for_canonical_permalinks,
+)
+
+
+def is_workspace_qualified_plain_identifier(identifier: str) -> bool:
+    """Return True for plain ``<workspace>/<project>/<path>`` identifiers."""
+    stripped = identifier.strip()
+    if stripped.startswith("memory://"):
+        return False
+
+    normalized = normalize_project_reference(stripped).strip("/")
+    return len(normalized.split("/", 2)) == 3
+
+
+async def detect_project_from_workspace_identifier_prefix(
+    identifier: str,
+    config: BasicMemoryConfig,
+    context: Any | None = None,
+) -> Optional[str]:
+    """Resolve a project route from a plain workspace-qualified identifier."""
+    if not is_workspace_qualified_plain_identifier(identifier):
+        return None
+
+    # MemWeave vendors Basic Memory without its MCP/cloud project-context surface.
+    try:
+        from basic_memory.mcp.project_context import (
+            _workspace_identifier_discovery_available,
+            resolve_workspace_qualified_identifier,
+        )
+    except ImportError:
+        return None
+
+    if not _workspace_identifier_discovery_available(identifier, config):
+        return None
+
+    workspace_discovery_fallback_errors = (
+        "not found",
+        "no accessible workspaces",
+        "unable to discover",
+    )
+    try:
+        workspace_resolution = await resolve_workspace_qualified_identifier(
+            identifier,
+            context=context,
+        )
+    except ValueError as exc:
+        message = str(exc).lower()
+        if any(error in message for error in workspace_discovery_fallback_errors):
+            return None
+        raise
+
+    if workspace_resolution is None:
+        return None
+    return workspace_resolution.project_identifier
+
+
+def normalize_link_text(link_text: str) -> tuple[str, str | None]:
+    """Strip wikilink syntax and return the target text plus optional alias."""
+    text = link_text.strip()
+    if text.startswith("[[") and text.endswith("]]"):
+        text = text[2:-2]
+
+    alias = None
+    if "|" in text:
+        text, alias = text.split("|", 1)
+        alias = alias.strip()
+
+    return text.strip(), alias
+
+
+class LinkResolver:
+    """Service for resolving markdown links to permalinks.
+
+    Uses a combination of exact matching and search-based resolution:
+    1. Try exact permalink match (fastest)
+    2. Try exact title match
+    3. Try exact file path match
+    4. Try file path with .md extension (for root or folder/title patterns)
+    5. Try a unique case-insensitive underscore/hyphen file-path alias
+    6. Fall back to search for fuzzy matching
+
+    When ``strict`` is set (the destructive edit/move paths) and a title matches more than one
+    note, resolution raises ``AmbiguousIdentifierError`` instead of guessing — the caller must pass
+    an exact permalink or external_id (issue #1148). Non-strict resolution keeps its shortest-path
+    preference.
+    """
+
+    def __init__(
+        self,
+        entity_repository: EntityRepository,
+        search_service: SearchService,
+        session_maker: async_sessionmaker[AsyncSession],
+        app_config: BasicMemoryConfig,
+    ):
+        """Initialize with repositories and the caller's composition-root config."""
+        self.entity_repository = entity_repository
+        self.search_service = search_service
+        self.session_maker = session_maker
+        self._project_repository = ProjectRepository()
+        self._app_config: BasicMemoryConfig = app_config
+        self._project_permalink: Optional[str] = None
+        self._project_cache_by_identifier: Dict[str, Project] = {}
+        self._entity_repository_cache: Dict[int, EntityRepository] = {}
+        self._search_service_cache: Dict[int, SearchService] = {}
+
+    async def resolve_entity(
+        self,
+        identifier: str,
+        *,
+        strict: bool = False,
+        source_path: Optional[str] = None,
+        load_relations: bool = True,
+        session: AsyncSession | None = None,
+    ) -> Optional[Entity]:
+        """Resolve an entity without leaving the resolver's project scope.
+
+        Unlike :meth:`resolve_link`, project-qualified identifiers do not select a different
+        repository. This is the target-project contract used by entity read and mutation flows.
+        """
+        clean_text, _ = self._normalize_link_text(identifier)
+        if is_path_target(clean_text):
+            return await self._resolve_path_target(
+                clean_text, source_path, load_relations=load_relations, session=session
+            )
+
+        async with db.scoped_session(self.session_maker, session) as active_session:
+            try:
+                canonical_id = str(uuid_mod.UUID(clean_text))
+                entity = await self.entity_repository.get_by_external_id(
+                    active_session,
+                    canonical_id,
+                    load_relations=load_relations,
+                )
+                if entity:
+                    return entity
+            except ValueError:
+                pass
+
+            return await self._resolve_in_current_project(
+                session=active_session,
+                link_text=clean_text,
+                use_search=True,
+                strict=strict,
+                source_path=source_path,
+                load_relations=load_relations,
+            )
+
+    async def _resolve_in_current_project(
+        self,
+        *,
+        session: AsyncSession,
+        link_text: str,
+        use_search: bool,
+        strict: bool,
+        source_path: Optional[str],
+        load_relations: bool,
+    ) -> Optional[Entity]:
+        """Resolve in this resolver's project: exact spellings first, fuzzy search last.
+
+        Shared by resolve_link and resolve_entity so entity reads and link
+        resolution accept the same routed identifiers.
+        """
+        project_permalink = await self._get_current_project_permalink(session)
+
+        # Trigger: the identifier may start with this project's own routing prefix, as a
+        #   routed memory:// URL does (`main/Cache Layer Design`, `main/assets/a.pdf`).
+        # Why: permalink candidates strip that prefix, but the title and file-path
+        #   lookups saw the prefixed text and could never match, so a title URL
+        #   resolved only through fuzzy search and often landed on a neighbour that
+        #   links to it (#1626), and a routed resource path (permalink NULL) missed.
+        # Outcome: exact lookups run on every reading -- the text as written, then the
+        #   path below the prefix -- before any fuzzy match. Creating a missing note
+        #   reads identifiers through the same function (#1775).
+        readings = note_path_readings(
+            link_text,
+            project_permalink=project_permalink,
+            workspace_permalink=workspace_slug_for_canonical_permalinks(),
+        )
+        for reading in readings:
+            resolved = await self._resolve_in_project(
+                session=session,
+                entity_repository=self.entity_repository,
+                search_service=self.search_service,
+                link_text=reading,
+                use_search=False,
+                strict=strict,
+                source_path=source_path,
+                project_permalink=project_permalink,
+                load_relations=load_relations,
+            )
+            if resolved:
+                return resolved
+
+        # Fuzzy matching is the last resort, after every exact spelling has missed.
+        # Strict resolution never guesses.
+        if use_search and not strict:
+            return await self._search_best_match(
+                session=session,
+                entity_repository=self.entity_repository,
+                search_service=self.search_service,
+                link_text=link_text,
+                load_relations=load_relations,
+            )
+        return None
+
+    async def resolve_link(
+        self,
+        link_text: str,
+        use_search: bool = True,
+        strict: bool = False,
+        source_path: Optional[str] = None,
+        load_relations: bool = True,
+        session: AsyncSession | None = None,
+    ) -> Optional[Entity]:
+        """Resolve a markdown link to a permalink.
+
+        Args:
+            link_text: The link text to resolve
+            use_search: Whether to use search-based fuzzy matching as fallback
+            strict: If True, only exact matches are allowed (no fuzzy search fallback)
+            source_path: Optional path of the source file containing the link.
+                        Used to prefer notes closer to the source (context-aware resolution).
+            load_relations: When False, skip eager loading and return a lightweight entity row.
+        """
+        logger.trace(f"Resolving link: {link_text} (source: {source_path})")
+
+        # Clean link text and extract any alias
+        clean_text, alias = self._normalize_link_text(link_text)
+        if is_path_target(clean_text):
+            return await self._resolve_path_target(
+                clean_text, source_path, load_relations=load_relations, session=session
+            )
+        explicit_project_reference = "::" in clean_text
+        clean_text = normalize_project_reference(clean_text)
+
+        async with db.scoped_session(self.session_maker, session) as active_session:
+            # --- External ID Resolution ---
+            # Try external_id first if identifier looks like a UUID.
+            # Canonicalize to lowercase-hyphen form so uppercase or unhyphenated
+            # UUIDs also match the stored external_id values.
+            try:
+                canonical_id = str(uuid_mod.UUID(clean_text))
+                entity = await self.entity_repository.get_by_external_id(
+                    active_session,
+                    canonical_id,
+                    load_relations=load_relations,
+                )
+                if entity:
+                    logger.debug(f"Found entity by external_id: {entity.permalink}")
+                    return entity
+            except ValueError:
+                pass
+
+            # Trigger: link uses project namespace syntax (project::note)
+            # Why: treat it as an explicit cross-project reference
+            # Outcome: resolve only within the referenced project scope
+            if explicit_project_reference:
+                project_prefix, remainder = self._split_project_prefix(clean_text)
+                if not project_prefix:
+                    return None
+
+                project_resources = await self._get_project_resources(
+                    project_prefix, active_session
+                )
+                if not project_resources:
+                    return None
+
+                project, entity_repository, search_service = project_resources
+                return await self._resolve_in_project(
+                    session=active_session,
+                    entity_repository=entity_repository,
+                    search_service=search_service,
+                    link_text=remainder,
+                    use_search=use_search,
+                    strict=strict,
+                    source_path=None,
+                    project_permalink=project.permalink,
+                    load_relations=load_relations,
+                )
+
+            resolved = await self._resolve_in_current_project(
+                session=active_session,
+                link_text=clean_text,
+                use_search=use_search,
+                strict=strict,
+                source_path=source_path,
+                load_relations=load_relations,
+            )
+            if resolved:
+                return resolved
+
+            # Trigger: local resolution failed and identifier looks like project/path
+            # Why: allow explicit project path references without namespace syntax
+            # Outcome: attempt resolution in the referenced project if it exists
+            project_prefix, remainder = self._split_project_prefix(clean_text)
+            if not project_prefix:
+                return None
+
+            project_resources = await self._get_project_resources(project_prefix, active_session)
+            if not project_resources:
+                return None
+
+            project, entity_repository, search_service = project_resources
+            if project.id == self.entity_repository.project_id:
+                return None
+
+            return await self._resolve_in_project(
+                session=active_session,
+                entity_repository=entity_repository,
+                search_service=search_service,
+                link_text=remainder,
+                use_search=use_search,
+                strict=strict,
+                source_path=None,
+                project_permalink=project.permalink,
+                load_relations=load_relations,
+            )
+
+    async def _resolve_path_target(
+        self,
+        target: str,
+        source_path: Optional[str],
+        *,
+        load_relations: bool,
+        session: AsyncSession | None,
+    ) -> Optional[Entity]:
+        """Resolve a path target (``/``, ``./``, ``../``) to the one file it names.
+
+        The path is taken relative to the note that carries the link. It never falls
+        through to titles, permalinks, filename aliases or another project.
+        """
+        project_path = resolve_project_path(target, source_path)
+        if project_path is None:
+            return None
+        async with db.scoped_session(self.session_maker, session) as active_session:
+            return await self.entity_repository.get_by_file_path(
+                active_session, project_path[1:], load_relations=load_relations
+            )
+
+    def _normalize_link_text(self, link_text: str) -> Tuple[str, Optional[str]]:
+        """Normalize link text and extract alias if present.
+
+        Args:
+            link_text: Raw link text from markdown
+
+        Returns:
+            Tuple of (normalized_text, alias or None)
+        """
+        return normalize_link_text(link_text)
+
+    async def _resolve_in_project(
+        self,
+        *,
+        session: AsyncSession,
+        entity_repository: EntityRepository,
+        search_service: SearchService,
+        link_text: str,
+        use_search: bool,
+        strict: bool,
+        source_path: Optional[str],
+        project_permalink: Optional[str],
+        load_relations: bool,
+    ) -> Optional[Entity]:
+        """Resolve a link within a specific project scope."""
+        clean_text = link_text
+        include_project = self._include_project_permalinks()
+        workspace_permalink = workspace_slug_for_canonical_permalinks()
+
+        # Trigger: callers can pass title, short permalink, project/path, or
+        #   workspace/project/path identifiers to the same resolver.
+        # Why: search results and memory:// URLs should stay usable across read,
+        #   edit, delete, move, and API-level entity resolution.
+        # Outcome: resolve canonical workspace IDs and legacy project-prefixed rows
+        #   through one shared candidate builder.
+        permalink_candidates = build_permalink_resolution_candidates(
+            clean_text,
+            project_permalink,
+            include_project=include_project,
+            workspace_permalink=workspace_permalink,
+        )
+
+        # --- Path Resolution ---
+        # Note: All paths in Basic Memory are stored as POSIX strings (forward slashes)
+        # for cross-platform compatibility. See entity_repository.py which normalizes
+        # paths using Path().as_posix(). This allows consistent path operations here.
+
+        # --- Relative Path Resolution ---
+        # Trigger: source_path is provided AND link contains "/"
+        # Why: Resolve paths like [[nested/deep-note]] relative to source folder first
+        # Outcome: [[nested/deep-note]] from testing/link-test.md → testing/nested/deep-note.md
+        deferred_relative_alias_path: Optional[str] = None
+        if source_path and "/" in clean_text:
+            if not (
+                include_project
+                and project_permalink
+                and clean_text.startswith(f"{project_permalink}/")
+            ):
+                source_folder = source_path.rsplit("/", 1)[0] if "/" in source_path else ""
+                if source_folder:
+                    # Construct relative path from source folder
+                    relative_path = f"{source_folder}/{clean_text}"
+
+                    # Try with .md extension
+                    if not relative_path.endswith(".md"):
+                        relative_path_md = f"{relative_path}.md"
+                        entity = await entity_repository.get_by_file_path(
+                            session,
+                            relative_path_md,
+                            load_relations=load_relations,
+                        )
+                        if entity:
+                            return entity
+
+                    # Try as-is (already has extension or is a permalink)
+                    entity = await entity_repository.get_by_file_path(
+                        session,
+                        relative_path,
+                        load_relations=load_relations,
+                    )
+                    if entity:
+                        return entity
+
+                    # Only exact relative paths may resolve this early. The forgiving
+                    # alias spelling is deferred until every exact identity — permalink,
+                    # title, file path — has missed, or a nearby alias would shadow
+                    # another note's exact permalink.
+                    deferred_relative_alias_path = (
+                        relative_path
+                        if relative_path.casefold().endswith(".md")
+                        else f"{relative_path}.md"
+                    )
+
+        # When source_path is provided, use context-aware resolution:
+        # Check both permalink and title matches, prefer closest to source.
+        # Example: [[testing]] from folder/note.md prefers folder/testing.md
+        # over a root testing.md with permalink "testing".
+        if source_path:
+            # Gather all potential matches
+            candidates: list[Entity] = []
+
+            # Check permalink match
+            for candidate_permalink in permalink_candidates:
+                permalink_entity = await entity_repository.get_by_permalink(
+                    session,
+                    candidate_permalink,
+                    load_relations=load_relations,
+                )
+                if permalink_entity and permalink_entity.id not in [c.id for c in candidates]:
+                    candidates.append(permalink_entity)
+
+            # Check title matches
+            title_entities = await entity_repository.get_by_title(
+                session,
+                clean_text,
+                load_relations=load_relations,
+            )
+            for entity in title_entities:
+                # Avoid duplicates (permalink match might also be in title matches)
+                if entity.id not in [c.id for c in candidates]:
+                    candidates.append(entity)
+
+            if candidates:
+                if len(candidates) == 1:
+                    return candidates[0]
+                else:
+                    # Multiple candidates - pick closest to source
+                    return self._find_closest_entity(candidates, source_path)
+
+        # Standard resolution (no source context): permalink first, then title.
+        #
+        # A destructive (strict) resolve must not silently guess between several same-title notes
+        # — e.g. an original plus a `-1` duplicate — which is how edit/move landed on the wrong
+        # entity (issue #1148). The trap is that the permalink step also matches the *slug* of the
+        # title (`build_permalink_resolution_candidates` slugifies the input), so a duplicated title
+        # whose original owns the title-derived permalink would still resolve silently. Pre-read the
+        # title matches so the permalink loop can tell a caller-supplied exact permalink (input is
+        # already in slug form) from the slug of a shared title. Non-strict resolution keeps the
+        # fast path — the title is read only if the permalink loop misses.
+        strict_title_matches = (
+            await entity_repository.get_by_title(session, clean_text, load_relations=load_relations)
+            if strict
+            else None
+        )
+        strict_ambiguous_title = strict_title_matches is not None and len(strict_title_matches) > 1
+        # The caller supplied an exact permalink when their verbatim (project-normalized) identifier
+        # matches a stored permalink. That is the first, un-slugified candidate the builder emits,
+        # so it also accepts explicit custom permalinks (e.g. "API_V2") that are not slug-shaped —
+        # inferring exactness from slug shape would wrongly reject them. Only this bypasses the
+        # duplicate-title guard below (#1148).
+        exact_identifier = normalize_project_reference(clean_text).strip("/")
+
+        # 1. Try exact permalink match first (most efficient)
+        for candidate_permalink in permalink_candidates:
+            entity = await entity_repository.get_by_permalink(
+                session,
+                candidate_permalink,
+                load_relations=load_relations,
+            )
+            if entity:
+                # The slugified form of a shared title must not silently win for a destructive op;
+                # only the caller's exact (verbatim) permalink candidate may bypass the guard.
+                if strict_ambiguous_title and candidate_permalink != exact_identifier:
+                    break
+                logger.debug(f"Found exact permalink match: {entity.permalink}")
+                return entity
+
+        # 2. Try exact title match. An exact file-path match below is more precise than a title and
+        # can still disambiguate, so defer any ambiguity rejection until the path lookups have run.
+        found = (
+            strict_title_matches
+            if strict
+            else await entity_repository.get_by_title(
+                session, clean_text, load_relations=load_relations
+            )
+        )
+        ambiguous_title_candidates: list[Entity] = []
+        if found:
+            if strict and len(found) > 1:
+                ambiguous_title_candidates = list(found)
+            else:
+                entity = found[0]
+                logger.debug(f"Found title match: {entity.title}")
+                return entity
+
+        # 3. Try file path
+        found_path = await entity_repository.get_by_file_path(
+            session,
+            clean_text,
+            load_relations=load_relations,
+        )
+        if found_path:
+            logger.debug(f"Found entity with path: {found_path.file_path}")
+            return found_path
+
+        # 4. Try file path with .md extension if not already present. Root-level
+        # filename links need the same fallback as nested paths (#1253). Under a
+        # strict resolve, a duplicated bare title remains ambiguous; callers can
+        # disambiguate it by supplying the exact ``.md`` file path as before.
+        file_path_with_md = clean_text
+        can_use_stem_path = "/" in clean_text or not ambiguous_title_candidates
+        has_markdown_extension = clean_text.casefold().endswith(".md")
+        if not has_markdown_extension and can_use_stem_path:
+            file_path_with_md = f"{clean_text}.md"
+            found_path_md = await entity_repository.get_by_file_path(
+                session,
+                file_path_with_md,
+                load_relations=load_relations,
+            )
+            if found_path_md:
+                logger.debug(f"Found entity with path (with .md): {found_path_md.file_path}")
+                return found_path_md
+
+        # 5. Direct-on-disk vaults commonly mix filename separators and case in
+        # wikilinks. Treat those spellings as aliases only after every exact semantic
+        # and path lookup, and only when the alias identifies one file uniquely.
+        # A source-relative alias is the closest forgiving spelling, so it is tried
+        # ahead of the project-wide one.
+        if deferred_relative_alias_path:
+            relative_alias_entity = await entity_repository.get_unique_by_file_path_alias(
+                session,
+                deferred_relative_alias_path,
+                load_relations=load_relations,
+            )
+            if relative_alias_entity:
+                logger.debug(
+                    f"Found entity by relative file path alias: {relative_alias_entity.file_path}"
+                )
+                return relative_alias_entity
+
+        if has_markdown_extension or can_use_stem_path:
+            alias_path = await entity_repository.get_unique_by_file_path_alias(
+                session,
+                file_path_with_md,
+                load_relations=load_relations,
+            )
+            if alias_path:
+                logger.debug(f"Found entity by unique file path alias: {alias_path.file_path}")
+                return alias_path
+
+        # No exact permalink or file path matched. If the only thing that matched was a title
+        # shared by several notes under a strict resolve, refuse to guess (#1148).
+        if ambiguous_title_candidates:
+            raise AmbiguousIdentifierError(
+                clean_text,
+                [(entity.permalink, entity.file_path) for entity in ambiguous_title_candidates],
+            )
+
+        # In strict mode, don't try fuzzy search - return None if no exact match found
+        if strict:
+            return None
+
+        # 6. Fall back to search for fuzzy matching (only if not in strict mode)
+        if use_search:
+            return await self._search_best_match(
+                session=session,
+                entity_repository=entity_repository,
+                search_service=search_service,
+                link_text=clean_text,
+                load_relations=load_relations,
+            )
+
+        # if we couldn't find anything then return None
+        return None
+
+    async def _search_best_match(
+        self,
+        *,
+        session: AsyncSession,
+        entity_repository: EntityRepository,
+        search_service: SearchService,
+        link_text: str,
+        load_relations: bool,
+    ) -> Optional[Entity]:
+        """Return the top full-text hit for link text, the resolver's fuzzy last resort."""
+        if "*" in link_text:
+            return None
+        results = await search_service.search(
+            query=SearchQuery(text=link_text, entity_types=[SearchItemType.ENTITY]),
+            session=session,
+        )
+        if not results:
+            return None
+        # Both SQLite and Postgres return results sorted best-first in SQL
+        # (SQLite: ORDER BY score ASC for negative BM25, Postgres: ORDER BY score DESC
+        # for positive ts_rank). Using results[0] is backend-agnostic and correct.
+        best_match = results[0]
+        logger.trace(f"Selected best match from {len(results)} results: {best_match.permalink}")
+        if not best_match.permalink:
+            return None
+        return await entity_repository.get_by_permalink(
+            session,
+            best_match.permalink,
+            load_relations=load_relations,
+        )
+
+    def _include_project_permalinks(self) -> bool:
+        """Return True when permalinks should include the project slug."""
+        return self._app_config.permalinks_include_project
+
+    async def _get_current_project_permalink(self, session: AsyncSession) -> Optional[str]:
+        """Get and cache the current project's permalink."""
+        if self._project_permalink is not None:
+            return self._project_permalink
+
+        project_id = self.entity_repository.project_id
+        if project_id is None:  # pragma: no cover
+            return None  # pragma: no cover
+
+        project = await self._project_repository.get_by_id(session, project_id)
+        if project:
+            self._project_permalink = project.permalink
+        return self._project_permalink
+
+    async def _get_project_by_identifier(
+        self, identifier: str, session: AsyncSession
+    ) -> Optional[Project]:
+        """Resolve project by name or permalink."""
+        cache_key = identifier.strip().lower()
+        if cache_key in self._project_cache_by_identifier:
+            return self._project_cache_by_identifier[cache_key]
+
+        project = await self._project_repository.get_by_name(session, identifier)
+        if not project:
+            project = await self._project_repository.get_by_name_case_insensitive(
+                session, identifier
+            )
+        if not project:
+            project = await self._project_repository.get_by_permalink(
+                session, generate_permalink(identifier)
+            )
+
+        if project:
+            self._project_cache_by_identifier[cache_key] = project
+        return project
+
+    async def _get_project_resources(
+        self, project_identifier: str, session: AsyncSession
+    ) -> Optional[Tuple[Project, EntityRepository, SearchService]]:
+        """Fetch repositories and services scoped to a project."""
+        project = await self._get_project_by_identifier(project_identifier, session)
+        if not project:
+            return None
+
+        entity_repository = self._entity_repository_cache.get(project.id)
+        if not entity_repository:
+            entity_repository = EntityRepository(project_id=project.id)
+            self._entity_repository_cache[project.id] = entity_repository
+
+        search_service = self._search_service_cache.get(project.id)
+        if not search_service:
+            search_repository = create_search_repository(
+                self.session_maker,
+                project_id=project.id,
+                app_config=self._app_config,
+            )
+            search_service = SearchService(
+                search_repository,
+                entity_repository,
+                self.search_service.file_service,
+                self.session_maker,
+            )
+            self._search_service_cache[project.id] = search_service
+
+        return project, entity_repository, search_service
+
+    def _split_project_prefix(self, identifier: str) -> Tuple[Optional[str], str]:
+        """Split project prefix from a path-like identifier."""
+        if "/" not in identifier:
+            return None, identifier
+
+        project_prefix, remainder = identifier.split("/", 1)
+        if not project_prefix or not remainder:
+            return None, identifier
+
+        return project_prefix, remainder
+
+    def _find_closest_entity(self, entities: list[Entity], source_path: str) -> Entity:
+        """Find the entity closest to the source file path.
+
+        Context-aware resolution: prefer notes in the same folder or closer in hierarchy.
+
+        Proximity Scoring Algorithm:
+        - Priority 0: Same folder as source (best match)
+        - Priority 1-N: Ancestor folders (N = levels up from source)
+        - Priority 100+N: Descendant folders (N = levels down, deprioritized)
+        - Priority 1000: Completely unrelated paths (least preferred)
+        - Ties are broken by shortest absolute path (consistent behavior)
+
+        Args:
+            entities: List of entities with the same title
+            source_path: Path of the file containing the link
+
+        Returns:
+            The entity closest to the source path
+        """
+        # Extract source folder (everything before the last /)
+        source_folder = source_path.rsplit("/", 1)[0] if "/" in source_path else ""
+
+        def path_proximity(entity: Entity) -> Tuple[int, int]:
+            """Return (proximity_score, path_length) for sorting.
+
+            Lower is better for both values.
+            """
+            entity_path = entity.file_path
+            entity_folder = entity_path.rsplit("/", 1)[0] if "/" in entity_path else ""
+
+            # Trigger: entity is in the same folder as source
+            # Why: same-folder notes are most contextually relevant
+            # Outcome: priority = 0 (best), ties broken by shortest path
+            if entity_folder == source_folder:
+                return (0, len(entity_path))
+
+            # Trigger: entity is in an ancestor folder of source
+            # e.g., source is "a/b/c/file.md", entity is "a/b/note.md" -> ancestor
+            # Why: ancestors are contextually relevant (shared parent context)
+            # Outcome: priority = levels_up (1, 2, 3...), closer ancestors preferred
+            if source_folder.startswith(entity_folder + "/") if entity_folder else source_folder:
+                # Count how many levels up
+                if entity_folder:
+                    levels_up = source_folder.count("/") - entity_folder.count("/")
+                else:
+                    # Root level
+                    levels_up = source_folder.count("/") + 1
+                return (levels_up, len(entity_path))
+
+            # Trigger: entity is in a descendant folder of source
+            # e.g., source is "a/file.md", entity is "a/b/c/note.md" -> descendant
+            # Why: descendants are less contextually relevant than ancestors
+            # Outcome: priority = 100 + levels_down, significantly deprioritized
+            if entity_folder.startswith(source_folder + "/") if source_folder else entity_folder:
+                if source_folder:
+                    levels_down = entity_folder.count("/") - source_folder.count("/")
+                else:
+                    # Source is at root
+                    levels_down = entity_folder.count("/") + 1
+                return (100 + levels_down, len(entity_path))
+
+            # Trigger: entity is in a completely unrelated path
+            # Why: no folder relationship means minimal contextual relevance
+            # Outcome: priority = 1000, only selected if no related paths exist
+            return (1000, len(entity_path))
+
+        # Sort by proximity (lower is better), then by path length (shorter is better)
+        return min(entities, key=path_proximity)

@@ -1,0 +1,28 @@
+{
+  "name": "@local/dsh-memweave",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Mount the local MemWeave continuity memory MCP server (stdio) in DeepSeek Harness.",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-mcp-client": ">=0.1.0-rc.2 || >=0.2.0-rc.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-mcp-client": {
+      "optional": true
+    }
+  }
+}
