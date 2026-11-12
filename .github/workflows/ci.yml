@@ -1,7 +1,7 @@
 name: CI
 
 # 最小 Linux CI：单 job、只跑 unittest，省 Actions 分钟。
-# 测试入口与 docs/development.md 一致：python -m unittest discover -s tests -v
+# 测试入口：python -m unittest discover -s tests -v
 on:
   push:
     branches: [main]

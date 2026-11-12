@@ -108,4 +108,4 @@ MemWeave 是一个本地 stdio MCP。所有客户端应指向同一个记忆库 
 
 更新源码后重新运行 bootstrap 或执行 `pip install .`，再运行 `setup`。保留原记忆库和自定义内容；更新 Hook 定义后重新完成宿主信任。不要自动切换分支、丢弃本地修改或升级到用户未指定的版本。
 
-详细逐项操作见 [手动安装](docs/manual-install.md)，客户端边界见 [接入说明](docs/integrations.md)，日常使用见 [Agent 指引](docs/agent-guide.md)。
+详细逐项操作见本文前面的通用路径和 bootstrap 命令；产品介绍见 [README](README.md)，设计与运行说明见 [产品导览](docs/product-guide.html)。

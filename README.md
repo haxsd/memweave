@@ -39,7 +39,7 @@ MemWeave 推荐由已有 Agent 安装：Agent 可以先检查操作系统、Pyth
 
 Agent 会先做只读盘点，再运行 `scripts/bootstrap.py --dry-run`；只有确认计划后才写入配置。它负责验证 MCP 工具、Skill/Rule 和启动通道，而不是只把“配置已写入”当成安装完成。
 
-手动安装步骤保留在 [docs/manual-install.md](docs/manual-install.md)，作为 Agent 不可用时的 fallback。
+手动步骤保留在本文的通用路径和 bootstrap 命令中，作为 Agent 不可用时的 fallback。
 
 ## 快速开始（给已经装好 Python 的人）
 
@@ -78,7 +78,7 @@ Agent 会先做只读盘点，再运行 `scripts/bootstrap.py --dry-run`；只�
 
 Hook 只是启动通道的一种实现，不是唯一实现。没有 Hook 的宿主可以由 always-on Rule 或等价首轮指令启动；没有启动通道时，只能标记“核心已连接，尚未完整接入”。
 
-客户端差异只影响配置位置、资源格式、启动实现和验证证据，不构成核心能力分级。具体边界见 [客户端接入](docs/integrations.md)。
+客户端差异只影响配置位置、资源格式、启动实现和验证证据，不构成核心能力分级。
 
 ## 在宿主中的工作循环
 
@@ -100,26 +100,18 @@ Hook 只是启动通道的一种实现，不是唯一实现。没有 Hook 的宿
 - 当前检索为文本 FTS，不使用向量检索；没有匹配时不注入无关知识兜底。
 - 记录 ID 不是远程访问凭证；产品当前面向可信的本机单用户。
 
-更完整的设计见 [架构说明](docs/architecture.md) 和 [产品与设计导览](docs/product-guide.html)。
+更完整的产品说明见 [产品与设计导览](docs/product-guide.html)。
 
 ## 项目状态
 
 `0.2.5` 是早期开发预览，尚未创建公开 tag 或 GitHub Release。MCP 核心、22 工具、任务/知识语义和项目身份对所有 stdio MCP 客户端相同；不同宿主的自动启动和压缩恢复能力仍有差异，公开文档只描述已验证的边界。
 
-自动化测试覆盖任务、存储、MCP、安装器、Hook 和客户端巡检；CI 在每次 push 和 pull request 上运行完整 unittest。真实客户端证据、未验证项和版本差异见 [客户端接入](docs/integrations.md)。
+自动化测试覆盖任务、存储、MCP、安装器、Hook 和客户端巡检；CI 在每次 push 和 pull request 上运行完整 unittest。
 
 ## 文档
 
 - [Agent 安装入口](AGENT_INSTALL.md)：把仓库交给已有 Agent 完成环境检查与接入。
 - [产品与设计导览](docs/product-guide.html)：单文件静态页，按 8 个章节讲产品逻辑、任务/知识模型和客户端运行方式。
-- [架构说明](docs/architecture.md)：两层记忆、运行时、启动契约和边界。
-- [手动安装](docs/manual-install.md)：逐项配置、更新与验证。
-- [客户端接入](docs/integrations.md)：统一 MCP 核心、各宿主启动通道与验证边界。
-- [Agent 使用指引](docs/agent-guide.md)：任务、检查点、知识审查和恢复流程。
-- [API 与存储](docs/api.md)：MCP / CLI / HTTP action、记录模型和检索边界。
-- [开发说明](docs/development.md)：开发、测试、构建和本地管理页。
-- [文档总览](docs/README.md)：全部公开文档。
-- [路线图](ROADMAP.md)：高层方向，不承诺具体发布日期。
 
 ## 许可证与来源
 

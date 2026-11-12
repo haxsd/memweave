@@ -46,7 +46,6 @@ dependencies = [
 Homepage = "https://github.com/haxsd/memweave"
 Repository = "https://github.com/haxsd/memweave"
 Issues = "https://github.com/haxsd/memweave/issues"
-Changelog = "https://github.com/haxsd/memweave/blob/main/CHANGELOG.md"
 
 [project.scripts]
 memweave = "memweave.cli:main"

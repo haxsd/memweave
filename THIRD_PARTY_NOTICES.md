@@ -13,7 +13,7 @@ This file records upstream code and behavior that MemWeave will directly copy, f
 - License text: the AGPL text is provided in [LICENSE](LICENSE).
 - Direct-use scope: the runtime subset of the pinned upstream source tree retained under `src/basic_memory/`, exercising Markdown note parsing, filesystem synchronization, SQLite/repository indexing, project model, FTS search and context-building implementation behind MemWeave's single-process adapter. Omitted upstream files remain available at the pinned upstream commit under the upstream AGPL license.
 - Integration location: `src/basic_memory/` plus `src/memweave/basic_memory_engine.py` and `src/memweave/basic_memory_index.py`; Basic Memory is not kept or started as a second MCP service.
-- Upstream sync method: pin the commit above, keep MemWeave-specific task changes isolated, review the upstream diff before each update, and update this notice plus `docs/design-references.md` with the new commit and changed paths.
+- Upstream sync method: pin the commit above, keep MemWeave-specific task changes isolated, review the upstream diff before each update, and update this notice with the new commit and changed paths.
 
 ### Current vendored manifest (updated 2026-11-02)
 
@@ -35,7 +35,7 @@ This file records upstream code and behavior that MemWeave will directly copy, f
 - License text: [licenses/planning-with-files/LICENSE](licenses/planning-with-files/LICENSE)
 - Adapted direct-use scope: selected task-plan/findings/progress lifecycle rules, session-start and prompt-submit context injection, stop gating, active-task resolution, and continuity Skill material. MemWeave expresses completion through task acceptance results and WorkUnit resolution; it does not claim upstream plan-hash attestation or the `check-complete` script.
 - Integration location: MemWeave’s single task lifecycle, continuity Skill and unified Hook entry; not a separately installed planning product.
-- Upstream sync method: pin the commit above, retain the MIT notice, review selected-file diffs before each update, and update this notice plus `docs/design-references.md` with the new commit and changed paths.
+- Upstream sync method: pin the commit above, retain the MIT notice, review selected-file diffs before each update, and update this notice with the new commit and changed paths.
 
 ### planning-with-files adaptation manifest
 
