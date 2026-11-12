@@ -57,7 +57,7 @@ MemWeave 只有两层产品语义：任务工作记忆（目标、验收、检�
 
 ## 项目状态
 
-`0.2.5` 是早期开发预览，尚未创建公开 tag 或 GitHub Release。CI 在每次 push 和 pull request 上运行完整 unittest。
+`0.2.5` 已经公开，克隆本仓库并按上面的安装步骤即可使用。当前仍是早期版本，能力和文档还会继续完善。CI 在每次 push 和 pull request 上运行完整 unittest。
 
 ## 文档
 
