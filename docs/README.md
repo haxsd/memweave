@@ -21,8 +21,6 @@ MemWeave 是已有编程 Agent 的本地连续工作层：一个常驻 stdio MCP
 
 - [开发说明](development.md)：环境、测试、构建、演示和本地管理页。
 - [实现参考](design-references.md)：Basic Memory 与 planning-with-files 的复制/fork 范围、固定提交和许可证义务。
-- [参与贡献](../CONTRIBUTING.md)：开发环境、测试门、设计约束和 PR 要求。
-- [安全策略](../SECURITY.md)：漏洞报告和本机单用户边界。
 - [变更记录](../CHANGELOG.md)：当前开发预览的高层变更。
 
 ## 许可证

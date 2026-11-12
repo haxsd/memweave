@@ -10,7 +10,7 @@
 - 增加客户端 setup/check、全机 `clients doctor` 和通用 MCP 配置。
 - 增加 Codex 低频 Hook、Cursor/Devin always-on Rule 的启动契约；无 Hook 宿主使用首轮回退并核对实际文件。
 - 产品导览改为仓库内单文件静态 HTML。
-- 开源前整理：Agent 优先安装入口、公开架构说明、安全策略和路线图。
+- 开源前整理：Agent 优先安装入口、公开架构说明和路线图。
 
 ## 更早
 

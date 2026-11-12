@@ -1,6 +1,6 @@
 # MemWeave 开发说明（给 AI 协作者）
 
-MemWeave 是一个本地 stdio MCP 和 Python 包，为已有编程 Agent 提供任务连续性和有来源的长期知识。修改代码前先读 [README](README.md)、[架构说明](docs/architecture.md)、[开发说明](docs/development.md) 和 [参与贡献](CONTRIBUTING.md)。
+MemWeave 是一个本地 stdio MCP 和 Python 包，为已有编程 Agent 提供任务连续性和有来源的长期知识。修改代码前先读 [README](README.md)、[架构说明](docs/architecture.md) 和 [开发说明](docs/development.md)。
 
 ## 环境
 
