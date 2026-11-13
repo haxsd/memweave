@@ -6,7 +6,7 @@
 
 MemWeave 是已有编程 Agent 的本地连续工作层。它把任务目标、约束、失败尝试、验证结果和下一步从聊天上下文中独立出来，并把真正可复用的经验沉淀为有范围、有来源的长期知识。
 
-它不替代 Codex、Cursor、Devin 或其他宿主，也不启动自己的模型。宿主 Agent 负责理解、判断和写代码；MemWeave 通过一个常驻 MCP 提供可恢复的工作记忆。
+它不替代任何宿主 Agent，也不启动自己的模型。宿主负责理解、判断和写代码；MemWeave 通过一个常驻 MCP 提供可恢复的工作记忆。客户端只是适配层。
 
 ## 解决什么问题
 
@@ -32,7 +32,7 @@ Agent 会先做只读盘点，再运行 `scripts/bootstrap.py --dry-run`；只�
 
 ## 快速开始（给已经装好 Python 的人）
 
-要求 Python 3.12+，从完整源码克隆执行：
+要求 Python 3.12+，从完整源码克隆执行。下面以 Codex 为例；MemWeave 面向任意 stdio MCP 客户端，Cursor/Devin 是受管安装适配，其他客户端使用后文的通用配置。
 
 ```powershell
 & '<Python 3.12+ 绝对路径>' scripts/bootstrap.py --client codex --root 'D:\my-project' --json
