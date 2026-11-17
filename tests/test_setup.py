@@ -68,6 +68,8 @@ class SetupTests(unittest.TestCase):
         self.assertIn("如果本回合没有看到 MemWeave 启动块", rule_text)
         self.assertIn("用户纠正、取消旧决定或新证据推翻当前方案", rule_text)
         self.assertIn("不声称与有 Hook 的宿主完全等价", rule_text)
+        self.assertIn("默认删除，不默认保留", rule_text)
+        self.assertIn("版本快照", rule_text)
         mcp = json.loads((self.cursor / "mcp.json").read_text(encoding="utf-8"))
         self.assertNotIn("--toolset", mcp["mcpServers"]["memweave"]["args"])
         manifest = json.loads((self.cursor / "memweave.json").read_text(encoding="utf-8"))

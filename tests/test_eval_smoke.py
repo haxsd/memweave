@@ -9,11 +9,11 @@ Or as part of the repository suite:
     python -m unittest discover -s tests -v
 
 The gate is deliberately small: two scenarios tagged ``smoke``, a registry guard
-(P1/P2/P3 scenarios stay registered while heavy ones stay out of ``smoke``), one
-repeat-based determinism check and one subprocess check of the documented CLI
-entry point.  It never talks to a real model, never needs the network and never
-touches ``%USERPROFILE%\\.memweave`` (all fixture homes live under the harness
-work dir).
+(key scenarios stay registered while heavy ones stay out of ``smoke``), one
+repeat-based determinism check, one deterministic behavioral-reuse check and one
+subprocess check of the documented CLI entry point.  It never talks to a real
+model, never needs the network and never touches ``%USERPROFILE%\\.memweave``
+(all fixture homes live under the harness work dir).
 """
 
 from __future__ import annotations
@@ -88,6 +88,7 @@ class EvalSmokeTests(unittest.TestCase):
             "evidence_pointer_persistence",
             "consolidation_lint_and_truncation",
             "knowledge_index_injection",
+            "behavioral_reuse",
         ):
             self.assertIn(scenario_id, scenario_ids)
         smoke_ids = sorted(
@@ -110,6 +111,23 @@ class EvalSmokeTests(unittest.TestCase):
             scenario["reproducibility"], {"repeat": 2, "identical": True},
         )
         self.assertEqual(len(report["summary"]["failing_cells"]), 0)
+
+    def test_behavioral_reuse_changes_the_deterministic_decision(self):
+        report = self.module.run_scenarios(
+            ids=["behavioral_reuse"], work_root=self.work_root,
+        )
+        scenario = report["scenarios"][0]
+        self.assertEqual(scenario["status"], "pass", scenario.get("error"))
+        checks = {item["name"]: item for item in scenario["checks"]}
+        decision = checks["behavior_decision_changed"]
+        self.assertEqual(decision["observed"], {"A": False, "B": False, "C": True})
+        control = checks["control_decision_is_unsafe"]
+        self.assertEqual(control["observed"], {"A": True, "B": True, "C": False})
+        trace = checks["decision_traceable_to_knowledge"]
+        self.assertTrue(trace["observed"]["C"])
+        gain = report["summary"]["recall_sets"]["long_term_knowledge_gain"]
+        self.assertEqual(gain["by_condition"]["B"]["hits"], 0)
+        self.assertEqual(gain["by_condition"]["C"]["rate"], 1.0)
 
     def test_cli_json_entrypoint(self):
         environment = dict(os.environ)

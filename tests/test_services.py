@@ -360,6 +360,37 @@ class ServiceTests(unittest.TestCase):
         exact = self.call("memory_search", project_id=self.project, query="任务接续")["items"]
         self.assertEqual([item["title"] for item in exact], ["任务接续方法"])
 
+    def test_long_chinese_prose_query_recalls_by_script_gram_overlap(self):
+        memory = self.call(
+            "memory_write",
+            project_id=self.project,
+            title="清理必须保留审计快照",
+            body=(
+                "README 的 git clean 会删除 ignored 的 "
+                "artifacts/session-index.snapshot。清理时先运行 dry-run，"
+                "再使用 safe_clean --apply。"
+            ),
+            sources=[{"type": "file", "reference": "README.md"}],
+            kind="procedure",
+            operation_id="natural-cleanup-query",
+        )
+        natural = self.call(
+            "memory_search",
+            project_id=self.project,
+            query="清理这个仓库的临时构建产物，保留源码，使用仓库里已有的工具执行清理",
+        )
+        self.assertEqual([item["id"] for item in natural["items"]], [memory["id"]])
+        self.assertEqual(
+            natural["coverage"]["strategy"],
+            "basic_memory_sqlite_fts5+script_gram_fallback",
+        )
+        unrelated = self.call(
+            "memory_search",
+            project_id=self.project,
+            query="怎样在新窗口知道旧线程做到哪里",
+        )
+        self.assertEqual(unrelated["items"], [])
+
     def test_retrieval_cues_support_a_changed_language(self):
         memory = self.call(
             "memory_write",
@@ -386,17 +417,51 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(restored["findings"], "")
         self.assertEqual(restored["progress"], "代码已更新")
 
-    def test_mixed_language_casefold_and_user_context_opt_in(self):
+    def test_mixed_language_casefold_and_user_context_default_on(self):
         self.call("memory_write", project_id=self.project, title="OAuth 刷新约束", body="Use Refresh Token",
                   sources=[{"type": "user", "reference": "输入"}], operation_id="mixed")
         self.call("memory_write", scope="user", title="个人输出偏好", body="偏好短段落与中文说明",
                   sources=[{"type": "user", "reference": "明确偏好"}], operation_id="preference")
         english = self.call("memory_search", project_id=self.project, query="REFRESH TOKEN")["items"]
         self.assertEqual([item["title"] for item in english], ["OAuth 刷新约束"])
-        normal = self.call("context_get", project_id=self.project)["text"]
-        explicit = self.call("context_get", project_id=self.project, include_user=True)["text"]
-        self.assertNotIn("偏好短段落", normal)
-        self.assertIn("偏好短段落", explicit)
+        default = self.call("context_get", project_id=self.project)["text"]
+        explicit_off = self.call(
+            "context_get", project_id=self.project, include_user=False
+        )["text"]
+        self.assertIn("偏好短段落", default)
+        self.assertNotIn("偏好短段落", explicit_off)
+
+    def test_mixed_chinese_task_and_natural_language_queries_recall_active_experience(self):
+        memory = self.call(
+            "memory_write", project_id=self.project,
+            title="Atlas 部署回滚经验",
+            body="部署前必须演练迁移回滚，失败时按已验证步骤恢复。",
+            sources=[{"type": "user", "reference": "实际演练"}],
+            operation_id="atlas-rollback",
+        )
+        task = self.call(
+            "task_open", project_id=self.project, title="修复 Atlas 部署回滚",
+            goal="验证部署前迁移回滚演练", acceptance=["回滚演练通过"],
+            operation_id="atlas-task",
+        )
+        from_task = self.call(
+            "context_get", project_id=self.project, task_id=task["id"], budget=12000,
+        )
+        included = {source["id"]: source for source in from_task["included_sources"]}
+        self.assertIn(memory["id"], included)
+        self.assertEqual(included[memory["id"]]["reason"], "task_query")
+        for query in (
+            "修复 Atlas 部署回滚",
+            "部署回滚",
+            "经验 规则 实现 恢复",
+        ):
+            with self.subTest(query=query):
+                context = self.call(
+                    "context_get", project_id=self.project, query=query, budget=12000,
+                )
+                self.assertIn(
+                    memory["id"], {source["id"] for source in context["included_sources"]}
+                )
 
     def test_completed_task_keeps_consolidation_pending_until_explicit_review(self):
         task = self.call("task_open", project_id=self.project, title="认证经验", goal="修复认证",
@@ -413,17 +478,20 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.call("memory_search", project_id=self.project, query="认证")["items"], [])
         self.assertEqual(len(self.call("memory_search", project_id=self.project, query="认证",
                                        status="candidate")["items"]), 1)
-        activated = self.call("memory_activate", memory_id=memory["id"], expected_revision=1,
-                              expected_etag=memory["etag"], operation_id="activate")
         latest = review["task"]
-        self.call("memory_review_complete", task_id=task["id"], expected_revision=latest["revision"],
-                  expected_etag=latest["etag"], memory_ids=[activated["id"]], summary="已去重并激活一条经验",
-                  operation_id="review-complete")
+        completed = self.call(
+            "memory_review_complete", task_id=task["id"], expected_revision=latest["revision"],
+            expected_etag=latest["etag"], memory_ids=[memory["id"]],
+            summary="已去重并激活一条经验", operation_id="review-complete",
+        )
+        self.assertEqual(completed["activated_memory_ids"], [memory["id"]])
+        activated = self.call("memory_read", memory_id=memory["id"])
+        self.assertEqual(activated["status"], "active")
+        self.assertEqual(len(self.call("memory_search", project_id=self.project, query="认证")["items"]), 1)
         with Service(self.service.vault.home) as restarted:
             reviewed = restarted.dispatch("memory_review", {"task_id": task["id"]})["data"]
             self.assertEqual(reviewed["state"], "reviewed")
             self.assertEqual(reviewed["task"]["consolidation_memory_ids"], [memory["id"]])
-        self.assertEqual(len(self.call("memory_search", project_id=self.project, query="认证")["items"]), 1)
 
     def test_completed_task_review_ignores_residual_lock_without_live_claim(self):
         task = self.call(
@@ -452,6 +520,90 @@ class ServiceTests(unittest.TestCase):
         )
         reviewed = self.call("task_read", task_id=task["id"])
         self.assertEqual(reviewed["consolidation_status"], "reviewed")
+
+    def test_review_complete_conflict_does_not_activate_reviewed_candidate(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="原子审查", goal="冲突不产生副作用",
+            acceptance=["候选保持未激活"], operation_id="atomic-review-task",
+        )
+        closed = self.call(
+            "task_close", task_id=task["id"], expected_revision=task["revision"],
+            expected_etag=task["etag"], outcome="completed", summary="先关闭",
+            acceptance_results={"候选保持未激活": "已关闭"}, operation_id="atomic-close",
+        )
+        candidate = self.call(
+            "memory_write", project_id=self.project, title="待审知识",
+            body="审查冲突时不应被激活。", sources=[{"type": "task", "reference": task["id"]}],
+            status="candidate", operation_id="atomic-candidate",
+        )
+        with self.assertRaises(DiagnosticError) as caught:
+            self.call(
+                "memory_review_complete", task_id=task["id"],
+                expected_revision=closed["revision"] + 1, expected_etag=closed["etag"],
+                memory_ids=[candidate["id"]], summary="不应写入",
+                operation_id="atomic-review",
+            )
+        self.assertEqual(caught.exception.code, "VERSION_CONFLICT")
+        self.assertEqual(
+            self.call("memory_read", memory_id=candidate["id"])["status"], "candidate"
+        )
+
+    def test_loop_health_tracks_knowledge_injection(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="Loop health task",
+            goal="Verify injected knowledge telemetry", acceptance=["injection tracked"],
+            operation_id="loop-health-task",
+        )
+        memory = self.call(
+            "memory_write", project_id=self.project, title="Loop health sentinel knowledge",
+            body="Loop health sentinel body is reusable.", sources=[{"type": "host", "reference": "explicit"}],
+            operation_id="loop-health-memory",
+        )
+        prepared = self.call(
+            "workspace_prepare", root=str(self.root), intent="resume",
+            query="Loop health sentinel", budget=8000,
+        )
+        self.assertIn(
+            memory["id"],
+            {source["id"] for source in prepared["context"]["included_sources"]},
+        )
+        loop = self.call("status", project_id=self.project)["knowledge_loop"]
+        self.assertEqual(loop["injection_tracking"]["state"], "active")
+        self.assertGreaterEqual(loop["injection_tracking"]["injection_count"], 1)
+        self.assertEqual(
+            loop["recent_injections"][0]["memory_id"], memory["id"]
+        )
+        self.assertEqual(loop["counts"]["active_zero_recall"], 0)
+        self.assertEqual(loop["counts"]["active_recall_unobserved"], 0)
+        self.assertEqual(loop["reuse_evidence"]["runtime"], "not_observed")
+        self.assertEqual(
+            loop["reuse_evidence"]["deterministic_scenario"], "behavioral_reuse"
+        )
+        self.assertIn(task["id"], prepared["context"]["candidate_sources"])
+
+    def test_loop_health_reports_orphan_candidate_and_pending_review_debt(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="Loop debt task",
+            goal="Leave review debt visible", acceptance=["review debt visible"],
+            operation_id="loop-debt-task",
+        )
+        self.call(
+            "task_close", task_id=task["id"], expected_revision=task["revision"],
+            expected_etag=task["etag"], outcome="completed", summary="review pending",
+            acceptance_results={"review debt visible": "verified"},
+            operation_id="loop-debt-close",
+        )
+        candidate = self.call(
+            "memory_write", project_id=self.project, title="Orphan candidate",
+            body="This candidate has no reviewed task reference.",
+            sources=[{"type": "host", "reference": "unreviewed"}], status="candidate",
+            operation_id="loop-debt-candidate",
+        )
+        loop = self.call("status", project_id=self.project)["knowledge_loop"]
+        self.assertEqual(loop["state"], "debt")
+        self.assertGreaterEqual(loop["counts"]["pending_review_tasks"], 1)
+        self.assertEqual(loop["counts"]["orphan_candidates"], 1)
+        self.assertEqual(loop["debt"]["orphan_candidates"][0]["id"], candidate["id"])
 
     def test_task_review_requires_completed_status_and_no_live_foreign_claim(self):
         current = self.call(
@@ -741,7 +893,11 @@ class ServiceTests(unittest.TestCase):
                       task_id=tasks[1]["id"])
         self.assertEqual(caught.exception.code, "TASK_NOT_CURRENT")
         inspect = self.call("workspace_prepare", root=str(self.root))
-        self.assertIsNone(inspect["context"])
+        self.assertIsNotNone(inspect["context"])
+        self.assertEqual(inspect["task_id"], tasks[0]["id"])
+        self.assertIn(tasks[0]["id"], inspect["context"]["candidate_sources"])
+        self.assertNotIn(tasks[1]["id"], inspect["context"]["text"])
+        self.assertIsNone(inspect["execution"])
 
     def test_workspace_prepare_resumes_unique_task_after_restart_and_rejects_other_scope(self):
         task = self.call("task_open", project_id=self.project, title="恢复任务", goal="保留目标",
@@ -771,12 +927,95 @@ class ServiceTests(unittest.TestCase):
                   acceptance_results={"验证": "实际运行通过"}, operation_id="close-pending")
         prepared = self.call("workspace_prepare", root=str(self.root), intent="resume")
         self.assertEqual(prepared["state"], "no_active_task")
-        self.assertIsNone(prepared["context"])
+        self.assertIsNotNone(prepared["context"])
+        self.assertIsNone(prepared["task_id"])
+        self.assertLessEqual(
+            len(prepared["context"]["text"]),
+            prepared["context"]["budget_characters"],
+        )
         self.assertEqual(prepared["pending_consolidation"][0]["id"], task["id"])
         self.assertIn(
             "pending_consolidation",
             {item["code"] for item in prepared["attention"]},
         )
+
+    def test_workspace_prepare_inspect_returns_bounded_knowledge_without_a_task(self):
+        active = self.call(
+            "memory_write", project_id=self.project, title="默认可见的项目经验",
+            body="无需当前任务也应能在新会话中发现这条经验。",
+            sources=[{"type": "user", "reference": "长期积累"}],
+            operation_id="inspect-active",
+        )
+        candidate = self.call(
+            "memory_write", project_id=self.project, title="尚未审查的候选",
+            body="候选内容不应进入默认知识摘要。",
+            sources=[{"type": "host", "reference": "待审"}], status="candidate",
+            operation_id="inspect-candidate",
+        )
+        prepared = self.call("workspace_prepare", root=str(self.root), intent="resume")
+        self.assertEqual(prepared["state"], "no_active_task")
+        self.assertIsNone(prepared["task_id"])
+        self.assertIsNotNone(prepared["context"])
+        context = prepared["context"]
+        self.assertTrue(context["knowledge_index"]["injected"])
+        self.assertIn(active["id"], context["text"])
+        self.assertNotIn(candidate["id"], context["text"])
+        self.assertLessEqual(len(context["text"]), context["budget_characters"])
+
+    def test_startup_activates_only_candidates_referenced_by_a_reviewed_task(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="历史审查迁移", goal="迁移已审经验",
+            acceptance=["迁移可重复"], operation_id="migration-task",
+        )
+        self.call(
+            "task_close", task_id=task["id"], expected_revision=task["revision"],
+            expected_etag=task["etag"], outcome="completed", summary="审查完成",
+            acceptance_results={"迁移可重复": "迁移验证通过"},
+            operation_id="migration-close",
+        )
+        reviewed = self.call(
+            "memory_write", project_id=self.project, title="已审查经验",
+            body="历史任务已经引用过这条知识。",
+            sources=[{"type": "task", "reference": task["id"]}],
+            status="candidate", operation_id="migration-reviewed",
+        )
+        unreviewed = self.call(
+            "memory_write", project_id=self.project, title="未审查候选",
+            body="没有任何审查记录引用这条知识。",
+            sources=[{"type": "host", "reference": "未审"}],
+            status="candidate", operation_id="migration-unreviewed",
+        )
+
+        def mark_reviewed():
+            current = self.service.vault.read(task["id"])
+            updated = {
+                **current,
+                "consolidation_status": "reviewed",
+                "consolidation_memory_ids": [reviewed["id"]],
+                "consolidation_summary": "历史版本只记录审查，没有激活知识。",
+                "revision": current["revision"] + 1,
+            }
+            return [{
+                "record": updated, "path": current["path"], "expected": current["etag"],
+            }], {"id": task["id"]}
+
+        self.service.vault.commit(
+            "fixture-reviewed-task", {"action": "fixture-reviewed-task"}, mark_reviewed,
+        )
+        for _ in range(2):
+            with Service(self.service.vault.home) as restarted:
+                self.assertEqual(
+                    restarted.dispatch(
+                        "memory_read", {"memory_id": reviewed["id"]}
+                    )["data"]["status"],
+                    "active",
+                )
+                self.assertEqual(
+                    restarted.dispatch(
+                        "memory_read", {"memory_id": unreviewed["id"]}
+                    )["data"]["status"],
+                    "candidate",
+                )
 
     def test_workspace_prepare_exposes_reboot_attention_and_completion(self):
         closed = self.call(
@@ -803,10 +1042,10 @@ class ServiceTests(unittest.TestCase):
                       {item["code"] for item in prepared["attention"]})
 
 
-    def test_workspace_prepare_accepts_optional_active_only_knowledge_index(self):
+    def test_workspace_prepare_includes_active_only_knowledge_index_by_default(self):
         task = self.call(
-            "task_open", project_id=self.project, title="Index opt-in task",
-            goal="Inject the active knowledge index only when requested",
+            "task_open", project_id=self.project, title="Index default task",
+            goal="Include the active knowledge index by default",
             acceptance=["index visible"], operation_id="index-prepare-task",
         )
         memory = self.call(
@@ -831,17 +1070,20 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertEqual(default["state"], "ready")
         self.assertEqual(default["task_id"], task["id"])
-        self.assertNotIn("knowledge_index", default["context"])
+        self.assertIn("knowledge_index", default["context"])
+        self.assertTrue(default["context"]["knowledge_index"]["injected"])
+        self.assertIn(memory["id"], default["context"]["text"])
+        self.assertNotIn(candidate["id"], default["context"]["text"])
+        self.assertNotIn("knowledge_index", explicit_off["context"])
         self.assertEqual(
             json.dumps(default["context"], ensure_ascii=False, sort_keys=True),
-            json.dumps(explicit_off["context"], ensure_ascii=False, sort_keys=True),
+            json.dumps(enabled["context"], ensure_ascii=False, sort_keys=True),
         )
-        metadata = enabled["context"]["knowledge_index"]
-        self.assertTrue(metadata["injected"])
-        self.assertIn("Knowledge index (navigation only; not evidence)", enabled["context"]["text"])
-        self.assertIn(memory["id"], enabled["context"]["text"])
-        self.assertNotIn(candidate["id"], enabled["context"]["text"])
-        self.assertLessEqual(len(enabled["context"]["text"]), 12000)
+        self.assertIn("Knowledge index (navigation only; not evidence)", default["context"]["text"])
+        self.assertLessEqual(
+            len(default["context"]["text"]),
+            default["context"]["budget_characters"],
+        )
         for value in ("yes", 1, None):
             with self.subTest(value=value), self.assertRaises(DiagnosticError) as caught:
                 self.call(
@@ -1102,6 +1344,30 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(lint["candidate_backlog"]["count"], 1)
         self.assertIsNotNone(lint["candidate_backlog"]["oldest_created_at"])
         self.assertEqual(lint["retired"]["count"], 1)
+        gate = consolidation["promotion_gate"]
+        self.assertTrue(gate["zero_knowledge_ok"])
+        self.assertEqual(gate["default_decision"], "delete")
+        self.assertEqual(len(gate["questions"]), 4)
+        self.assertIn("Retention does not preserve", gate["write_shape"]["rule"])
+        self.assertIn("One topic per record", " ".join(gate["write_shape"]["checks"]))
+        self.assertIn("task closeout summary", gate["do_not_promote"])
+        self.assertIn("task/phase progress or what-changed narrative", gate["do_not_promote"])
+        self.assertTrue(
+            any("product behavior or spec" in item for item in gate["do_not_promote"])
+        )
+        flow = consolidation["review_flow"]
+        self.assertIn("Host Agent", flow["owner"])
+        self.assertIn("task_close", flow["triggers"])
+        self.assertIn("pending_consolidation", flow["debt"])
+        self.assertIn("explicit user source", flow["user_scope"])
+        self.assertIn("low-value", flow["retention_bias"])
+        self.assertIn("rewrite", flow["rewrite"].lower())
+        risks = lint["promotion_risks"]
+        self.assertIn("oversized_active", risks)
+        self.assertIn("single_source", risks)
+        self.assertIn("migration_activated", risks)
+        self.assertIn("task_log", risks)
+        self.assertIn("version_snapshot", risks)
         self.assertIn("notes", lint)
         self.assertIsInstance(lint["truncated"], bool)
         self.assertIn("limits", consolidation)
@@ -1156,6 +1422,145 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("active", consolidation["truncated_reasons"])
         self.assertTrue(consolidation["lint"]["knowledge_without_evidence"]["truncated"])
         self.assertLessEqual(len(consolidation["lint"]["knowledge_without_evidence"]["ids"]), 20)
+
+    def test_memory_review_flags_task_log_bundles_and_single_source_records(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="Promotion gate", goal="flag task logs",
+            acceptance=["bundle is flagged"], operation_id="promotion-gate-task",
+        )
+        self.call(
+            "task_close", task_id=task["id"], expected_revision=task["revision"],
+            expected_etag=task["etag"], outcome="completed", summary="review promotion gate",
+            acceptance_results={"bundle is flagged": "focused test"},
+            operation_id="promotion-gate-close",
+        )
+        bundle = self.call(
+            "memory_write", project_id=self.project, title="Task closeout bundle",
+            body="Task closeout detail. " * 220,
+            sources=[{"type": "task", "reference": task["id"]}],
+            operation_id="promotion-gate-bundle",
+        )
+        strong = self.call(
+            "memory_write", project_id=self.project, title="Stable project invariant",
+            body="Every write path requires JSON and origin validation.",
+            sources=[
+                {"type": "file", "reference": "src/memweave/server.py"},
+                {"type": "host", "reference": "focused regression"},
+            ],
+            operation_id="promotion-gate-strong",
+        )
+        review = self.call("memory_review", task_id=task["id"])
+        consolidation = review["consolidation"]
+        gate = consolidation["promotion_gate"]
+        self.assertTrue(gate["zero_knowledge_ok"])
+        self.assertIn("multi-topic bundle", gate["do_not_promote"])
+        risks = consolidation["lint"]["promotion_risks"]
+        self.assertEqual(risks["oversized_body_chars"], 4000)
+        self.assertIn(bundle["id"], risks["oversized_active"]["ids"])
+        self.assertNotIn(strong["id"], risks["oversized_active"]["ids"])
+        self.assertIn(bundle["id"], risks["single_source"]["ids"])
+        self.assertNotIn(strong["id"], risks["single_source"]["ids"])
+        self.assertEqual(risks["migration_activated"]["count"], 0)
+        self.assertTrue(any("broad task summaries" in note for note in consolidation["lint"]["notes"]))
+
+    def test_memory_review_flags_task_log_and_release_snapshot_shapes(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="Shape lint", goal="flag low-value records",
+            acceptance=["shapes are flagged"], operation_id="shape-lint-task",
+        )
+        self.call(
+            "task_close", task_id=task["id"], expected_revision=task["revision"],
+            expected_etag=task["etag"], outcome="completed", summary="shape lint",
+            acceptance_results={"shapes are flagged": "focused test"},
+            operation_id="shape-lint-close",
+        )
+        task_log = self.call(
+            "memory_write", project_id=self.project, title="阶段 4 实现记录",
+            body=(
+                "已实现候选入口；已完成全量 unittest；测试通过后发布安装包，"
+                "本机生产库已迁移到 schema v12。"
+            ),
+            sources=[{"type": "task", "reference": task["id"]}],
+            operation_id="shape-lint-task-log",
+        )
+        snapshot = self.call(
+            "memory_write", project_id=self.project, title="v0.7.6 发布记录",
+            body="发布资产：安装包 GitHubRadar-Setup-0.7.6.exe，sha256 9743c434。",
+            sources=[{"type": "file", "reference": "README.md"}],
+            operation_id="shape-lint-snapshot",
+        )
+        invariant = self.call(
+            "memory_write", project_id=self.project, title="破坏性维护先预览再执行",
+            body="删除或迁移数据前必须先预览并备份；所有破坏性维护命令都必须遵守。",
+            sources=[
+                {"type": "file", "reference": "src/memweave/services.py"},
+                {"type": "host", "reference": "focused regression"},
+            ],
+            operation_id="shape-lint-invariant",
+        )
+        install_rule = self.call(
+            "memory_write", project_id=self.project, title="本机覆盖必须核对运行副本",
+            body="安装后必须核对目标 exe 的 SHA256 与本轮构建产物一致。",
+            sources=[
+                {"type": "file", "reference": "src/memweave/services.py"},
+                {"type": "host", "reference": "focused regression"},
+            ],
+            operation_id="shape-lint-install-rule",
+        )
+        review = self.call("memory_review", task_id=task["id"])
+        risks = review["consolidation"]["lint"]["promotion_risks"]
+        self.assertIn(task_log["id"], risks["task_log"]["ids"])
+        self.assertIn(snapshot["id"], risks["version_snapshot"]["ids"])
+        self.assertNotIn(invariant["id"], risks["task_log"]["ids"])
+        self.assertNotIn(invariant["id"], risks["version_snapshot"]["ids"])
+        self.assertNotIn(install_rule["id"], risks["version_snapshot"]["ids"])
+
+    def test_memory_review_flags_rewrite_candidates(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="Rewrite lint",
+            goal="flag poorly shaped knowledge", acceptance=["candidates are flagged"],
+            operation_id="rewrite-lint-task",
+        )
+        self.call(
+            "task_close", task_id=task["id"], expected_revision=task["revision"],
+            expected_etag=task["etag"], outcome="completed", summary="rewrite lint",
+            acceptance_results={"candidates are flagged": "focused test"},
+            operation_id="rewrite-lint-close",
+        )
+        long_record = self.call(
+            "memory_write", project_id=self.project, title="Long valuable rule",
+            body="Rule sentence. " + ("boundary detail " * 100),
+            sources=[
+                {"type": "file", "reference": "src/memweave/services.py"},
+                {"type": "host", "reference": "focused regression"},
+            ],
+            operation_id="rewrite-lint-long",
+        )
+        phase_record = self.call(
+            "memory_write", project_id=self.project, title="Phase 9 客户端巡检",
+            body="网关测试必须隔离主目录、策略来源和出网代理。",
+            sources=[
+                {"type": "file", "reference": "src/memweave/services.py"},
+                {"type": "host", "reference": "focused regression"},
+            ],
+            operation_id="rewrite-lint-phase",
+        )
+        crisp = self.call(
+            "memory_write", project_id=self.project, title="破坏性维护先预览再执行",
+            body="删除或迁移数据前必须预览并备份。",
+            sources=[
+                {"type": "file", "reference": "src/memweave/services.py"},
+                {"type": "host", "reference": "focused regression"},
+            ],
+            operation_id="rewrite-lint-crisp",
+        )
+        risks = self.call("memory_review", task_id=task["id"])[
+            "consolidation"
+        ]["lint"]["promotion_risks"]
+        self.assertEqual(risks["rewrite_candidate"]["body_chars"], 1200)
+        self.assertIn(long_record["id"], risks["rewrite_candidate"]["ids"])
+        self.assertIn(phase_record["id"], risks["rewrite_candidate"]["ids"])
+        self.assertNotIn(crisp["id"], risks["rewrite_candidate"]["ids"])
 
     def _memory_record(self, record_id, status, title="record", body="body", evidence=None):
         stamp = "2026-11-09T00:00:00+00:00"
@@ -1430,8 +1835,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(phase_review["consolidation"]["knowledge_index"], standalone)
         self.assertIn(written["id"], task_review["consolidation"]["knowledge_index"]["active"]["items"][0])
 
-    def test_knowledge_index_is_not_injected_into_context(self):
-        self.call(
+    def test_knowledge_index_is_injected_into_context_as_navigation_only(self):
+        memory = self.call(
             "memory_write", project_id=self.project, title="Context target",
             body="CONTEXT_INJECTION_SENTINEL", sources=[{"type": "host", "reference": "seed"}],
             operation_id="context-index",
@@ -1441,8 +1846,10 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(index["active"]["total"], 1)
         after = self.call("context_get", project_id=self.project)["text"]
         self.assertEqual(before, after)
+        self.assertIn("Knowledge index (navigation only; not evidence)", before)
+        self.assertIn(memory["id"], before)
         prepared = self.call("workspace_prepare", root=str(self.root), intent="inspect")
-        self.assertNotIn("knowledge_index", prepared)
+        self.assertTrue(prepared["context"]["knowledge_index"]["injected"])
         self.assertNotIn("one_line_per_record", before)
 
 

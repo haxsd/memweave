@@ -68,7 +68,7 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(context["graph"]["freshness"]["scope"], "indexed_sources_only")
         self.assertEqual(context["graph"]["freshness"]["stale_architecture_records"], 1)
 
-    def test_user_preferences_are_opt_in_and_do_not_require_matching_the_code_query(self):
+    def test_user_preferences_are_included_by_default_without_matching_the_code_query(self):
         preference = self.call("memory_write", scope="user", kind="preference", title="说明方式",
                                body="先说明结论，再列验证结果。", operation_id="preference",
                                sources=[{"type": "user", "reference": "长期明确偏好"}])
@@ -76,11 +76,13 @@ class ContextTests(unittest.TestCase):
                               status="candidate", operation_id="guess",
                               sources=[{"type": "host", "reference": "unconfirmed"}])
         normal = self.call("context_get", project_id=self.project, query="auth")
-        explicit = self.call("context_get", project_id=self.project, query="auth", include_user=True)
-        self.assertNotIn("先说明结论", normal["text"])
-        self.assertIn("先说明结论", explicit["text"])
-        self.assertNotIn(candidate["id"], explicit["candidate_sources"])
-        self.assertIn(preference["id"], {source["id"] for source in explicit["included_sources"]})
+        explicit_off = self.call(
+            "context_get", project_id=self.project, query="auth", include_user=False
+        )
+        self.assertIn("先说明结论", normal["text"])
+        self.assertNotIn("先说明结论", explicit_off["text"])
+        self.assertNotIn(candidate["id"], normal["candidate_sources"])
+        self.assertIn(preference["id"], {source["id"] for source in normal["included_sources"]})
 
     def test_emitted_source_ids_are_traceable_within_small_budgets(self):
         self.map_architecture()
@@ -106,7 +108,7 @@ class ContextTests(unittest.TestCase):
         self.assertTrue(context["included_sources"])
         self.assertTrue(context["truncated"])
 
-    def test_context_does_not_inject_recent_memory_when_query_misses(self):
+    def test_context_does_not_match_recent_memory_when_query_misses(self):
         continuation = self.call(
             "memory_write",
             project_id=self.project,
@@ -131,22 +133,49 @@ class ContextTests(unittest.TestCase):
         )
         sources = {source["id"]: source for source in context["included_sources"]}
         self.assertNotIn(continuation["id"], sources)
-        self.assertNotIn("任务接续方法", context["text"])
+        self.assertNotIn(f"Memory [{continuation['id']}]", context["text"])
         self.assertFalse(context["memory"]["recent_fallback"])
         self.assertEqual(context["memory"]["strategy"], "basic_memory_sqlite_fts5")
 
-    def test_task_title_does_not_inject_unrelated_project_knowledge(self):
+    def test_context_degrades_to_markdown_navigation_without_a_running_index(self):
+        task = self.call(
+            "task_open", project_id=self.project, title="index unavailable",
+            goal="Keep Markdown navigation usable", acceptance=["context survives"],
+            operation_id="index-unavailable-task",
+        )
+        memory = self.call(
+            "memory_write", project_id=self.project, title="Markdown navigation sentinel",
+            body="Visible without the derived SQLite index.",
+            sources=[{"type": "user", "reference": "explicit"}],
+            operation_id="index-unavailable-memory",
+        )
+        fresh = Service(self.service.vault.home)
+        prepared = fresh.dispatch(
+            "workspace_prepare", {"root": str(self.root), "intent": "inspect"}
+        )["data"]
+        self.assertEqual(prepared["state"], "ready")
+        context = prepared["context"]
+        self.assertFalse(context["memory"]["available"])
+        self.assertIn(memory["id"], context["text"])
+        self.assertIn(
+            "knowledge_index_unavailable",
+            {item["code"] for item in context["attention"]},
+        )
+        self.assertIn(task["id"], context["candidate_sources"])
+
+    def test_task_title_does_not_match_unrelated_project_knowledge(self):
         task = self.call(
             "task_open", project_id=self.project, title="auth task", goal="Fix auth",
             acceptance=["verified"], operation_id="task",
         )
-        self.call(
+        memory = self.call(
             "memory_write", project_id=self.project, title="unrelated project note",
             body="This should require a matching query.",
             sources=[{"type": "user", "reference": "explicit"}], operation_id="project-memory",
         )
         context = self.call("context_get", project_id=self.project, task_id=task["id"])
-        self.assertNotIn("unrelated project note", context["text"])
+        self.assertNotIn(memory["id"], {source["id"] for source in context["included_sources"]})
+        self.assertNotIn(f"Memory [{memory['id']}]", context["text"])
         self.assertFalse(context["memory"]["recent_fallback"])
 
     def test_memory_search_returns_retrieval_and_context_metadata(self):
@@ -414,10 +443,10 @@ class ContextTests(unittest.TestCase):
         )
         self.assertFalse(after["memory"]["recent_fallback"])
 
-    def test_knowledge_index_injection_is_off_by_default_and_byte_identical(self):
+    def test_knowledge_index_injection_is_on_by_default_and_can_be_disabled(self):
         self.call(
             "memory_write", project_id=self.project, title="ACTIVE_ONLY_NAV",
-            body="Navigation row that must stay out of the default context.",
+            body="Navigation row included in the default context.",
             sources=[{"type": "user", "reference": "explicit"}], operation_id="default-index",
         )
         task = self.call(
@@ -428,12 +457,16 @@ class ContextTests(unittest.TestCase):
         parameters = dict(project_id=self.project, task_id=task["id"], query="auth", budget=4000)
         baseline = self.call("context_get", **parameters)
         explicit_off = self.call("context_get", **parameters, include_knowledge_index=False)
-        self.assertEqual(
+        self.assertIn("knowledge_index", baseline)
+        self.assertTrue(baseline["knowledge_index"]["injected"])
+        self.assertIn("Knowledge index", baseline["text"])
+        self.assertIn("ACTIVE_ONLY_NAV", baseline["text"])
+        self.assertNotIn("knowledge_index", explicit_off)
+        self.assertNotIn("Knowledge index", explicit_off["text"])
+        self.assertNotEqual(
             json.dumps(baseline, ensure_ascii=False, sort_keys=True),
             json.dumps(explicit_off, ensure_ascii=False, sort_keys=True),
         )
-        self.assertNotIn("knowledge_index", baseline)
-        self.assertNotIn("Knowledge index", baseline["text"])
         with patch.object(
             self.service, "knowledge_index",
             side_effect=AssertionError("knowledge index must stay lazy when disabled"),
@@ -441,11 +474,13 @@ class ContextTests(unittest.TestCase):
             "memweave.context.knowledge_index_block",
             side_effect=AssertionError("knowledge index block must stay lazy when disabled"),
         ):
-            still_default = self.call("context_get", **parameters)
-        self.assertEqual(still_default, baseline)
+            still_off = self.call(
+                "context_get", **parameters, include_knowledge_index=False
+            )
+        self.assertEqual(still_off, explicit_off)
         self.assertEqual(
-            json.dumps(still_default, ensure_ascii=False, sort_keys=True),
-            json.dumps(baseline, ensure_ascii=False, sort_keys=True),
+            json.dumps(still_off, ensure_ascii=False, sort_keys=True),
+            json.dumps(explicit_off, ensure_ascii=False, sort_keys=True),
         )
 
     def test_knowledge_index_injection_is_active_only_and_bounded(self):
@@ -535,7 +570,7 @@ class ContextTests(unittest.TestCase):
         self.assertIn("Preserve the goal and next action", text)
         self.assertTrue(context["knowledge_index"]["requested"])
         self.assertFalse(context["knowledge_index"]["injected"])
-        self.assertEqual(context["knowledge_index"]["omitted_reason"], "budget")
+        self.assertEqual(context["knowledge_index"]["omitted_reason"], "budget_priority")
         default = self.call(
             "context_get", project_id=self.project, task_id=task["id"], query="tiny", budget=500,
         )

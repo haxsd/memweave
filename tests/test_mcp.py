@@ -62,6 +62,8 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                 status = (await client.call_tool("memweave_system_status")).structured_content["data"]
                 self.assertEqual(status["probe_count"], 1)
                 self.assertEqual(status["clients"]["codex"]["desktop_verification"], "unverified")
+                self.assertIn("knowledge_loop", status)
+                self.assertIn("injection_tracking", status["knowledge_loop"])
 
     async def test_business_and_parameter_errors_are_mcp_tool_errors(self):
         async with asyncio.timeout(20):
@@ -142,7 +144,7 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                             violations.append(f"{tool.name}.{name}")
                 self.assertEqual(violations, [])
 
-    async def test_agent_memory_write_defaults_to_candidate_until_activation(self):
+    async def test_agent_memory_write_defaults_to_active_and_candidate_stays_opt_in(self):
         async with asyncio.timeout(30):
             async with self.client() as client:
                 project = await client.call_tool("memweave_project_register", {
@@ -160,26 +162,41 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                     "sources": ["host:test"], "operation_id": "memory",
                 })
                 self.assertFalse(written.is_error, str(written.content))
-                candidate = written.structured_content["data"]
-                self.assertEqual(candidate["status"], "candidate")
-                active = await client.call_tool("memweave_memory_search", {
-                    "project_id": project_id, "query": "candidate default sentinel",
-                })
-                self.assertEqual(active.structured_content["data"]["items"], [])
-                activated = await client.call_tool("memweave_memory_activate", {
-                    "memory_id": candidate["id"], "expected_revision": candidate["revision"],
-                    "expected_etag": candidate["etag"], "operation_id": "activate",
-                })
-                self.assertFalse(activated.is_error, str(activated.content))
+                active = written.structured_content["data"]
+                self.assertEqual(active["status"], "active")
                 visible = await client.call_tool("memweave_memory_search", {
                     "project_id": project_id, "query": "candidate default sentinel",
                 })
                 self.assertEqual(
                     [item["id"] for item in visible.structured_content["data"]["items"]],
+                    [active["id"]],
+                )
+                candidate = await client.call_tool("memweave_memory_write", {
+                    "project_id": project_id, "title": "unapproved deployment note",
+                    "body": "zephyr quarantine marker remains hidden until activation",
+                    "sources": ["host:test"], "status": "candidate",
+                    "operation_id": "explicit-candidate",
+                })
+                self.assertFalse(candidate.is_error, str(candidate.content))
+                candidate = candidate.structured_content["data"]
+                hidden = await client.call_tool("memweave_memory_search", {
+                    "project_id": project_id, "query": "zephyr quarantine marker",
+                })
+                self.assertEqual(hidden.structured_content["data"]["items"], [])
+                activated = await client.call_tool("memweave_memory_activate", {
+                    "memory_id": candidate["id"], "expected_revision": candidate["revision"],
+                    "expected_etag": candidate["etag"], "operation_id": "activate",
+                })
+                self.assertFalse(activated.is_error, str(activated.content))
+                visible_candidate = await client.call_tool("memweave_memory_search", {
+                    "project_id": project_id, "query": "zephyr quarantine marker",
+                })
+                self.assertEqual(
+                    [item["id"] for item in visible_candidate.structured_content["data"]["items"]],
                     [candidate["id"]],
                 )
 
-    async def test_workspace_prepare_injects_only_active_knowledge_index_when_requested(self):
+    async def test_workspace_prepare_injects_only_active_knowledge_index_by_default(self):
         async with asyncio.timeout(40):
             async with self.client() as client:
                 async def call(action, **parameters):
@@ -202,31 +219,26 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                     body="Active navigation entry from MCP.", sources=["host:test"],
                     operation_id="active",
                 )
-                await call(
-                    "memory_activate", memory_id=active["id"],
-                    expected_revision=active["revision"], expected_etag=active["etag"],
-                    operation_id="activate",
-                )
                 candidate = await call(
                     "memory_write", project_id=project["id"], title="CANDIDATE_MCP_INDEX",
                     body="Candidate entry must stay out.", sources=["host:test"],
-                    operation_id="candidate",
+                    status="candidate", operation_id="candidate",
                 )
                 default = await call(
                     "workspace_prepare", root=self.temporary.name, intent="resume",
                 )
-                enabled = await call(
+                explicit_off = await call(
                     "workspace_prepare", root=self.temporary.name, intent="resume",
-                    include_knowledge_index=True,
+                    include_knowledge_index=False,
                 )
                 self.assertEqual(default["task_id"], task["id"])
-                self.assertNotIn("knowledge_index", default["context"])
-                metadata = enabled["context"]["knowledge_index"]
+                metadata = default["context"]["knowledge_index"]
                 self.assertTrue(metadata["injected"])
-                text = enabled["context"]["text"]
+                text = default["context"]["text"]
                 self.assertIn("knowledge index", text.lower())
                 self.assertIn("- " + active["id"] + " | ", text)
                 self.assertNotIn(candidate["id"], text)
+                self.assertNotIn("knowledge_index", explicit_off["context"])
 
     async def test_task_and_memory_survive_host_process_switch(self):
         async with asyncio.timeout(40):
@@ -817,10 +829,9 @@ class McpTests(unittest.IsolatedAsyncioTestCase):
                     ],
                     operation_id="plain-sources",
                 )
-                self.assertEqual(memory["status"], "candidate")
+                self.assertEqual(memory["status"], "active")
                 hits = await call(
                     "memory_search", project_id=project["id"], query="plain references",
-                    status="candidate",
                 )
                 self.assertEqual(hits["items"][0]["sources"], [
                     {"type": "file", "reference": "src/memweave/server.py"},

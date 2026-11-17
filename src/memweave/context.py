@@ -1,13 +1,21 @@
 from pathlib import Path
 
 from memweave.diagnostics import DiagnosticError
-from memweave.services import task_lifecycle_status
+from memweave.services import (
+    CONTEXT_BUDGET_DEFAULT,
+    CONTEXT_BUDGET_MAX,
+    task_lifecycle_status,
+)
 from memweave.storage import contract_digest
 
 
 TASK_BRIEF_LIMIT = 320
 KNOWLEDGE_INDEX_MAX_LINES = 30
 KNOWLEDGE_INDEX_MAX_CHARS = 4000
+KNOWLEDGE_INDEX_MIN_BUDGET = 2000
+KNOWLEDGE_INDEX_MIN_CHARS = 400
+KNOWLEDGE_INDEX_BUDGET_DIVISOR = 4
+PRIORITY_BLOCK_FLOOR = 240
 KNOWLEDGE_INDEX_TITLE = "Knowledge index (navigation only; not evidence):"
 
 
@@ -251,7 +259,7 @@ def memory_selection(service, project_id, query, scope, query_source="request", 
     return [(item, reason) for item in items[:8]]
 
 
-def knowledge_index_block(service, project_id, char_budget):
+def knowledge_index_block(service, project_id, char_budget, omitted_reason="budget"):
     """Render a bounded, active-only knowledge navigation head.
 
     The block is navigation data only, never evidence: it reuses the on-demand
@@ -267,7 +275,7 @@ def knowledge_index_block(service, project_id, char_budget):
         "char_limit": KNOWLEDGE_INDEX_MAX_CHARS,
         "characters": 0,
         "truncated": False,
-        "omitted_reason": "budget",
+        "omitted_reason": omitted_reason,
     }
     if hard_budget <= len(KNOWLEDGE_INDEX_TITLE):
         return "", omitted
@@ -321,18 +329,20 @@ def knowledge_index_block(service, project_id, char_budget):
 
 
 def build_context(
-    service, project_id, task_id=None, query="", include_user=False, budget=12000,
-    execution_root=None, include_group_knowledge=False, include_knowledge_index=False,
+    service, project_id, task_id=None, query="", include_user=True,
+    budget=CONTEXT_BUDGET_DEFAULT,
+    execution_root=None, include_group_knowledge=False, include_knowledge_index=True,
 ):
     if (
-        type(budget) is not int or not 500 <= budget <= 32000
+        type(budget) is not int or not 500 <= budget <= CONTEXT_BUDGET_MAX
         or type(include_user) is not bool
         or type(include_group_knowledge) is not bool
         or type(include_knowledge_index) is not bool
     ):
         raise DiagnosticError(
             "RECORD_INVALID",
-            "budget must be 500–32000 characters; include_user, include_group_knowledge and "
+            f"budget must be 500–{CONTEXT_BUDGET_MAX} characters; include_user, "
+            "include_group_knowledge and "
             "include_knowledge_index must be boolean.",
         )
     if not isinstance(query, str) or len(query) > 1000:
@@ -390,10 +400,20 @@ def build_context(
     knowledge_metadata = None
     if include_knowledge_index:
         task_floor = len(task_brief_text) + 3 if task_brief_text else 0
-        block_budget = budget - len(header) - 2 - task_floor
-        knowledge_block, knowledge_metadata = knowledge_index_block(
-            service, project_id, block_budget
+        unit_floor = (
+            min(800, PRIORITY_BLOCK_FLOOR * len(open_work_units(task))) if task else 0
         )
+        memory_floor = PRIORITY_BLOCK_FLOOR if knowledge_query else 0
+        available = budget - len(header) - 2 - task_floor - unit_floor - memory_floor
+        index_cap = min(KNOWLEDGE_INDEX_MAX_CHARS, budget // KNOWLEDGE_INDEX_BUDGET_DIVISOR)
+        if budget < KNOWLEDGE_INDEX_MIN_BUDGET or available < KNOWLEDGE_INDEX_MIN_CHARS:
+            knowledge_block, knowledge_metadata = knowledge_index_block(
+                service, project_id, 0, omitted_reason="budget_priority"
+            )
+        else:
+            knowledge_block, knowledge_metadata = knowledge_index_block(
+                service, project_id, min(available, index_cap)
+            )
     groups = []
     candidates = []
     if task:
@@ -430,10 +450,17 @@ def build_context(
             ))
         if work_unit_blocks:
             groups.append((4, work_unit_blocks))
-    memory_items = memory_selection(
-        service, project_id, knowledge_query, "project",
-        query_source=knowledge_query_source, include_group=include_group_knowledge,
-    )
+    knowledge_search_available = True
+    try:
+        memory_items = memory_selection(
+            service, project_id, knowledge_query, "project",
+            query_source=knowledge_query_source, include_group=include_group_knowledge,
+        )
+    except DiagnosticError as error:
+        if error.code != "INDEX_UNAVAILABLE":
+            raise
+        memory_items = []
+        knowledge_search_available = False
     memories = []
     memory_reasons = {}
     seen_memories = set()
@@ -447,10 +474,33 @@ def build_context(
         content = f"Memory [{memory['id']}] ({label}) {clip(memory['title'], 100)}\n{memory['body']}"
         memories.append((memory["id"], "memory", content))
     if include_user:
-        matches = service.memory_search(query=query, scope="user")["items"]
-        preferences = [item for item in service.memory_search(scope="user")["items"]
-                       if item.get("kind") == "preference"]
-        for memory in {item["id"]: item for item in preferences + matches}.values():
+        # User scope is deliberately small and explicitly authored. Read it
+        # straight from Markdown so default context does not depend on the
+        # derived FTS index being started (for example during setup/check).
+        user_records = [
+            item for item in service.vault.list_records("memory", scope="user")
+            if item.get("status") == "active"
+        ]
+        order = lambda item: (item.get("updated_at", ""), item["id"])
+        preferences = sorted(
+            (item for item in user_records if item.get("kind") == "preference"),
+            key=order, reverse=True,
+        )
+        others = sorted(
+            (item for item in user_records if item.get("kind") != "preference"),
+            key=order, reverse=True,
+        )
+        matched = []
+        if query.strip():
+            try:
+                matched = service.memory_search(query=query, scope="user")["items"]
+            except DiagnosticError as error:
+                if error.code != "INDEX_UNAVAILABLE":
+                    raise
+        selected_user = list({
+            item["id"]: item for item in matched + preferences + others
+        }.values())[:20]
+        for memory in selected_user:
             if memory["id"] in seen_memories:
                 continue
             seen_memories.add(memory["id"])
@@ -464,6 +514,15 @@ def build_context(
             ))
     if memories:
         groups.append((4, memories))
+    if not knowledge_search_available:
+        attention.append({
+            "code": "knowledge_index_unavailable",
+            "severity": "warning",
+            "message": (
+                "The derived search index is not running; task and Markdown knowledge "
+                "navigation are still available, but query-matched knowledge was skipped."
+            ),
+        })
     graph_blocks = []
     for node in sorted(graph["nodes"], key=lambda item: {"architecture": 0, "file": 1}.get(item["type"], 2)):
         if node.get("status") != "active" or node.get("path") == ".":
@@ -533,6 +592,7 @@ def build_context(
                   graph={"coverage": graph["coverage"], "freshness": freshness},
                   memory={
                       "strategy": "basic_memory_sqlite_fts5",
+                      "available": knowledge_search_available,
                       "query_used": bool(knowledge_query),
                       "query_source": knowledge_query_source,
                       "recent_fallback": False,

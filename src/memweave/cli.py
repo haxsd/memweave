@@ -167,6 +167,11 @@ def main(argv: list[str] | None = None) -> int:
             subparser.add_argument("--json", action="store_true")
             subparser.add_argument("--client", choices=("cursor", "codex", "devin"), default="cursor")
             subparser.add_argument("--global-base", type=Path, help=argparse.SUPPRESS)
+            if command == "setup":
+                subparser.add_argument(
+                    "--mcp-scope", choices=("local", "project", "user"), default=None,
+                    help="Devin MCP scope: local (default), project, or user.",
+                )
             if command == "check":
                 subparser.add_argument("--probe", action="store_true")
     clients_parser = subparsers.add_parser("clients")
@@ -210,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
                     output = result(setup_devin(
                         arguments.root, arguments.home, arguments.toolset,
                         global_base=arguments.global_base,
+                        mcp_scope=arguments.mcp_scope,
                     ))
                 else:
                     output = result(check_devin(

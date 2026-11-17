@@ -127,6 +127,122 @@
   }
   .arr { color: var(--faint); font-size: 12px; }
 
+  .review-map { display: grid; gap: 14px; }
+  .review-stepper {
+    display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px;
+    position: relative;
+  }
+  .review-stepper::before {
+    content: ""; position: absolute; top: 23px; left: 7%; right: 7%; height: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--green), var(--orange), var(--purple));
+    opacity: .55;
+  }
+  .review-step {
+    position: relative; z-index: 1; padding: 12px 10px 10px;
+    background: var(--bg-3); border: 1px solid var(--border); border-radius: 10px;
+    text-align: center;
+  }
+  .review-index {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 50%;
+    background: var(--bg-2); border: 1px solid var(--border-strong);
+    color: var(--accent); font-size: 11px; font-weight: 800;
+  }
+  .review-step strong { display: block; margin-top: 6px; font-size: 12px; }
+  .review-step span:last-child {
+    display: block; margin-top: 2px; color: var(--faint);
+    font-size: 10.5px; line-height: 1.5;
+  }
+  .review-step.active { border-color: rgba(78, 161, 255, .55); background: var(--accent-soft); }
+  .review-step.gate { border-color: rgba(215, 186, 125, .5); }
+  .review-step.done { border-color: rgba(78, 201, 176, .5); }
+
+  .review-split { display: grid; grid-template-columns: 1.25fr .75fr; gap: 12px; }
+  .review-roles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .review-role {
+    padding: 12px; background: var(--bg-3);
+    border: 1px solid var(--border); border-radius: 10px;
+  }
+  .review-role .role-icon {
+    display: flex; align-items: center; justify-content: center;
+    width: 28px; height: 28px; border-radius: 8px;
+    background: var(--accent-soft); color: var(--accent);
+    font-size: 12px; font-weight: 800;
+  }
+  .review-role.agent { border-top: 3px solid var(--accent); }
+  .review-role.system { border-top: 3px solid var(--green); }
+  .review-role.system .role-icon { background: rgba(78, 201, 176, .14); color: var(--green); }
+  .review-role.user { border-top: 3px solid var(--purple); }
+  .review-role.user .role-icon { background: rgba(197, 134, 192, .14); color: var(--purple); }
+  .review-role strong { display: block; margin-top: 8px; font-size: 12px; }
+  .review-role span { display: block; margin-top: 3px; color: var(--faint); font-size: 10.5px; line-height: 1.55; }
+
+  .review-debt {
+    padding: 14px; background: rgba(244, 135, 113, .08);
+    border: 1px solid rgba(244, 135, 113, .35); border-radius: 10px;
+  }
+  .debt-head { display: flex; align-items: center; gap: 8px; }
+  .debt-icon {
+    display: flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; border-radius: 50%;
+    background: rgba(244, 135, 113, .18); color: var(--red);
+    font-weight: 800;
+  }
+  .review-debt strong { font-size: 12px; }
+  .review-debt p { margin: 8px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.65; }
+  .debt-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .debt-tags span {
+    padding: 2px 7px; border-radius: 999px;
+    background: rgba(244, 135, 113, .12); color: var(--red); font-size: 10px;
+  }
+
+  .review-gate {
+    padding: 14px; border: 1px solid rgba(215, 186, 125, .35); border-radius: 12px;
+    background: linear-gradient(180deg, rgba(215, 186, 125, .08), transparent);
+  }
+  .gate-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .gate-badge {
+    padding: 2px 8px; border-radius: 999px;
+    background: rgba(215, 186, 125, .15); color: var(--orange);
+    font-size: 10px; font-weight: 800; letter-spacing: .08em;
+  }
+  .review-gate h4 { margin: 0; font-size: 13px; }
+  .gate-questions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+  .gate-q {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 9px 10px; background: var(--bg-3);
+    border: 1px solid var(--border); border-radius: 8px;
+    color: var(--muted); font-size: 11.5px; line-height: 1.6;
+  }
+  .q-index {
+    flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; border-radius: 6px;
+    background: rgba(215, 186, 125, .15); color: var(--orange);
+    font-size: 9.5px; font-weight: 800;
+  }
+  .gate-output {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+    margin-top: 10px; padding-top: 10px;
+    border-top: 1px dashed var(--border-strong);
+    color: var(--faint); font-size: 11px;
+  }
+  .gate-output strong { color: var(--green); }
+  .gate-output .empty { margin-left: auto; color: var(--muted); }
+  .gate-rejects { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .gate-rejects span {
+    padding: 3px 8px; border-radius: 999px;
+    background: rgba(244, 135, 113, .09); border: 1px solid rgba(244, 135, 113, .22);
+    color: var(--muted); font-size: 10px;
+  }
+
+  .review-outcomes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .outcome { padding: 10px 12px; background: var(--bg-3); border: 1px solid var(--border); border-radius: 8px; }
+  .outcome strong { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
+  .outcome span { display: block; margin-top: 3px; color: var(--faint); font-size: 10.5px; line-height: 1.5; }
+  .outcome.active { border-left: 3px solid var(--green); }
+  .outcome.candidate { border-left: 3px solid var(--orange); }
+  .outcome.retired { border-left: 3px solid var(--faint); }
+
   .diagram { display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; }
   .diagram .box { flex: 1 1 180px; min-width: 0; }
   .diagram .arrow { display: flex; align-items: center; justify-content: center; color: var(--faint); font-size: 16px; }
@@ -234,7 +350,11 @@
 
   @media (max-width: 900px) {
     html { scroll-padding-top: 96px; }
-    .cols-3, .cols-2, .record-grid, .two-col, .code-map, .walk-grid { grid-template-columns: 1fr; }
+    .cols-3, .cols-2, .record-grid, .two-col, .code-map, .walk-grid,
+    .review-stepper, .review-split, .review-roles, .gate-questions, .review-outcomes {
+      grid-template-columns: 1fr;
+    }
+    .review-stepper::before { display: none; }
     .project-grid { grid-template-columns: 1fr; }
     .split { grid-template-columns: 1fr; }
     .diagram .arrow { display: none; }
@@ -282,7 +402,7 @@
       <a href="#ch-02">02 任务</a>
       <a href="#ch-03">03 记录</a>
       <a href="#ch-04">04 并行</a>
-      <a href="#ch-05">05 收束</a>
+      <a href="#ch-05">05 审查</a>
       <a href="#ch-06">06 召回</a>
       <a href="#ch-07">07 接入</a>
     </div>
@@ -327,7 +447,7 @@
         </article>
         <article class="card">
           <p class="kicker">03 任务沉淀经验，用户记忆跨项目</p>
-          <p>每个任务结束时，把值得复用的结论审核后沉淀为项目经验；下次遇到类似工作，可以直接复用，不用重新摸索。</p>
+          <p>每个任务结束时先做一次删选：绝大多数内容留在任务记录，只有值得跨任务复用的结论才沉淀为项目经验；下次遇到类似工作，可以直接复用，不用重新摸索。</p>
           <p>用户明确要求保留的偏好或经验，可以跨项目使用；只有显式启用才进入上下文。</p>
           <div class="flow">
             <span class="tag">任务结束</span><span class="arr">→</span>
@@ -605,7 +725,7 @@
             <span class="num">5</span>
             <div><h3>完成并审查</h3><span class="path">knowledge/memory_&lt;id&gt;.md</span></div>
           </div>
-          <p>有可复用结论时 · 每条 1 个</p>
+          <p>任务关闭后先进入 pending_review · 审查通过后每条 1 个</p>
           <div class="split">
             <pre>---
 {
@@ -619,7 +739,7 @@
           </div>
         </article>
       </div>
-      <div class="callout">取消的任务直接归档，不产生知识文件。</div>
+      <div class="callout">取消的任务直接归档；完成的任务先进入 pending_review，审查通过后才产生 active 知识。审查责任、时机和标准见 <a href="#ch-05">第 05 章</a>。</div>
     </div>
 
     <p class="lead" style="margin-top:18px">
@@ -627,7 +747,7 @@
     </p>
 
     <p class="takeaway">
-      <strong>一句话：</strong>任务文件保留最新状态，检查点文件保留历史快照；阶段文件标记任务内部的边界，工作单元文件记录并行分工；有可复用结论时，知识文件在审查通过后产生。
+      <strong>一句话：</strong>任务文件保留最新状态，检查点文件保留历史快照；阶段文件标记任务内部的边界，工作单元文件记录并行分工；任务关闭后先进入 pending_review，审查通过后才产生 active 知识文件。
     </p>
   </section>
 
@@ -697,25 +817,25 @@
 
   <section id="ch-05" class="section" data-chapter>
     <p class="chapter-no">05 / 收束</p>
-    <h2>任务结束后，项目经验和用户经验分别怎么产生</h2>
+    <h2>任务结束后，知识由谁审、何时审、按什么标准审</h2>
     <p class="lead">
-      任务关闭只说明这次工作结束，不会自动产生长期知识。任务里的发现、失败和验证，先要经过一次独立的证据审查：值得复用的结论写成候选，确认后才生效。项目经验和用户经验走同一条审核路径，但来源、范围和复用方式不同。
+      任务关闭只说明这次工作结束，不会自动产生长期知识。MemWeave 只准备证据包、lint 和晋升门槛；宿主 Agent 负责判断，用户保留最终审计权。任务里的发现、失败和验证，先要经过一次独立的证据审查：**默认结论是删除**，只有确实跨任务复用、删掉后明显更容易重复犯错的结论才写成知识并附来源；不确定或仍待审的内容写成候选，`memory_review_complete` 会在记录审查结果的同一个原子提交里激活本次候选。项目经验和用户经验走同一条审核路径，但来源、范围和复用方式不同。
     </p>
 
     <div class="frame">
       <div class="frame-head">
         <h3>两条来源，同一套审核</h3>
-        <p>项目经验来自任务证据；用户经验来自用户明确要求。两者都不能跳过候选和审查。</p>
+        <p>项目经验来自任务证据；用户经验来自用户明确要求。候选只用于不确定或待审内容，审查完成即进入默认召回。</p>
       </div>
       <div class="grid cols-2">
         <div class="card">
           <p class="kicker">项目经验 · 同项目复用</p>
-          <p>任务里的目标、失败、验证和检查点是原材料。任务结束后，审查出值得复用的结论，写成项目候选；确认生效后，后续同类任务可以召回。</p>
+          <p>任务里的目标、失败、验证和检查点是原材料。任务结束后，审查出值得复用的结论，写成项目知识；不确定的内容先写候选，随审查完成一起激活，后续同类任务即可召回。</p>
           <div class="flow">
             <span class="tag">任务证据</span><span class="arr">→</span>
             <span class="tag">审查</span><span class="arr">→</span>
-            <span class="tag">候选</span><span class="arr">→</span>
-            <span class="tag">生效</span>
+            <span class="tag">知识（默认 active）</span><span class="arr">→</span>
+            <span class="tag">默认召回</span>
           </div>
           <p class="muted" style="margin-top:10px">项目经验默认只在同一项目内复用，不自动进入其他项目。</p>
         </div>
@@ -728,20 +848,167 @@
             <span class="tag">候选</span><span class="arr">→</span>
             <span class="tag">生效</span>
           </div>
-          <p class="muted" style="margin-top:10px">用户经验可以跨项目，但只有显式开启用户偏好时才进入上下文，不是默认注入。</p>
+          <p class="muted" style="margin-top:10px">用户经验可以跨项目，active 用户偏好默认进入上下文；写入用户范围仍要求明确的用户来源。</p>
         </div>
       </div>
       <div class="callout" style="margin-top:14px">
-        两条路共享同一套状态：候选不进入默认上下文；显式审核后生效，才进入默认召回；退役后退出默认召回但保留记录。任务、检查点和并行单元都不能直接升级为知识。
+        两条路共享同一套状态：候选不进入默认上下文；审查完成时本次 reviewed 候选被原子激活并进入默认召回；退役后退出默认召回但保留记录。任务、检查点和并行单元都不能直接升级为知识。
+      </div>
+      <div class="callout" style="margin-top:14px">
+        <strong>晋升门槛：默认删除，不默认保留。</strong> 记录必须先证明自己值得留下。只有跨任务仍然稳定、删掉后会明显更容易重复犯错、且证据可回放的规则，才值得晋升。改进文案、压缩长度或“看起来有点用”都不是保留理由；不确定就删除。一次审查写 0 条知识是正常结果。
+      </div>
+      <div class="callout" style="margin-top:14px">
+        <strong>以下内容直接删除，不做“改进后保留”：</strong> 任务进度与收尾总结、版本/发布快照、函数或测试名、文件位置与配置值、一次性冒烟步骤、复述代码或文档、具体业务规则或产品规格、泛泛的最佳实践、未经验证的推断。
       </div>
     </div>
 
-    <p class="lead" style="margin-top:18px">
-      例如：一次“登录失败提示”的任务，审查后可能留下“错误提示要区分原因”这条项目经验；而“以后所有项目都用中文回复”只能来自用户明确要求，不能从某次任务推断。两者都要先候选、再显式审核，区别只是作用范围和复用边界。
-    </p>
+    <div class="callout" style="margin-top:14px">
+      <strong>保留 ≠ 保留原写法。</strong> 通过门槛后必须重写：标题直接写规则；第一句说明适用场景和要做什么；一条只讲一个主题；正文只保留边界、例外和失败模式；证据放进 evidence，不写任务过程、函数名、版本号和测试数量。优先控制在 600 字以内，超过 1200 字进入重写候选；写不短就拆或删。
+    </div>
+
+    <div class="frame" style="margin-top:16px">
+      <div class="frame-head">
+        <h3>同一段任务记录，怎样判断该不该留</h3>
+        <p>先判断是否值得保留；不值得就删除，不要改写成一条“看起来像经验”的记录。</p>
+      </div>
+      <div class="grid cols-2">
+        <div class="card" style="border-left:3px solid var(--red)">
+          <p class="kicker">删除 · 任务/版本快照</p>
+          <p><strong>v0.7.6 发布记录：</strong>安装包 sha256 9743c434，候选上限 500，批次 10 个，309 项测试通过。</p>
+          <p class="muted">版本号、哈希、参数和测试数量都会过期；未来任务不能据此改变决策。</p>
+        </div>
+        <div class="card" style="border-left:3px solid var(--green)">
+          <p class="kicker">保留 · 项目不变量</p>
+          <p><strong>破坏性维护先预览再执行：</strong>删除或迁移数据前必须预览并备份；整批异常先视为上游故障，不能据此批量删除。</p>
+          <p class="muted">跨任务、非显而易见、删掉会明显更容易造成数据损失；附代码/测试证据。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="frame" style="margin-top:16px">
+      <div class="frame-head">
+        <h3>审查不是一句话，而是一条状态链</h3>
+        <p>每一段都有明确输入、责任人和输出；任何一段停下来，知识就停在候选，不会进入默认上下文。</p>
+      </div>
+
+      <div class="review-map">
+        <div class="review-stepper">
+          <div class="review-step active">
+            <span class="review-index">01</span>
+            <strong>任务关闭</strong>
+            <span>完成验收，进入 pending_review</span>
+          </div>
+          <div class="review-step">
+            <span class="review-index">02</span>
+            <strong>证据打包</strong>
+            <span>memory_review：检查点、来源、lint</span>
+          </div>
+          <div class="review-step gate">
+            <span class="review-index">03</span>
+            <strong>删选判断</strong>
+            <span>promotion_gate 四问 + 可回放证据</span>
+          </div>
+          <div class="review-step">
+            <span class="review-index">04</span>
+            <strong>记录结果</strong>
+            <span>默认 0 条；最多 3 条，原子提交</span>
+          </div>
+          <div class="review-step done">
+            <span class="review-index">05</span>
+            <strong>进入召回</strong>
+            <span>active 才进入默认上下文</span>
+          </div>
+        </div>
+
+        <div class="review-split">
+          <div class="review-roles">
+            <div class="review-role agent">
+              <div class="role-icon">A</div>
+              <strong>宿主 Agent</strong>
+              <span>读证据、做判断、写知识；不是后台自动发生</span>
+            </div>
+            <div class="review-role system">
+              <div class="role-icon">M</div>
+              <strong>MemWeave</strong>
+              <span>只准备证据、lint 和门槛；不调用模型</span>
+            </div>
+            <div class="review-role user">
+              <div class="role-icon">U</div>
+              <strong>用户</strong>
+              <span>最终审计者；可逐条保留、修正、退役</span>
+            </div>
+          </div>
+          <div class="review-debt">
+            <div class="debt-head">
+              <div class="debt-icon">!</div>
+              <strong>审查债务</strong>
+            </div>
+            <p><code>pending_review</code> 和 candidate backlog 不是正常状态。完成审查或明确延期前，不要静默开启新的主任务。</p>
+            <div class="debt-tags"><span>pending_review</span><span>candidate backlog</span><span>任务日志形状</span><span>版本快照</span><span>来源缺失</span></div>
+          </div>
+        </div>
+
+        <div class="review-gate">
+          <div class="gate-head">
+            <span class="gate-badge">PROMOTION GATE</span>
+            <h4>四问全过 + 有证据 + 重写合格，才允许保留</h4>
+          </div>
+          <div class="gate-questions">
+            <div class="gate-q"><span class="q-index">Q1</span>未来无关任务会因此改变决策，而不只是觉得有意思？</div>
+            <div class="gate-q"><span class="q-index">Q2</span>删掉它，会明显更容易重复 bug、数据损失或安全错误吗？</div>
+            <div class="gate-q"><span class="q-index">Q3</span>它能在几分钟内从代码、测试、git 或文档重新得出吗？能 → 删除。</div>
+            <div class="gate-q"><span class="q-index">Q4</span>它是稳定不变量，还是任务进度、实现位置或版本快照？</div>
+          </div>
+          <div class="gate-output">
+            <strong>✓ 全部通过</strong> → 最多 0–3 条小型、聚焦、可检索的知识
+            <span class="empty">默认 0 条；未通过直接删除</span>
+          </div>
+          <div class="gate-rejects">
+            <span>任务进度</span><span>版本快照</span><span>函数/测试名</span>
+            <span>发布哈希</span><span>一次性步骤</span><span>复述代码文档</span>
+            <span>泛泛最佳实践</span>
+          </div>
+        </div>
+
+        <div class="review-outcomes">
+          <div class="outcome active">
+            <strong><span class="dot yes"></span>active</strong>
+            <span>默认召回；出现在后续上下文</span>
+          </div>
+          <div class="outcome candidate">
+            <strong><span class="dot partial"></span>candidate</strong>
+            <span>不进入默认上下文；等待审查或明确延期</span>
+          </div>
+          <div class="outcome retired">
+            <strong><span class="dot no"></span>retired</strong>
+            <span>退出默认召回；保留记录和历史</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="frame" style="margin-top:16px">
+      <div class="frame-head">
+        <h3>闭环不是感觉，而是可观测状态</h3>
+        <p><code>system_status.knowledge_loop</code> 汇总长期记忆闭环的真实债务和证据，不靠“用了很久应该有效”来判断。</p>
+      </div>
+      <div class="grid cols-2">
+        <div class="card">
+          <p class="kicker">会被暴露的债务</p>
+          <p>待审任务/阶段龄期、孤立 candidate、迁移激活但未核验的记录、缺失来源、无证据和单来源风险。没有注入追踪时，不回退成“零召回”结论，而是明确标记为未观测。</p>
+          <p class="muted" style="margin-top:10px"><code>workspace_prepare</code> 记录本次真正进入 <code>included_sources</code> 的知识；导航索引里只出现标题不算召回证据。</p>
+        </div>
+        <div class="card">
+          <p class="kicker">会被验证的行为</p>
+          <p><code>behavioral_reuse</code> 场景先制造一次失败，再让同类任务在新会话出现：没有经验时确定性策略选择危险命令，有经验并被作为证据注入时切换到安全路径。</p>
+          <p class="muted" style="margin-top:10px">这是确定性策略回放，不是模型成功率证明。另有一个隔离的 <code>scripts/memweave_agent_eval.py</code> 真实 Codex A/B，检查自动准备、<code>included_sources</code>、实际命令和文件结果；单次运行仍不等于统计收益。</p>
+        </div>
+      </div>
+    </div>
+
 
     <p class="takeaway">
-      <strong>一句话：</strong>项目经验从任务证据来，用户经验从用户明确要求来；两条路都不能跳过候选和审查。
+      <strong>一句话：</strong>项目经验从任务证据来，用户经验从用户明确要求来；两条路都默认删除，只有通过门槛且证据可回放的规则才留下。
     </p>
   </section>
 
@@ -768,7 +1035,7 @@
         </div>
         <div class="map-box">
           <strong>3. 相关知识</strong>
-          <span>按任务标题/目标或本次 query 检索，只装生效知识；没有匹配就不装</span>
+          <span>按任务标题/目标或本次 query 检索 active 知识，并附有界 active-only 知识索引；候选/退役不装</span>
         </div>
         <div class="map-box">
           <strong>4. 代码结构</strong>
@@ -784,7 +1051,7 @@
           <span class="seg-graph" style="flex:10">结构证据</span>
         </div>
       </div>
-      <p class="muted" style="margin-top:8px">示意比例，不是真实测量；真实预算是 500–32000 字符，默认 12000。任务 brief 不能被挤出。</p>
+      <p class="muted" style="margin-top:8px">示意比例，不是真实测量；真实预算是 500–64000 字符，默认 32000。任务 brief 与开放 WorkUnit 不能被挤出，低预算时知识索引先让位。</p>
     </div>
 
     <div class="frame">
@@ -826,13 +1093,13 @@
 
     <h3 style="margin:26px 0 8px;font-size:17px">检索实际怎么走</h3>
     <p class="lead">
-      恢复时，任务、检查点和并行单元不是“搜”出来的，而是按当前任务 ID 直接读 Markdown：任务正文保存最新状态，检查点保留历史顺序。只有知识需要检索：用任务标题/目标或本次 query 去 SQLite FTS5 索引找候选，索引按笔记类型、项目、范围和状态过滤；默认只查生效知识，候选和退役不会返回。索引返回文件路径和分数，最终仍回 Markdown 读当前记录，所以索引不是第二份事实来源。
+      恢复时，任务、检查点和并行单元不是“搜”出来的，而是按当前任务 ID 直接读 Markdown：任务正文保存最新状态，检查点保留历史顺序。只有知识需要检索：用任务标题/目标或本次 query 去 SQLite FTS5 索引找命中，索引按笔记类型、项目、范围和状态过滤；默认只查生效知识，候选和退役不会返回。中文/混合查询在严格匹配无结果时会用原始词项做 OR 兜底；长篇自然中文如果整段短语不命中，会用脚本 unigram/bigram 覆盖回退，要求多个共享片段，避免单字误命中。索引返回文件路径和分数，最终仍回 Markdown 读当前记录，所以索引不是第二份事实来源。
     </p>
 
     <div class="grid cols-2" style="margin-top:14px">
       <div class="card">
         <p class="kicker">产品能保证</p>
-        <p>默认只召回同一项目的生效知识，用户偏好等可选内容必须显式开启；候选和退役不进来；每条结果回读当前 Markdown 和 revision/etag；索引损坏可重建；没有匹配就不注入兜底；截断会明确标注。</p>
+        <p>默认召回同一项目的生效知识，并注入 active 用户偏好与有界知识索引；候选和退役不进来；每条命中回读当前 Markdown 和 revision/etag；索引损坏可重建，派生索引未运行时仍返回 Markdown 知识导航并标注 attention；没有匹配就不注入兜底；截断会明确标注。中文/混合查询会先走严格 FTS，再按词项 OR 兜底；长自然中文另走多片段覆盖回退，不要求精确原词复现，也不把单个共享字当命中。</p>
       </div>
       <div class="card">
         <p class="kicker">产品不能保证</p>
@@ -866,7 +1133,7 @@
       </div>
       <div class="box" style="text-align:center">
         <strong>启动通道</strong>
-        <span>Hook / always-on Rule / 手动首轮指令</span>
+        <span>Hook / always-on Rule / AGENTS.md / 手动首轮指令</span>
       </div>
       <div class="map-arrow" style="margin:6px 0">↓</div>
       <div class="box" style="text-align:center">
@@ -897,7 +1164,7 @@
           <span class="coverage-note">任务内持续</span>
         </div>
       </div>
-      <p class="muted" style="margin-top:8px">有 Hook 的宿主由 Hook 触达边界；没有 Hook 的宿主由 always-on Rule 或手动首轮指令触达。任务内的持续部分始终走 MCP / Skill。</p>
+      <p class="muted" style="margin-top:8px">有可靠 Hook 的宿主由 Hook 触达边界；Codex 由受管 AGENTS.md 触达；没有 Hook 的宿主由 always-on Rule 或手动首轮指令触达。SessionStart 可能晚于首个模型回合，不能作为唯一通道。任务内的持续部分始终走 MCP / Skill。</p>
       <div class="diagram-scroll">
         <svg class="sequence-svg" viewBox="0 0 1000 560" role="img" aria-label="一次会话的时序：用户打开项目，启动通道提醒 Agent，Agent 通过 MCP 读取任务和写检查点，压缩后再次恢复">
           <defs>
@@ -983,7 +1250,7 @@
     </p>
 
     <p class="lead" style="margin-top:12px">
-      所以 Hook 不是存储，也不是每轮都跑；它只在起点和压缩边界负责把 Agent 叫醒。行为契约负责规定什么时候准备、什么时候写检查点、什么时候收尾；MCP 核心负责真正读写任务、检查点和知识。没有 Hook 的客户端也能用同一套流程，只是启动和压缩恢复由 always-on Rule 或手动首轮指令完成。
+      所以 Hook 不是存储，也不是每轮都跑；它只在起点和压缩边界负责把 Agent 叫醒。行为契约负责规定什么时候准备、什么时候写检查点、什么时候收尾；MCP 核心负责真正读写任务、检查点和知识。Codex 的首轮启动由受管 AGENTS.md 保证，Cursor/Devin 由 always-on Rule 或手动首轮指令完成；Hook 只作为边界增强，不能单独证明模型已收到启动上下文。
     </p>
 
     <p class="takeaway">

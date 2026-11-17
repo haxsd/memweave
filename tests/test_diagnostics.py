@@ -100,7 +100,10 @@ class DiagnosticsTests(unittest.TestCase):
             status["clients"]["cursor"]["bootstrap_channel"],
             "always_on_rule+lifecycle_hooks_best_effort",
         )
-        self.assertEqual(status["clients"]["codex"]["bootstrap_channel"], "lifecycle_hooks")
+        self.assertEqual(
+            status["clients"]["codex"]["bootstrap_channel"],
+            "always_on_agents+lifecycle_hooks_best_effort",
+        )
         self.assertEqual(status["clients"]["devin"]["bootstrap_channel"], "always_on_rule")
 
     def test_empty_optional_hook_identifiers_are_omitted(self):

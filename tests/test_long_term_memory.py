@@ -166,7 +166,7 @@ class LongTermMemoryTests(unittest.TestCase):
             query="payroll ledger", budget=4000,
         )
         self.assertNotIn(candidate["id"], {item["id"] for item in unrelated["included_sources"]})
-        self.assertNotIn("quasar refresh boundary sentinel", unrelated["text"])
+        self.assertNotIn(f"Memory [{candidate['id']}]", unrelated["text"])
 
         latest = self.call("task_read", task_id=first["id"])
         self.call(

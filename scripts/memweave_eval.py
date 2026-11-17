@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MemWeave memory-evaluation harness v2 (deterministic, offline).
+"""MemWeave memory-evaluation harness v3 (deterministic, offline).
 
 The harness answers one question with a repeatable command: what does the
 memory substrate actually put in front of a fresh session, and what changes
@@ -16,8 +16,11 @@ Design rules:
 * v1 added two P1/P2 scenarios on top of the recovery/injection/budget/conflict
   set: structured evidence-pointer persistence (incl. legacy records and rebuild)
   and ``memory_review`` consolidation lint/truncation incl. the P2 knowledge
-  index.  v2 adds the P3 opt-in ``knowledge_index`` injection off/on gate.
-  All three are deliberately non-``smoke`` so the CI gate stays fast.
+  index.  v2 adds the P3 opt-in ``knowledge_index`` injection off/on gate.  v3
+  adds ``behavioral_reuse``: a prior failure lesson is injected into an
+  equivalent retry and a deterministic policy must change its next action.
+  This is a policy replay, not a model success rate.  Scenarios stay
+  non-``smoke`` so the CI gate stays fast.
 * Scenarios use the real in-process ``Service`` entry (the same surface the CLI
   and the MCP server dispatch to); this keeps CI smoke fast.  It is not a model
   evaluation: it measures retrieval + injection + conflict behaviour, not
@@ -33,7 +36,7 @@ Usage:
     python scripts/memweave_eval.py --tag smoke     # fast subset
     python scripts/memweave_eval.py --strict        # exit 1 on failure
 
-See ``docs/eval.md`` for scenario descriptions, metrics, baseline and limits.
+See ``tests/eval/README.md`` for scenario descriptions, metrics and limits.
 """
 
 from __future__ import annotations
@@ -70,7 +73,7 @@ except ModuleNotFoundError as _import_error:  # pragma: no cover - environment g
     raise SystemExit(2)
 
 HARNESS_NAME = "memweave-eval"
-HARNESS_VERSION = "0.3.0"
+HARNESS_VERSION = "0.4.0"
 SCHEMA_VERSION = 1
 CONDITIONS = ("A", "B", "C")
 CONDITION_INFO = {
@@ -2858,6 +2861,150 @@ def checks_knowledge_index_injection(fixture: Fixture) -> list[Check]:
     ]
 
 
+# -- scenario 11: behavioral reuse after a prior failure --------------------
+
+BEHAVIOR_QUERY = "清理生成物 git clean isolation worktree"
+
+
+def build_behavioral_reuse(fixture: Fixture) -> None:
+    """Create one failed cleanup followed by an equivalent retry task."""
+    fixture.register("Behavioral reuse")
+    fixture.open_task(
+        "failed_cleanup",
+        title="Clean generated artifacts",
+        goal="Remove generated artifacts without touching isolation worktrees.",
+        acceptance=["generated artifacts removed", "isolation worktrees preserved"],
+    )
+    fixture.claim("failed_cleanup")
+    fixture.checkpoint(
+        "failed_cleanup",
+        progress="First cleanup attempt",
+        findings="The first cleanup used git clean -fdx and deleted an isolation worktree.",
+        failures=(
+            "git clean -fdx removed the isolation worktree and its local state; "
+            "the cleanup was not safe."
+        ),
+        verification="focused cleanup check reproduced the data loss",
+        next_step="Recover from backup and never use git clean for this repository.",
+    )
+    fixture.close_task(
+        "failed_cleanup",
+        summary="Failed cleanup recorded; the reusable lesson is ready for review.",
+    )
+    fixture.open_task(
+        "retry_cleanup",
+        title="Retry generated artifact cleanup",
+        goal="Clean generated artifacts without deleting isolation worktrees.",
+        acceptance=["generated artifacts removed", "isolation worktrees preserved"],
+    )
+    fixture.claim("retry_cleanup")
+    fixture.checkpoint(
+        "retry_cleanup",
+        progress="Preparing the retry cleanup",
+        findings="The previous attempt deleted an isolation worktree.",
+        next_step="Choose the cleanup command and run it.",
+    )
+
+
+def learn_behavioral_reuse(fixture: Fixture) -> None:
+    fixture.write_knowledge(
+        "cleanup_rule",
+        title="清理生成物只删精确路径，绝不使用 git clean -fdx",
+        body=(
+            "清理生成物时只删除明确列出的可再生产物；绝不使用 git clean -fdx "
+            "或任何会递归删除未跟踪目录的命令，否则会破坏隔离 worktree 和本地状态。\n"
+            "Retrieval cues: cleanup generated artifacts, git clean, isolation worktree, "
+            "清理生成物, 隔离 worktree."
+        ),
+        kind="constraint",
+        task_key="failed_cleanup",
+    )
+
+
+def probe_behavioral_reuse(session: Session, prepared: dict, fixture: Fixture,
+                           condition: str) -> dict:
+    """Run a deterministic cleanup policy over the prepare surface.
+
+    The policy treats only a memory entry in ``included_sources`` as usable
+    evidence. A title that merely appears in the navigation index does not
+    change the decision. This is a deterministic policy replay, not a model
+    quality measurement.
+    """
+    facts = facts_from_prepared(prepared)
+    expected_id = fixture.knowledge.get("cleanup_rule", {}).get("id")
+    memory_sources = [
+        source for source in facts.get("included") or []
+        if source.get("type") == "memory"
+    ]
+    matched = next(
+        (source for source in memory_sources if source.get("id") == expected_id),
+        None,
+    )
+    safe = matched is not None
+    return {
+        "behavior_decision": "exact_paths_only" if safe else "git_clean_fdx",
+        "behavior_safe": safe,
+        "behavior_knowledge_id": matched.get("id") if matched else None,
+        "behavior_reason": matched.get("reason") if matched else "no_evidence_injection",
+    }
+
+
+def checks_behavioral_reuse(fixture: Fixture) -> list[Check]:
+    def knowledge_id():
+        return fixture.knowledge.get("cleanup_rule", {}).get("id")
+
+    def decision_traceable(facts: dict) -> tuple[bool, str]:
+        expected = knowledge_id()
+        observed = facts.get("behavior_knowledge_id")
+        return (
+            expected is not None and observed == expected,
+            f"behavior_knowledge_id={observed!r} expected={expected!r}",
+        )
+
+    def control_is_unsafe(facts: dict) -> tuple[bool, str]:
+        safe = bool(facts.get("behavior_safe"))
+        return (not safe), f"behavior_safe={safe}"
+
+    return [
+        Check(
+            "retry_task_recovered", "recall",
+            "the equivalent retry task is recovered",
+            {"A": False, "B": True, "C": True},
+            _equals("task_id", fixture.task_id("retry_cleanup")),
+        ),
+        Check(
+            "prior_failure_evidence_injected", "recall",
+            "the prior cleanup lesson is injected as a memory source (C only)",
+            {"A": False, "B": False, "C": True},
+            _in_list_lazy("included_ids", knowledge_id),
+        ),
+        Check(
+            "behavior_decision_changed", "recall",
+            "the deterministic cleanup policy changes to exact paths (C only)",
+            {"A": False, "B": False, "C": True},
+            _equals("behavior_safe", True),
+        ),
+        Check(
+            "control_decision_is_unsafe", "recall",
+            "without evidence injection the same policy selects git clean -fdx (A/B)",
+            {"A": True, "B": True, "C": False},
+            control_is_unsafe,
+        ),
+        Check(
+            "decision_traceable_to_knowledge", "recall",
+            "the changed decision cites the injected knowledge id (C only)",
+            {"A": False, "B": False, "C": True},
+            decision_traceable,
+        ),
+        Check(
+            "behavior_context_within_budget", "safety",
+            "the behavioral replay stays inside the context budget",
+            {"A": True, "B": True, "C": True},
+            _chars_at_most(DEFAULT_BUDGET),
+        ),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Scenario registry
 # ---------------------------------------------------------------------------
@@ -2921,6 +3068,24 @@ SCENARIOS: list[Scenario] = [
         build=build_phase_reuse,
         learn=learn_phase_reuse,
         make_checks=checks_phase_reuse,
+    ),
+    Scenario(
+        id="behavioral_reuse",
+        title="Behavioral reuse after a prior failure",
+        description=(
+            "A failed cleanup used git clean -fdx and destroyed an isolation worktree. "
+            "An equivalent retry must receive the reviewed cleanup rule as a memory source "
+            "and a deterministic policy must switch from the risky command to exact-path "
+            "deletion. This is a deterministic policy replay, not a model success rate. "
+            "A title visible only in the navigation index is deliberately insufficient."
+        ),
+        prompt="Retry the generated-artifact cleanup without deleting isolation worktrees.",
+        tags=("knowledge", "behavior"),
+        query=BEHAVIOR_QUERY,
+        build=build_behavioral_reuse,
+        learn=learn_behavioral_reuse,
+        make_checks=checks_behavioral_reuse,
+        probe=probe_behavioral_reuse,
     ),
     Scenario(
         id="stale_knowledge_trap",
@@ -3524,7 +3689,7 @@ def format_human_report(report: dict) -> str:
     lines.append("")
     lines.append(
         "Deterministic evaluation only: it measures what MemWeave injects and rejects, "
-        "not how well a model would answer. See docs/eval.md."
+        "not how well a model would answer. See tests/eval/README.md."
     )
     return "\n".join(lines)
 

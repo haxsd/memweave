@@ -29,11 +29,16 @@ class CodexSetupTests(unittest.TestCase):
         return json.loads(completed.stdout or completed.stderr)["data"]
 
     def snapshot(self):
-        return {str(path.relative_to(self.root)): path.read_bytes()
-                for directory in (self.root / ".codex", self.root / ".agents")
-                if directory.exists() for path in directory.rglob("*") if path.is_file()}
+        snapshot = {
+            str(path.relative_to(self.root)): path.read_bytes()
+            for directory in (self.root / ".codex", self.root / ".agents")
+            if directory.exists() for path in directory.rglob("*") if path.is_file()
+        }
+        if (self.root / "AGENTS.md").is_file():
+            snapshot["AGENTS.md"] = (self.root / "AGENTS.md").read_bytes()
+        return snapshot
 
-    def test_codex_setup_and_probe_install_all_components_without_touching_agents(self):
+    def test_codex_setup_and_probe_preserve_agents_and_add_managed_block(self):
         original = "# Existing project rules\nKeep business invariants.\n"
         (self.root / "AGENTS.md").write_text(original, encoding="utf-8")
         installed = self.command("setup")
@@ -50,16 +55,45 @@ class CodexSetupTests(unittest.TestCase):
         )
         self.assertFalse({"PostToolUse", "Stop"} & set(hooks["hooks"]))
         self.assertTrue(installed["required_actions"])
-        self.assertEqual((self.root / "AGENTS.md").read_text(), original)
+        agents = (self.root / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn(original, agents)
+        self.assertIn("<!-- memweave:begin -->", agents)
+        self.assertIn("memweave_workspace_prepare", agents)
+        self.assertIn("<!-- memweave:end -->", agents)
         checked = self.command("check", "--probe")
         self.assertEqual(checked["state"], "ready")
         self.assertEqual(checked["protocol_verification"], "sdk_stdio")
         self.assertEqual(checked["hook_trust"], "requires_host_review")
         self.assertEqual(checked["desktop_verification"], "unverified")
-        self.assertEqual(checked["bootstrap_channel"], "lifecycle_hooks")
+        self.assertEqual(
+            checked["bootstrap_channel"],
+            "always_on_agents+lifecycle_hooks_best_effort",
+        )
         before = self.snapshot()
         self.assertEqual(self.command("setup")["state"], "up_to_date")
         self.assertEqual(before, self.snapshot())
+
+    def test_codex_creates_agents_block_when_agents_file_is_absent(self):
+        self.assertFalse((self.root / "AGENTS.md").exists())
+        self.command("setup")
+        agents = (self.root / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("<!-- memweave:begin -->", agents)
+        self.assertIn("memweave_workspace_prepare", agents)
+        self.assertEqual(self.command("check")["state"], "ready")
+
+    def test_modified_agents_managed_block_is_not_overwritten(self):
+        self.command("setup")
+        path = self.root / "AGENTS.md"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "memweave_workspace_prepare", "modified_instruction", 1
+            ),
+            encoding="utf-8",
+        )
+        before = self.snapshot()
+        self.command("setup", success=False)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(self.command("check", success=False)["state"], "needs_attention")
 
     def test_codex_merge_preserves_comments_other_mcp_and_hook_groups(self):
         directory = self.root / ".codex"

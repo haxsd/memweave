@@ -12,7 +12,7 @@ from memweave import __version__
 
 
 CLIENT_BOOTSTRAP_CHANNELS = {
-    "codex": "lifecycle_hooks",
+    "codex": "always_on_agents+lifecycle_hooks_best_effort",
     "cursor": "always_on_rule+lifecycle_hooks_best_effort",
     "devin": "always_on_rule",
     "generic": "manual_host_instruction_required",
@@ -237,3 +237,100 @@ class Diagnostics:
             return state if isinstance(state, dict) else {}
         except (DiagnosticError, sqlite3.Error, ValueError, TypeError, RecursionError):
             return {}
+
+    def record_knowledge_injections(
+        self, project_id: str, task_id: str | None, sources: list, query: str = "",
+    ) -> dict:
+        """Record which knowledge records reached a prepare context.
+
+        This is derived runtime telemetry, never canonical memory. It powers the
+        read-only loop-health view and must not fail a prepare when storage is
+        unavailable.
+        """
+        validate_text(project_id, "project_id", 100)
+        memory_ids = []
+        for source in sources or []:
+            if not isinstance(source, dict) or source.get("type") != "memory":
+                continue
+            memory_id = source.get("id")
+            validate_text(memory_id, "memory_id", 100)
+            memory_ids.append((memory_id, str(source.get("reason") or "")[:80]))
+        if not memory_ids:
+            return {"recorded": 0}
+        if task_id is not None:
+            validate_text(task_id, "task_id", 100)
+        injected_at = datetime.now(timezone.utc).isoformat()
+        query_text = (query or "")[:1000]
+        with self._connect(writable=True) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS knowledge_injections ("
+                "project_id TEXT NOT NULL, memory_id TEXT NOT NULL, "
+                "last_injected_at TEXT NOT NULL, injection_count INTEGER NOT NULL, "
+                "last_task_id TEXT, last_reason TEXT, last_query TEXT, "
+                "PRIMARY KEY(project_id, memory_id))"
+            )
+            for memory_id, reason in memory_ids:
+                connection.execute(
+                    "INSERT INTO knowledge_injections "
+                    "(project_id, memory_id, last_injected_at, injection_count, "
+                    " last_task_id, last_reason, last_query) "
+                    "VALUES (?, ?, ?, 1, ?, ?, ?) "
+                    "ON CONFLICT(project_id, memory_id) DO UPDATE SET "
+                    "last_injected_at=excluded.last_injected_at, "
+                    "injection_count=knowledge_injections.injection_count + 1, "
+                    "last_task_id=excluded.last_task_id, "
+                    "last_reason=excluded.last_reason, "
+                    "last_query=excluded.last_query",
+                    (project_id, memory_id, injected_at, task_id, reason, query_text),
+                )
+        return {"recorded": len(memory_ids), "injected_at": injected_at}
+
+    def knowledge_injections(self, project_id: str | None = None) -> dict:
+        """Return bounded injection telemetry; absence means no observation yet."""
+        empty = {
+            "tracking_since": None,
+            "last_injection_at": None,
+            "injection_count": 0,
+            "memory_count": 0,
+            "items": [],
+            "truncated": False,
+        }
+        if not self.database.is_file():
+            return empty
+        try:
+            with self._connect() as connection:
+                exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'knowledge_injections'"
+                ).fetchone()
+                if exists is None:
+                    return empty
+                if project_id is None:
+                    rows = connection.execute(
+                        "SELECT project_id, memory_id, last_injected_at, injection_count, "
+                        "last_task_id, last_reason, last_query "
+                        "FROM knowledge_injections ORDER BY last_injected_at DESC LIMIT 201"
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        "SELECT project_id, memory_id, last_injected_at, injection_count, "
+                        "last_task_id, last_reason, last_query "
+                        "FROM knowledge_injections WHERE project_id = ? "
+                        "ORDER BY last_injected_at DESC LIMIT 201",
+                        (project_id,),
+                    ).fetchall()
+        except (DiagnosticError, sqlite3.Error):
+            return empty
+        items = [dict(row) for row in rows]
+        truncated = len(items) > 200
+        items = items[:200]
+        if not items:
+            return empty
+        return {
+            "tracking_since": min(item["last_injected_at"] for item in items),
+            "last_injection_at": max(item["last_injected_at"] for item in items),
+            "injection_count": sum(int(item["injection_count"]) for item in items),
+            "memory_count": len(items),
+            "items": items,
+            "truncated": truncated,
+        }

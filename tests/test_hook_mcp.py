@@ -64,7 +64,7 @@ class HookMcpTests(unittest.IsolatedAsyncioTestCase):
 
                 await hook("sessionEnd")
                 restored = await hook("sessionStart", conversation_id="next-session")
-                self.assertNotIn("NEXT_SESSION_REUSES_KNOWLEDGE", restored["additional_context"])
+                self.assertIn("已确认的项目经验", restored["additional_context"])
                 self.assertNotIn("关闭并提炼", restored["additional_context"])
                 async with asyncio.timeout(30):
                     async with Client(
@@ -79,6 +79,10 @@ class HookMcpTests(unittest.IsolatedAsyncioTestCase):
                         data = prepared.structured_content["data"]
                         self.assertIsNone(data["task_id"])
                         self.assertIn("NEXT_SESSION_REUSES_KNOWLEDGE", data["context"]["text"])
+                        self.assertIn(
+                            memory["id"],
+                            {source["id"] for source in data["context"]["included_sources"]},
+                        )
 
     async def test_codex_task_state_is_resumed_by_cursor_on_the_same_home(self):
         with tempfile.TemporaryDirectory() as directory:

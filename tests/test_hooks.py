@@ -45,7 +45,7 @@ class HookWorkflowTests(unittest.TestCase):
                          goal="OLD_TASK_GOAL_MUST_NOT_LEAK", acceptance=["通过回归"],
                          operation_id=operation_id)
 
-    def test_start_auto_resumes_unique_task_and_withholds_user_scope(self):
+    def test_start_auto_resumes_unique_task_and_includes_user_preference(self):
         self.call("memory_write", title="项目约束",
                   body="PROJECT_RULE_VISIBLE 实现修复 OLD_TASK_GOAL_MUST_NOT_LEAK",
                   project_id=self.project["id"],
@@ -61,10 +61,12 @@ class HookWorkflowTests(unittest.TestCase):
         self.assertIn("不要把“裸名未出现”误判为 MCP 未加载", context)
         self.assertIn("未出现时不得凭 Hook 文案发起调用", context)
         self.assertIn("不要用 shell 重读 Skill", context)
+        self.assertIn("默认删除，不默认保留", context)
+        self.assertIn("版本快照", context)
         self.assertIn("OLD_TASK_GOAL_MUST_NOT_LEAK", context)
         self.assertIn("唯一 current 任务", context)
         self.assertIn("MemWeave · 任务", context)
-        self.assertNotIn("PRIVATE_USER_PREFERENCE", context)
+        self.assertIn("PRIVATE_USER_PREFERENCE", context)
         self.assertLessEqual(len(context), 6000)
         self.assertEqual(self.call("task_read", task_id=task["id"])["revision"], 1)
         state = self.service.vault.diagnostics.hook_state("conversation-1")

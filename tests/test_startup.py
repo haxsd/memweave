@@ -29,6 +29,11 @@ class ServerStartupTests(unittest.TestCase):
         self.assertIn("verify actual files/tests before continuing", server.instructions)
         self.assertIn("When the user corrects the direction", server.instructions)
         self.assertIn("checkpoint the correction", server.instructions)
+        self.assertIn("durable cross-task invariants", server.instructions)
+        self.assertIn(
+            "Task progress, version snapshots and one-off implementation details stay in task history",
+            server.instructions,
+        )
         self.assertEqual(
             CLIENT_BOOTSTRAP_CHANNELS["generic"],
             "manual_host_instruction_required",

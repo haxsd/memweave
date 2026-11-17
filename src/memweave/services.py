@@ -1,8 +1,12 @@
 import hashlib
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+from basic_memory.repository.script_ngrams import script_run_grams, script_runs
+from basic_memory.utils import generate_permalink
 
 from memweave.basic_memory_index import BasicMemoryIndex
 from memweave.diagnostics import DiagnosticError, result, validate_text
@@ -33,6 +37,8 @@ WORK_UNIT_TRANSITIONS = {
     "completed": set(),
     "cancelled": set(),
 }
+CONTEXT_BUDGET_DEFAULT = 32000
+CONTEXT_BUDGET_MAX = 64000
 
 # Bounded consolidation package returned by memory_review (read-only, no model call).
 CONSOLIDATION_LIMITS = {
@@ -47,11 +53,157 @@ CONSOLIDATION_LIMITS = {
     "duplicate_title_groups": 20,
     "duplicate_title_ids": 10,
     "knowledge_ids_without_evidence": 20,
+    "promotion_risk_ids": 20,
+    "rewrite_body_chars": 1200,
+    "oversized_body_chars": 4000,
     "recent_checkpoint_chars": 16000,
     "active_knowledge_chars": 20000,
     "candidate_knowledge_chars": 20000,
     "pending_chars": 8000,
     "lint_chars": 12000,
+}
+
+# Delete-first promotion gate returned with every task/phase review. This is
+# guidance for the host model, not an automatic classifier: the model must decide
+# whether a candidate is durable project knowledge or just task/version history.
+KNOWLEDGE_PROMOTION_GATE = {
+    "rule": (
+        "Default to deleting. Promote only a durable, cross-task invariant whose loss "
+        "would make a future unrelated task materially more likely to fail. Task "
+        "history, version snapshots and re-derivable implementation facts never become "
+        "long-term knowledge."
+    ),
+    "default_decision": "delete",
+    "burden_of_proof": (
+        "The record must earn retention. Rewriting a low-value record is not a reason "
+        "to keep it."
+    ),
+    "write_shape": {
+        "rule": (
+            "Retention does not preserve the original wording. Rewrite before writing."
+        ),
+        "template": (
+            "One-sentence invariant, then 2-4 bullets for boundary, exception or "
+            "failure mode; keep evidence in pointers, not prose."
+        ),
+        "checks": [
+            "Title states the rule, not the task, phase, version or ticket.",
+            "First sentence states when the rule applies and what to do.",
+            "One topic per record; split or delete multi-topic bundles.",
+            "Remove chronology, file/function/test names, command logs, version numbers and hashes.",
+            "Keep only boundaries, exceptions and failure modes that change future decisions.",
+            "If it defines product behavior, put it in code, tests or product docs, not long-term knowledge.",
+            "Attach replayable evidence pointers; prose alone is not evidence.",
+            "If it cannot be stated in one sentence plus a few bullets, split or delete it.",
+        ],
+        "target": (
+            "Prefer 600 characters or fewer. Active bodies of 1200 characters or more "
+            "are rewrite candidates, not automatically valid knowledge."
+        ),
+    },
+    "layers": {
+        "task_history": (
+            "What changed in this task, touched files/functions, schema versions, "
+            "test names and one-off debugging steps; keep in task/checkpoint."
+        ),
+        "project_invariant": (
+            "A stable rule, constraint, decision or procedure that a future "
+            "unrelated task must follow; candidate for project knowledge."
+        ),
+        "implementation_detail": (
+            "Transient names, line numbers, configuration and migration steps; "
+            "keep in code/docs, not long-term knowledge."
+        ),
+        "version_snapshot": (
+            "Release tags, package names, hashes, dates, batch parameters and database "
+            "schema versions; keep in release notes or task records."
+        ),
+    },
+    "questions": [
+        "Would a future, unrelated task change a decision because of this, rather than merely find it interesting?",
+        "If deleted, would that task be materially more likely to repeat a bug, data loss, security mistake or wrong architecture choice?",
+        "Can it be re-derived in a few minutes from code, tests, git history or docs? If yes, delete it.",
+        "Is it a stable invariant rather than this task's progress, implementation locations or a version snapshot?",
+    ],
+    "do_not_promote": [
+        "task closeout summary",
+        "task/phase progress or what-changed narrative",
+        "multi-topic bundle",
+        "one-off fix narrative",
+        "function/schema/test names without a durable rule",
+        "touched files, line numbers, config values or test counts",
+        "release tags, package names, hashes, dates or batch parameters",
+        "one-off smoke/debug steps, temporary ports or local paths",
+        "restating current code or docs behavior that can be read directly",
+            "product behavior or spec that belongs in code, tests or product docs",
+        "generic best practice that any competent developer already applies",
+        "unverified inference",
+    ],
+    "keep_only_if": [
+        "non-obvious invariant that prevents data loss, security/privacy harm or repeated debugging",
+        "current architecture decision with rationale and rejected alternatives",
+        "external platform or API constraint that is expensive to rediscover",
+        "project-specific trap with a symptom and a rule",
+        "explicit enduring user preference in user scope",
+    ],
+    "zero_knowledge_ok": True,
+    "target": (
+        "0 records is the default; at most 3 small, focused records only when every "
+        "question passes and the result has been rewritten into the required shape."
+    ),
+}
+
+KNOWLEDGE_REVIEW_FLOW = {
+    "owner": (
+        "Host Agent reviews; MemWeave prepares evidence and lint only; the user is "
+        "the final auditor."
+    ),
+    "triggers": [
+        "task_close",
+        "task_phase_close",
+        "workspace_prepare reports pending consolidation",
+        "candidate backlog",
+        "next session start",
+        "explicit user request",
+    ],
+    "criteria": (
+        "Delete-first. Apply promotion_gate; if retention is uncertain or the record "
+        "can be re-derived, delete it. If retained, rewrite it into one focused "
+        "invariant before writing. 0 records is the default successful outcome."
+    ),
+    "rewrite": (
+        "Retention does not preserve the original wording. Rewrite valuable but poorly "
+        "written records into one-sentence invariants with boundaries and evidence; "
+        "never copy task chronology into knowledge."
+    ),
+    "retention_bias": (
+        "Do not improve or compress a low-value record to keep it. Wording changes do "
+        "not create durable value."
+    ),
+    "outcome": (
+        "memory_review_complete records the review; reviewed candidates activate "
+        "atomically and enter default recall. An explicit empty review is a complete "
+        "outcome, not a failure."
+    ),
+    "debt": (
+        "pending_consolidation is review debt: resolve it or explicitly defer it "
+        "before opening a new main task."
+    ),
+    "user_scope": (
+        "User-scope knowledge requires an explicit user source and should be "
+        "confirmed by the user; never infer it from project facts."
+    ),
+    "existing_audit": (
+        "Re-audit active knowledge with the same gate. Migration-activated records are "
+        "untrusted until their evidence and current applicability are verified. Rewrite "
+        "valuable but poorly shaped records; do not keep them verbatim."
+    ),
+}
+
+KNOWLEDGE_LOOP_LIMITS = {
+    "detail_items": 20,
+    "active_scan": 120,
+    "recent_injections": 10,
 }
 
 # One-line knowledge navigation map derived on demand from Markdown; never authoritative.
@@ -198,6 +350,23 @@ def _retrieval_cue_value(line):
     return remainder.strip()
 
 
+def _script_query_grams(text):
+    """Return the same unigram/bigram units used by the script search column."""
+    grams = set()
+    for run in script_runs(text):
+        grams.update(script_run_grams(run))
+    return grams
+
+
+def _script_query_minimum(query_grams):
+    """Require more overlap as a query gets longer, without exact-phrase coupling."""
+    if len(query_grams) <= 3:
+        return 1
+    if len(query_grams) <= 7:
+        return 2
+    return 3
+
+
 def _knowledge_summary(body):
     """Pick one bounded applicability sentence from a knowledge body.
 
@@ -216,6 +385,128 @@ def _knowledge_summary(body):
             continue
         return stripped
     return cues
+
+
+def _age_days(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return round(
+        max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 86400), 1
+    )
+
+
+def _file_source_exists(root, reference):
+    if not isinstance(root, str) or not root or not isinstance(reference, str):
+        return None
+    try:
+        cleaned = re.sub(r":\d+(?:-\d+)?$", "", reference.strip())
+        path = Path(cleaned)
+        if not path.is_absolute():
+            path = Path(root) / path
+        return path.resolve().is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def _knowledge_source_risks(memory, project_root, task_ids):
+    risks = set()
+    sources = memory.get("sources") or []
+    for source in sources:
+        if not isinstance(source, dict):
+            risks.add("invalid_source")
+            continue
+        source_type = source.get("type")
+        reference = source.get("reference")
+        if source_type == "task" and reference not in task_ids:
+            risks.add("missing_task_source")
+        elif source_type == "file":
+            exists = _file_source_exists(project_root, reference)
+            if exists is False:
+                risks.add("missing_file_source")
+    evidence = record_evidence(memory)
+    if not evidence:
+        risks.add("no_evidence")
+    if len(sources) == 1:
+        risks.add("single_source")
+    if memory.get("activation_source") == "reviewed_migration" and not evidence:
+        risks.add("migration_unverified")
+    return sorted(risks)
+
+
+_TASK_LOG_MARKERS = (
+    "已实现",
+    "已新增",
+    "已完成",
+    "已修复",
+    "已发布",
+    "已提交",
+    "测试通过",
+    "unittest",
+    "compileall",
+    "node --check",
+    "ruff",
+    "本机生产库",
+    "临时目录",
+    "冒烟",
+    "版本为",
+    "阶段 ",
+    "schema v",
+    "迁移到",
+    "发布资产",
+    "安装包",
+    "哈希",
+    "重试次数",
+    "批次",
+    "当日",
+)
+_VERSION_RE = re.compile(r"\bv\d+\.\d+(?:\.\d+)?\b", re.IGNORECASE)
+_REWRITE_TITLE_MARKERS = (
+    "phase ",
+    "阶段 ",
+    "实现规则",
+    "验证要点",
+    "实施记录",
+    "收尾",
+    "v0.",
+    "v1.",
+    "v2.",
+)
+
+
+def _knowledge_promotion_shape(title, body):
+    """Return cheap advisory signals for task-log and release-snapshot shapes."""
+    text = f"{title or ''}\n{body or ''}"
+    folded = text.casefold()
+    task_signals = {
+        marker for marker in _TASK_LOG_MARKERS if marker.casefold() in folded
+    }
+    version_snapshot = bool(
+        "发布资产" in text
+        or ("安装包" in text and ("发布" in text or "release" in folded))
+        or (
+            "sha256" in folded
+            and ("发布资产" in text or "release" in folded or "安装包" in text)
+        )
+        or (
+            _VERSION_RE.search(text)
+            and ("发布" in text or "release" in folded)
+        )
+    )
+    return len(task_signals) >= 3, version_snapshot
+
+
+def _knowledge_needs_rewrite(title, body, threshold):
+    """Flag valuable-looking records whose shape is too long or task-centric."""
+    if len(body or "") >= threshold:
+        return True
+    folded = (title or "").casefold()
+    return any(marker.casefold() in folded for marker in _REWRITE_TITLE_MARKERS)
 
 
 def _knowledge_index_line(record, limits):
@@ -321,6 +612,7 @@ class Service:
         self.vault.initialize()
         self._migrate_task_model()
         self._migrate_memory_scope()
+        self._migrate_reviewed_candidates()
         return self.status()
 
     def start(self):
@@ -328,6 +620,7 @@ class Service:
         self.vault.initialize()
         self._migrate_task_model()
         self._migrate_memory_scope()
+        self._migrate_reviewed_candidates()
         if self.index is None:
             index = BasicMemoryIndex.acquire(self.vault.home)
             try:
@@ -506,6 +799,7 @@ class Service:
         }
         memories = self.vault.list_records("memory")
         output["knowledge"] = self._knowledge_counts(memories)
+        output["knowledge_loop"] = self.knowledge_loop_health(project_id)
         architectures = self.vault.list_records("architecture")
         projects = self.vault.list_records("project")
         output["architecture"] = self._architecture_counts(architectures, projects)
@@ -569,6 +863,169 @@ class Service:
             "by_scope": by_scope,
             "by_status": by_status,
             "by_scope_status": by_scope_status,
+        }
+
+    def knowledge_loop_health(self, project_id=None):
+        """Return bounded, read-only evidence about the long-term memory loop.
+
+        The report separates canonical Markdown state from derived runtime
+        telemetry. ``zero_recall`` only means no injection was recorded since
+        tracking began; it is not proof that older knowledge was never useful.
+        """
+        project = self._project(project_id) if project_id is not None else None
+        memories = self.vault.list_records("memory", project_id=project_id)
+        tasks = self.vault.list_records("task", project_id=project_id)
+        phases = self.vault.list_records("phase", project_id=project_id)
+        projects = {item["id"]: item for item in self.vault.list_records("project")}
+        task_ids = {item["id"] for item in self.vault.list_records("task")}
+        injections = self.vault.diagnostics.knowledge_injections(project_id)
+        injection_map = {
+            item["memory_id"]: item for item in injections.get("items", [])
+        }
+        memory_by_id = {item["id"]: item for item in memories}
+
+        def detail(record, age_field="created_at"):
+            return {
+                "id": record["id"],
+                "title": record.get("title", ""),
+                "age_days": _age_days(record.get(age_field)),
+            }
+
+        reviewed_refs = set()
+        pending_tasks = []
+        for task in tasks:
+            if task.get("consolidation_status") == "reviewed":
+                reviewed_refs.update(task.get("consolidation_memory_ids") or [])
+            if (
+                task.get("status") == "completed"
+                and task.get("consolidation_status", "pending") == "pending"
+            ):
+                pending_tasks.append(task)
+        pending_phases = [
+            phase for phase in phases
+            if phase.get("consolidation_status", "pending") == "pending"
+        ]
+        candidates = [item for item in memories if item.get("status") == "candidate"]
+        active = [item for item in memories if item.get("status") == "active"]
+        orphan_candidates = [
+            item for item in candidates if item["id"] not in reviewed_refs
+        ]
+        active_without_evidence = [
+            item for item in active if not record_evidence(item)
+        ]
+        migration_activated = [
+            item for item in active
+            if item.get("activation_source") == "reviewed_migration"
+        ]
+        migration_unverified = [
+            item for item in migration_activated if not record_evidence(item)
+        ]
+        source_risks = []
+        for memory in active[:KNOWLEDGE_LOOP_LIMITS["active_scan"]]:
+            root = (projects.get(memory.get("project_id")) or {}).get("root")
+            risks = _knowledge_source_risks(memory, root, task_ids)
+            if risks:
+                item = detail(memory)
+                item["risks"] = risks
+                source_risks.append(item)
+        tracking_since = injections.get("tracking_since")
+        tracking_active = bool(tracking_since)
+        zero_recall = []
+        if tracking_active:
+            for memory in active:
+                if memory["id"] in injection_map:
+                    continue
+                item = detail(memory)
+                created = memory.get("created_at")
+                item["created_before_tracking"] = bool(
+                    created and created < tracking_since
+                )
+                zero_recall.append(item)
+        recent_injections = []
+        for entry in injections.get("items", [])[:KNOWLEDGE_LOOP_LIMITS["recent_injections"]]:
+            memory = memory_by_id.get(entry["memory_id"])
+            recent_injections.append({
+                "memory_id": entry["memory_id"],
+                "title": memory.get("title", "") if memory else "",
+                "last_injected_at": entry.get("last_injected_at"),
+                "injection_count": entry.get("injection_count"),
+                "last_task_id": entry.get("last_task_id"),
+                "last_reason": entry.get("last_reason"),
+            })
+        counts = {
+            "knowledge_total": len(memories),
+            "active": len(active),
+            "candidate": len(candidates),
+            "retired": sum(1 for item in memories if item.get("status") == "retired"),
+            "pending_review_tasks": len(pending_tasks),
+            "pending_review_phases": len(pending_phases),
+            "orphan_candidates": len(orphan_candidates),
+            "active_without_evidence": len(active_without_evidence),
+            "active_migration_activated": len(migration_activated),
+            "active_migration_unverified": len(migration_unverified),
+            "active_zero_recall": len(zero_recall),
+            "active_recall_unobserved": 0 if tracking_active else len(active),
+            "active_source_risk": len(source_risks),
+        }
+        issues = {}
+        for key in (
+            "pending_review_tasks", "pending_review_phases", "orphan_candidates",
+            "active_migration_unverified", "active_source_risk",
+        ):
+            if counts[key]:
+                issues[key] = counts[key]
+        limit = KNOWLEDGE_LOOP_LIMITS["detail_items"]
+        return {
+            "state": "healthy" if not issues else "debt",
+            "project_id": project["id"] if project is not None else None,
+            "issues": issues,
+            "counts": counts,
+            "debt": {
+                "pending_review_tasks": [
+                    detail(item, "updated_at") for item in pending_tasks[:limit]
+                ],
+                "pending_review_phases": [
+                    detail(item, "updated_at") for item in pending_phases[:limit]
+                ],
+                "orphan_candidates": [
+                    detail(item) for item in orphan_candidates[:limit]
+                ],
+                "migration_unverified": [
+                    detail(item) for item in migration_unverified[:limit]
+                ],
+                "active_without_evidence": [
+                    detail(item) for item in active_without_evidence[:limit]
+                ],
+                "zero_recall": zero_recall[:limit],
+                "source_risk": source_risks[:limit],
+            },
+            "injection_tracking": {
+                "tracking_since": tracking_since,
+                "last_injection_at": injections.get("last_injection_at"),
+                "injection_count": injections.get("injection_count", 0),
+                "memory_count": injections.get("memory_count", 0),
+                "state": "active" if tracking_active else "not_started",
+                "truncated": bool(injections.get("truncated")),
+            },
+            "recent_injections": recent_injections,
+            "reuse_evidence": {
+                "runtime": "not_observed",
+                "deterministic_scenario": "behavioral_reuse",
+                "boundary": (
+                    "Injection and a deterministic policy replay are observed; "
+                    "real model adoption is not."
+                ),
+            },
+            "limits": dict(KNOWLEDGE_LOOP_LIMITS),
+            "notes": [
+                "zero_recall means no injection was recorded since tracking began; "
+                "it is withheld as active_recall_unobserved until tracking starts.",
+                "Injection proves the knowledge reached context, not that a model used it.",
+                "Reuse behavior is covered by the deterministic behavioral_reuse evaluation; "
+                "runtime does not yet observe model decisions.",
+                "task/file sources are checked locally; URL and host references are not "
+                "live-verified.",
+            ],
         }
 
     def _architecture_counts(self, architectures, projects):
@@ -890,6 +1347,77 @@ class Service:
         self.vault.commit(operation_id, request, build)
         self._refresh_index(removed=removed)
 
+    def _migrate_reviewed_candidates(self):
+        """Activate candidates already referenced by a reviewed task or phase.
+
+        Older releases marked consolidation as reviewed without activating the
+        referenced knowledge. Those lessons then stayed invisible to default recall
+        forever. Candidates never referenced by a completed review stay candidates.
+        """
+        candidates = [
+            memory for memory in self.vault.list_records("memory")
+            if memory.get("status") == "candidate"
+        ]
+        if not candidates:
+            return
+        reviewed_ids = set()
+        reviewed_projects = {}
+        review_sources = []
+        for record_type in ("task", "phase"):
+            for record in self.vault.list_records(record_type):
+                if record.get("consolidation_status") != "reviewed":
+                    continue
+                referenced = set(record.get("consolidation_memory_ids") or [])
+                reviewed_ids.update(referenced)
+                for memory_id in referenced:
+                    reviewed_projects.setdefault(memory_id, set()).add(record["project_id"])
+                if referenced:
+                    review_sources.append(f"{record_type}:{record['id']}")
+        eligible = sorted(
+            (
+                memory for memory in candidates
+                if memory["id"] in reviewed_ids
+                and memory.get("project_id") in reviewed_projects.get(memory["id"], set())
+            ),
+            key=lambda item: item["id"],
+        )
+        if not eligible:
+            return
+        request = {
+            "action": "activate-reviewed-candidates-v1",
+            "memories": [
+                {"id": memory["id"], "etag": memory["etag"], "project_id": memory["project_id"]}
+                for memory in eligible
+            ],
+            "review_sources": sorted(review_sources),
+        }
+        operation_id = "reviewed-candidate-activation-" + hashlib.sha256(
+            json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:24]
+        changed = []
+        def build():
+            entries = []
+            for memory in eligible:
+                current = self.vault.read(memory["id"])
+                if current.get("status") != "candidate":
+                    continue
+                updated = {
+                    **current,
+                    "status": "active",
+                    "activation_source": "reviewed_migration",
+                    "revision": current["revision"] + 1,
+                    "updated_at": now(),
+                }
+                changed.append(current["path"])
+                entries.append({
+                    "record": updated,
+                    "path": current["path"],
+                    "expected": current["etag"],
+                })
+            return entries, {"activated": [entry["record"]["id"] for entry in entries]}
+        self.vault.commit(operation_id, request, build)
+        self._refresh_index(changed)
+
     def _create(self, operation_id, request, record_type, scope, project_id, title, body,
                 record_status="active", **metadata):
         def build():
@@ -997,8 +1525,9 @@ class Service:
         raise DiagnosticError("TASK_STATE_INVALID", "Too many tasks created in the same minute.")
 
     def workspace_prepare(
-        self, root, intent="inspect", task_id=None, query="", include_user=False,
-        include_group_knowledge=False, include_knowledge_index=False, budget=12000,
+        self, root, intent="inspect", task_id=None, query="", include_user=True,
+        include_group_knowledge=False, include_knowledge_index=True,
+        budget=CONTEXT_BUDGET_DEFAULT,
         execution_claim=None,
     ):
         path = Path(text(root, "root", 4096)).expanduser()
@@ -1017,7 +1546,7 @@ class Service:
         ) or (
             type(include_knowledge_index) is not bool
         ) or (
-            type(budget) is not int or not 500 <= budget <= 32000
+            type(budget) is not int or not 500 <= budget <= CONTEXT_BUDGET_MAX
         ):
             raise DiagnosticError(
                 "RECORD_INVALID",
@@ -1183,53 +1712,64 @@ class Service:
                 raise DiagnosticError("TASK_STATE_INVALID", "More than one current task needs migration.")
             else:
                 prepared["state"] = "no_active_task"
-                self._mark_workspace_prepared(prepared)
-                return prepared
-            claim, claim_state = self.execution.claim(
-                selected["id"], project["id"], execution_claim
-            )
-            if claim_state == "invalid":
-                raise DiagnosticError(
-                    "EXECUTION_CLAIM_INVALID",
-                    "The execution claim is stale or does not belong to this task.",
+            if selected is not None:
+                claim, claim_state = self.execution.claim(
+                    selected["id"], project["id"], execution_claim
                 )
-            if claim_state == "claimed":
-                prepared["state"] = "task_claimed"
-                prepared["tasks"] = []
-                prepared["task_id"] = None
+                if claim_state == "invalid":
+                    raise DiagnosticError(
+                        "EXECUTION_CLAIM_INVALID",
+                        "The execution claim is stale or does not belong to this task.",
+                    )
+                if claim_state == "claimed":
+                    prepared["state"] = "task_claimed"
+                    prepared["tasks"] = []
+                    prepared["task_id"] = None
+                    prepared["execution"] = {
+                        "state": "claimed_elsewhere",
+                        "task_id": selected["id"],
+                    }
+                    prepared["attention"].append({
+                        "code": "task_claimed_elsewhere",
+                        "severity": "warning",
+                        "message": (
+                            "Another live MCP service instance owns this task. Do not continue it; "
+                            "work on an explicit side task, or wait for the owner to close/release it."
+                        ),
+                    })
+                    self._mark_workspace_prepared(prepared)
+                    return prepared
                 prepared["execution"] = {
-                    "state": "claimed_elsewhere",
+                    "state": claim_state,
+                    "claim_id": claim["claim_id"],
                     "task_id": selected["id"],
+                    "claimed_at": claim["claimed_at"],
                 }
-                prepared["attention"].append({
-                    "code": "task_claimed_elsewhere",
-                    "severity": "warning",
-                    "message": (
-                        "Another live MCP service instance owns this task. Do not continue it; "
-                        "work on an explicit side task, or wait for the owner to close/release it."
-                    ),
-                })
-                self._mark_workspace_prepared(prepared)
-                return prepared
-            prepared["execution"] = {
-                "state": claim_state,
-                "claim_id": claim["claim_id"],
-                "task_id": selected["id"],
-                "claimed_at": claim["claimed_at"],
-            }
-        if intent != "inspect":
-            if intent == "new":
-                prepared["tasks"] = []
-            prepared["task_id"] = selected["id"] if selected else None
-            prepared["context"] = context = self.context_get(
-                project["id"], prepared["task_id"], query, include_user, budget,
-                execution_root=str(path),
-                include_group_knowledge=include_group_knowledge,
-                include_knowledge_index=include_knowledge_index,
+        if intent == "new":
+            prepared["tasks"] = []
+        # Even read-only inspect and no-active-task responses carry a bounded
+        # knowledge digest; otherwise a project with accumulated active knowledge
+        # looks empty on every fresh session.
+        context_task_id = selected["id"] if selected else (
+            current[0]["id"] if intent == "inspect" and len(current) == 1 else None
+        )
+        prepared["task_id"] = context_task_id
+        prepared["context"] = context = self.context_get(
+            project["id"], context_task_id, query, include_user, budget,
+            execution_root=str(path),
+            include_group_knowledge=include_group_knowledge,
+            include_knowledge_index=include_knowledge_index,
+        )
+        prepared["attention"] = context.get("attention", prepared_attention)
+        prepared["completion"] = context.get("completion")
+        try:
+            self.vault.diagnostics.record_knowledge_injections(
+                project["id"], context_task_id,
+                context.get("included_sources") or [], query=query,
             )
-            prepared["context"] = context
-            prepared["attention"] = context.get("attention", prepared_attention)
-            prepared["completion"] = context.get("completion")
+        except DiagnosticError:
+            # Runtime telemetry must never block recovery.
+            pass
         self._mark_workspace_prepared(prepared)
         return prepared
 
@@ -1972,6 +2512,67 @@ class Service:
         record["evidence"] = record_evidence(record)
         return record
 
+    def _memory_script_fallback(self, searches, query, status, limit):
+        """Rank active memory by script-gram overlap when exact FTS misses.
+
+        The script column stores portable unigrams and adjacent bigrams, but the
+        strict query path currently requires a whole run to appear as one ordered
+        phrase. Natural questions and long Chinese requests rarely reproduce a
+        note's exact run, so the body is never injected even though the title is
+        visible in the navigation index. This bounded fallback scans the local
+        memory records and requires meaningful overlap rather than one shared
+        character.
+        """
+        query_grams = _script_query_grams(query)
+        if not query_grams:
+            return []
+        minimum = _script_query_minimum(query_grams)
+        search_keys = set(searches)
+        scored = []
+        for record in self.vault.list_records("memory"):
+            if record.get("status") != status:
+                continue
+            key = (record.get("scope"), record.get("project_id"))
+            if key not in search_keys:
+                continue
+            title_grams = _script_query_grams(record.get("title", ""))
+            body_grams = _script_query_grams(
+                "\n".join(
+                    value for value in (
+                        record.get("title", ""),
+                        record.get("body", ""),
+                        record.get("retrieval", ""),
+                    ) if value
+                )
+            )
+            shared = query_grams & body_grams
+            if len(shared) < minimum:
+                continue
+            coverage = len(shared) / len(query_grams)
+            if len(query_grams) >= 8 and coverage < 0.08:
+                continue
+            title_shared = len(query_grams & title_grams)
+            score = coverage + min(0.20, title_shared * 0.05)
+            scored.append((score, record))
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                str(item[1].get("updated_at") or ""),
+                str(item[1].get("id") or ""),
+            ),
+            reverse=True,
+        )
+        items = []
+        for score, record in scored[:limit]:
+            record = dict(record)
+            record["evidence"] = record_evidence(record)
+            record["retrieval"] = {
+                "permalink": generate_permalink(record["path"]),
+                "score": -round(score, 6),
+            }
+            items.append(record)
+        return items
+
     def memory_search(self, project_id=None, query="", scope="project", limit=20, status="active",
                       include_group=False, include_members=False):
         self._scope(scope, project_id)
@@ -2042,12 +2643,21 @@ class Service:
             items.append(record)
             if len(items) >= limit:
                 break
+        script_fallback = False
+        if not items and query.strip():
+            items = self._memory_script_fallback(
+                searches, query, status, limit,
+            )
+            script_fallback = bool(items)
         return {
             "items": items,
             "matched": len(items),
             "coverage": {
                 "state": "partial",
-                "strategy": "basic_memory_sqlite_fts5",
+                "strategy": (
+                    "basic_memory_sqlite_fts5+script_gram_fallback"
+                    if script_fallback else "basic_memory_sqlite_fts5"
+                ),
                 "query_limit": limit,
                 "record_limit": 1000,
             },
@@ -2198,9 +2808,15 @@ class Service:
             task["project_id"], query=query
         )["items"]
         review["instructions"] = (
-            "Host reviews evidence, searches user wording and bilingual aliases for duplicates, "
-            "and writes candidates or corrections. Reusable knowledge should end with a concise "
-            "Retrieval cues line. No model has run here."
+            "Apply consolidation.review_flow and consolidation.promotion_gate before writing "
+            "knowledge. Default to deleting: keep task progress, version snapshots and re-derivable "
+            "implementation facts in task/checkpoint, and promote only durable cross-task invariants "
+            "whose loss would make a future task materially more likely to fail, backed by evidence. "
+            "Retention does not preserve the original wording: rewrite every retained record into one "
+            "focused invariant with a rule-shaped title, one-sentence applicability and only boundary, "
+            "exception or failure-mode bullets. Search user wording and bilingual aliases for duplicates. "
+            "Default to 0 records and never write more than 3; an empty review is a complete outcome. "
+            "Reusable knowledge should end with a concise Retrieval cues line. No model has run here."
         )
         review["consolidation"] = self._consolidation_package(task, phase)
         return review
@@ -2242,6 +2858,10 @@ class Service:
             record for record in self.vault.list_record_metadata("memory", project_id=project_id)
             if record.get("project_id") == project_id
         ]
+        body_by_id = {
+            record["id"]: record.get("body") or ""
+            for record in self.vault.list_records("memory", project_id=project_id)
+        }
 
         def summarize(record):
             evidence = record_evidence(record)
@@ -2340,6 +2960,40 @@ class Service:
             if not record_evidence(record)
         )
         without_evidence_ids = without_evidence[:limits["knowledge_ids_without_evidence"]]
+        oversized_active = sorted(
+            record["id"] for record in active_records
+            if len(body_by_id.get(record["id"], "")) >= limits["oversized_body_chars"]
+        )
+        oversized_ids = oversized_active[:limits["promotion_risk_ids"]]
+        single_source = sorted(
+            record["id"] for record in (*active_records, *candidate_records)
+            if len(record.get("sources") or []) == 1
+        )
+        single_source_ids = single_source[:limits["promotion_risk_ids"]]
+        migration_activated = sorted(
+            record["id"] for record in active_records
+            if record.get("activation_source") == "reviewed_migration"
+        )
+        migration_activated_ids = migration_activated[:limits["promotion_risk_ids"]]
+        task_log, version_snapshot = [], []
+        for record in (*active_records, *candidate_records):
+            is_task_log, is_version_snapshot = _knowledge_promotion_shape(
+                record.get("title"), body_by_id.get(record["id"], "")
+            )
+            if is_task_log:
+                task_log.append(record["id"])
+            if is_version_snapshot:
+                version_snapshot.append(record["id"])
+        task_log_ids = sorted(task_log)[:limits["promotion_risk_ids"]]
+        version_snapshot_ids = sorted(version_snapshot)[:limits["promotion_risk_ids"]]
+        rewrite_candidate = sorted(
+            record["id"] for record in (*active_records, *candidate_records)
+            if _knowledge_needs_rewrite(
+                record.get("title"), body_by_id.get(record["id"], ""),
+                limits["rewrite_body_chars"],
+            )
+        )
+        rewrite_candidate_ids = rewrite_candidate[:limits["promotion_risk_ids"]]
         oldest_candidate_at = (
             min((record.get("created_at", "") for record in candidate_records), default=None) or None
         )
@@ -2347,6 +3001,12 @@ class Service:
 
         duplicate_truncated = duplicate_total > len(duplicate_groups)
         without_evidence_truncated = len(without_evidence) > len(without_evidence_ids)
+        oversized_truncated = len(oversized_active) > len(oversized_ids)
+        single_source_truncated = len(single_source) > len(single_source_ids)
+        migration_truncated = len(migration_activated) > len(migration_activated_ids)
+        task_log_truncated = len(task_log) > len(task_log_ids)
+        version_snapshot_truncated = len(version_snapshot) > len(version_snapshot_ids)
+        rewrite_truncated = len(rewrite_candidate) > len(rewrite_candidate_ids)
         lint_notes = []
         if duplicate_total:
             lint_notes.append(f"{duplicate_total} normalized title group(s) repeat in this project.")
@@ -2360,8 +3020,41 @@ class Service:
             )
         if retired_count:
             lint_notes.append(f"{retired_count} retired record(s) stay out of default recall.")
+        if oversized_active:
+            lint_notes.append(
+                f"{len(oversized_active)} active record(s) are >= "
+                f"{limits['oversized_body_chars']} characters; check whether they are broad "
+                "task summaries that should be split or retired."
+            )
+        if single_source:
+            lint_notes.append(
+                f"{len(single_source)} active/candidate record(s) rely on a single source."
+            )
+        if migration_activated:
+            lint_notes.append(
+                f"{len(migration_activated)} active record(s) were activated by historical "
+                "migration; audit their provenance."
+            )
+        if task_log:
+            lint_notes.append(
+                f"{len(task_log)} active/candidate record(s) read like task logs; default "
+                "to deleting them unless a reusable invariant is isolated."
+            )
+        if version_snapshot:
+            lint_notes.append(
+                f"{len(version_snapshot)} active/candidate record(s) read like release or "
+                "version snapshots; keep those facts in task/release notes."
+            )
+        if rewrite_candidate:
+            lint_notes.append(
+                f"{len(rewrite_candidate)} active/candidate record(s) are long or "
+                "task-titled; rewrite them into one focused invariant or delete them."
+            )
         if not lint_notes:
-            lint_notes.append("No duplicate titles, unsourced knowledge, candidate backlog or retired records.")
+            lint_notes.append(
+                "No duplicate titles, unsourced knowledge, candidate backlog, task-log "
+                "shapes, version snapshots, rewrite candidates or retired records."
+            )
         lint_truncation_notes = []
         if duplicate_truncated:
             lint_truncation_notes.append(
@@ -2371,6 +3064,33 @@ class Service:
             lint_truncation_notes.append(
                 f"Unsourced knowledge IDs truncated to {len(without_evidence_ids)} "
                 f"of {len(without_evidence)}."
+            )
+        if oversized_truncated:
+            lint_truncation_notes.append(
+                f"Oversized active IDs truncated to {len(oversized_ids)} of {len(oversized_active)}."
+            )
+        if single_source_truncated:
+            lint_truncation_notes.append(
+                f"Single-source IDs truncated to {len(single_source_ids)} of {len(single_source)}."
+            )
+        if migration_truncated:
+            lint_truncation_notes.append(
+                f"Migration-activated IDs truncated to {len(migration_activated_ids)} "
+                f"of {len(migration_activated)}."
+            )
+        if task_log_truncated:
+            lint_truncation_notes.append(
+                f"Task-log-shaped IDs truncated to {len(task_log_ids)} of {len(task_log)}."
+            )
+        if version_snapshot_truncated:
+            lint_truncation_notes.append(
+                f"Version-snapshot IDs truncated to {len(version_snapshot_ids)} of "
+                f"{len(version_snapshot)}."
+            )
+        if rewrite_truncated:
+            lint_truncation_notes.append(
+                f"Rewrite-candidate IDs truncated to {len(rewrite_candidate_ids)} of "
+                f"{len(rewrite_candidate)}."
             )
         lint = {
             "duplicate_titles": {
@@ -2390,9 +3110,52 @@ class Service:
                 "oldest_created_at": oldest_candidate_at,
             },
             "retired": {"count": retired_count},
+            "promotion_risks": {
+                "oversized_body_chars": limits["oversized_body_chars"],
+                "oversized_active": {
+                    "count": len(oversized_active),
+                    "ids": oversized_ids,
+                    "truncated": oversized_truncated,
+                },
+                "single_source": {
+                    "count": len(single_source),
+                    "ids": single_source_ids,
+                    "truncated": single_source_truncated,
+                },
+                "migration_activated": {
+                    "count": len(migration_activated),
+                    "ids": migration_activated_ids,
+                    "truncated": migration_truncated,
+                },
+                "task_log": {
+                    "count": len(task_log),
+                    "ids": task_log_ids,
+                    "truncated": task_log_truncated,
+                },
+                "version_snapshot": {
+                    "count": len(version_snapshot),
+                    "ids": version_snapshot_ids,
+                    "truncated": version_snapshot_truncated,
+                },
+                "rewrite_candidate": {
+                    "count": len(rewrite_candidate),
+                    "ids": rewrite_candidate_ids,
+                    "truncated": rewrite_truncated,
+                    "body_chars": limits["rewrite_body_chars"],
+                },
+            },
             "notes": lint_notes,
             "truncation_notes": lint_truncation_notes,
-            "truncated": duplicate_truncated or without_evidence_truncated,
+            "truncated": (
+                duplicate_truncated
+                or without_evidence_truncated
+                or oversized_truncated
+                or single_source_truncated
+                or migration_truncated
+                or task_log_truncated
+                or version_snapshot_truncated
+                or rewrite_truncated
+            ),
         }
 
         truncated_reasons = []
@@ -2445,6 +3208,8 @@ class Service:
                 "limit": limits["pending_items"],
                 "truncated": len(tasks) > len(pending_task_items),
             },
+            "promotion_gate": KNOWLEDGE_PROMOTION_GATE,
+            "review_flow": KNOWLEDGE_REVIEW_FLOW,
             "lint": lint,
             "knowledge_index": knowledge_index,
             "limits": {
@@ -2480,6 +3245,7 @@ class Service:
             raise DiagnosticError("RECORD_INVALID", "memory_ids must contain at most 30 reviewed knowledge IDs.")
         for memory_id in memory_ids:
             text(memory_id, "memory_id", 100)
+        memory_ids = list(dict.fromkeys(memory_ids))
         changes = dict(consolidation_status="reviewed", consolidation_memory_ids=memory_ids,
                        consolidation_summary=text(summary, "summary"))
         task = self._record(task_id, "task")
@@ -2493,21 +3259,100 @@ class Service:
                 self._require_execution_claim(task_id)
         else:
             self._require_execution_claim(task_id)
+            phase = self._record(phase_id, "phase")
+            if phase["task_id"] != task_id or phase["project_id"] != task["project_id"]:
+                raise DiagnosticError("SCOPE_DENIED", "Phase belongs to a different task.")
+        snapshots = []
         for memory_id in memory_ids:
             memory = self.memory_read(memory_id)
             if memory.get("project_id") != task["project_id"]:
                 raise DiagnosticError("SCOPE_DENIED", "Reviewed knowledge must belong to this project.")
-        if phase_id is not None:
-            phase = self._record(phase_id, "phase")
-            if phase["task_id"] != task_id:
-                raise DiagnosticError("SCOPE_DENIED", "Phase belongs to a different task.")
-            return self._update(
-                "phase_review_complete", phase_id, "phase", expected_revision,
-                expected_etag, operation_id, changes,
-            )
-        changes["archived_at"] = now()
-        return self._update("memory_review_complete", task_id, "task", expected_revision, expected_etag,
-                            operation_id, changes)
+            snapshots.append(memory)
+        target_type = "task" if phase_id is None else "phase"
+        target_id = task_id if phase_id is None else phase_id
+        request = {
+            "action": "memory_review_complete",
+            "target": {"type": target_type, "id": target_id},
+            "expected_revision": expected_revision,
+            "expected_etag": expected_etag,
+            "changes": changes,
+            "reviewed_memories": [
+                {"id": memory["id"], "revision": memory["revision"], "etag": memory["etag"]}
+                for memory in snapshots
+            ],
+        }
+        updated_paths = []
+        def build():
+            old = self._record(target_id, target_type)
+            if old["revision"] != expected_revision or old["etag"] != expected_etag:
+                raise DiagnosticError(
+                    "VERSION_CONFLICT", "Read the latest revision and etag before writing."
+                )
+            if target_type == "task":
+                if old["status"] != "completed":
+                    raise DiagnosticError(
+                        "RECORD_INVALID", "Consolidation review requires a completed task."
+                    )
+                target_changes = {**changes, "archived_at": now()}
+            else:
+                if old["task_id"] != task_id:
+                    raise DiagnosticError("SCOPE_DENIED", "Phase belongs to a different task.")
+                target_changes = changes
+            entries = []
+            for snapshot in snapshots:
+                current = self.memory_read(snapshot["id"])
+                if current.get("project_id") != task["project_id"]:
+                    raise DiagnosticError(
+                        "SCOPE_DENIED", "Reviewed knowledge must belong to this project."
+                    )
+                if (
+                    current["revision"] != snapshot["revision"]
+                    or current["etag"] != snapshot["etag"]
+                ):
+                    raise DiagnosticError(
+                        "VERSION_CONFLICT",
+                        "Reviewed knowledge changed; read the latest revision and retry.",
+                    )
+                # Review completion is the point at which reviewed candidate
+                # knowledge becomes usable. Retired knowledge is never revived.
+                if current.get("status") != "candidate":
+                    continue
+                updated = {
+                    **current,
+                    "status": "active",
+                    "activation_source": "reviewed_task" if phase_id is None else "reviewed_phase",
+                    "revision": current["revision"] + 1,
+                    "updated_at": now(),
+                }
+                updated_paths.append(current["path"])
+                entries.append({
+                    "record": updated,
+                    "path": current["path"],
+                    "expected": current["etag"],
+                })
+            updated_target = {
+                **old,
+                **target_changes,
+                "revision": old["revision"] + 1,
+                "updated_at": now(),
+            }
+            updated_paths.append(old["path"])
+            entries.append({
+                "record": updated_target,
+                "path": old["path"],
+                "expected": old["etag"],
+            })
+            return entries, {
+                "id": target_id,
+                "revision": updated_target["revision"],
+                "etag": digest(encode_record(updated_target).encode("utf-8")),
+                "activated_memory_ids": [
+                    entry["record"]["id"] for entry in entries if entry["record"].get("type") == "memory"
+                ],
+            }
+        response = self.vault.commit(operation_id, request, build)
+        self._refresh_index(updated_paths)
+        return response
 
     def memory_forget(self, memory_id, expected_revision, expected_etag, operation_id):
         if type(expected_revision) is not int or expected_revision < 1:
@@ -2528,8 +3373,9 @@ class Service:
         return response
 
     def context_get(
-        self, project_id, task_id=None, query="", include_user=False, budget=12000,
-        execution_root=None, include_group_knowledge=False, include_knowledge_index=False,
+        self, project_id, task_id=None, query="", include_user=True,
+        budget=CONTEXT_BUDGET_DEFAULT,
+        execution_root=None, include_group_knowledge=False, include_knowledge_index=True,
     ):
         from memweave.context import build_context
         return build_context(

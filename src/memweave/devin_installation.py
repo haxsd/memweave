@@ -21,8 +21,12 @@ from memweave.services import Service
 MANIFEST = "memweave.json"
 SKILL = "skills/memweave-continuity/SKILL.md"
 RULE = "rules/memweave.md"
+LOCAL_MCP_CONFIG = "mcp_config.local.json"
+PROJECT_MCP_CONFIG = "mcp_config.json"
+MCP_SCOPES = ("local", "project", "user")
+DEFAULT_MCP_SCOPE = "local"
 REQUIRED_ACTIONS = [
-    "重启 Devin Desktop，使全局 mcp_config.json 中的 MemWeave 服务重新加载。",
+    "让 Devin 重新加载当前项目的 MCP 配置；Desktop 重启或 CLI 新会话均可。",
     "在 Devin 中打开目标项目，确认 memweave_* 工具出现。",
     "首个状态或实施请求先调用 workspace_prepare；配置检查不等于 Devin 桌面已加载。",
 ]
@@ -38,10 +42,23 @@ def devin_config_path(global_base=None):
     return directory / "mcp_config.json"
 
 
-def report(project, home, **fields):
+def mcp_config_path(project, scope=DEFAULT_MCP_SCOPE, global_base=None):
+    if scope not in MCP_SCOPES:
+        raise DiagnosticError("RECORD_INVALID", "Devin MCP scope must be local, project or user.")
+    if scope == "user":
+        return devin_config_path(global_base)
+    relative = LOCAL_MCP_CONFIG if scope == "local" else PROJECT_MCP_CONFIG
+    return project.path(relative)
+
+
+def manifest_scope(manifest):
+    return manifest.get("mcp_scope") or "user"
+
+
+def report(project, home, mcp_scope=DEFAULT_MCP_SCOPE, **fields):
     return dict(
         version=__version__, client="devin", root=str(project.root), home=str(home),
-        toolset="universal", tool_count=22, mcp_scope="global",
+        toolset="universal", tool_count=22, mcp_scope=mcp_scope,
         bootstrap_channel=CLIENT_BOOTSTRAP_CHANNELS["devin"],
         protocol_verification="not_run", desktop_verification="unverified",
         hooks_installed=False, required_actions=list(REQUIRED_ACTIONS), **fields,
@@ -70,7 +87,12 @@ def rule_text(root):
         "直接说明 MCP 尚未加载或仍在重连，等工具出现后再调用。在 prepare/reboot 给出唯一下一步之前，"
         "禁止打开 PLAN.md、全仓搜索、project_scan 或大范围 graph 扫描，也不得用 CLI/Python 绕过 MCP 硬门，"
         "不得创建、编辑或删除文件。必须先 prepare（inspect/new/resume）；未 prepare 前其他项目工具返回 PREPARE_REQUIRED。"
-        "实施任务同样先 prepare；意图或任务归属有歧义时不按最近时间猜测，include_user 默认 false。\n"
+        "实施任务同样先 prepare；意图或任务归属有歧义时不按最近时间猜测。"
+        "active 项目经验、用户偏好和知识索引默认注入，默认上下文预算 32000 字符、上限 64000；"
+        "低预算时知识索引先让位于当前任务和开放 WorkUnit；"
+        "闭环健康用 system_status.knowledge_loop 查看，知识总数不能代替注入和复用证据。"
+        "默认删除，不默认保留：只有跨任务稳定、删掉会明显更容易重复犯错且有证据的约束才晋升；"
+        "保留后必须重写为单一、可执行的不变量；任务进度、版本快照和实现细节留在任务记录，零条结果是正常结果。\n"
         + STARTUP_FALLBACK +
         CORRECTION_CHECKPOINT +
         "- Devin 不注册 MemWeave 生命周期 Hook；本 always-on Rule 就是会话启动指令通道。"
@@ -130,7 +152,7 @@ def _apply_global(path, content, old):
     backup = None
     if old is not None:
         backup = path.parent / "memweave-backups" / uuid4().hex
-        replace_file(backup / "mcp_config.json", old)
+        replace_file(backup / path.name, old)
     replace_file(path, content)
     return str(backup) if backup else None
 
@@ -150,6 +172,7 @@ def manifest_data(project):
         or not isinstance(manifest.get("home"), str)
         or not Path(manifest["home"]).is_absolute()
         or not isinstance(manifest.get("server"), dict)
+        or manifest.get("mcp_scope", "user") not in MCP_SCOPES
         or not isinstance(manifest.get("mcp_config"), str)
         or not Path(manifest["mcp_config"]).is_absolute()
         or not isinstance(resources, dict) or set(resources) != {SKILL, RULE}
@@ -167,11 +190,11 @@ def manifest_data(project):
 def devin_ignore_lines():
     return [
         "/.gitignore", "/memweave.json", "/memweave-backups/", "/skills/memweave-continuity/",
-        "/rules/memweave.md", "/.memweave-setup.lock",
+        "/rules/memweave.md", "/mcp_config.local.json", "/.memweave-setup.lock",
     ]
 
 
-def installation_plan(project, home, toolset, manifest, mcp_config):
+def installation_plan(project, home, toolset, manifest, mcp_config, mcp_scope):
     server = server_command(home)
     skill = files("memweave").joinpath(
         "skills", "memweave-continuity", "SKILL.md"
@@ -189,7 +212,8 @@ def installation_plan(project, home, toolset, manifest, mcp_config):
     desired[".gitignore"] = merged_ignore(project, ".gitignore", devin_ignore_lines())
     desired[MANIFEST] = json_bytes(dict(
         format=1, client="devin", version=__version__, root=str(project.root),
-        home=str(home), toolset="universal", server=server, mcp_config=str(mcp_config),
+        home=str(home), toolset="universal", server=server, mcp_scope=mcp_scope,
+        mcp_config=str(mcp_config),
         resources=ownership,
     ))
     return {
@@ -198,30 +222,40 @@ def installation_plan(project, home, toolset, manifest, mcp_config):
     }
 
 
-def setup_devin(root, home=None, toolset=None, global_base=None, write_global=True):
+def setup_devin(
+    root, home=None, toolset=None, global_base=None, write_global=True, mcp_scope=None,
+):
     project = ProjectFiles(root, directory=".devin")
     selected = selected_home(home, {})
-    mcp_config = devin_config_path(global_base)
-    _safe_global_path(mcp_config)
     manifest = manifest_data(project)
     selected = selected_home(home, manifest)
-    installation_plan(project, selected, toolset, manifest, mcp_config)
+    scope = mcp_scope or (manifest_scope(manifest) if manifest else DEFAULT_MCP_SCOPE)
+    mcp_config = mcp_config_path(project, scope, global_base)
+    if scope == "user":
+        _safe_global_path(mcp_config)
+    installation_plan(project, selected, toolset, manifest, mcp_config, scope)
     project.cursor.mkdir(parents=True, exist_ok=True)
     try:
         with FileLock(project.path(".memweave-setup.lock"), timeout=3):
             manifest = manifest_data(project)
             selected = selected_home(home, manifest)
-            plan = installation_plan(project, selected, toolset, manifest, mcp_config)
-            global_changed = False
-            global_backup = None
-            if write_global:
+            scope = mcp_scope or (manifest_scope(manifest) if manifest else DEFAULT_MCP_SCOPE)
+            mcp_config = mcp_config_path(project, scope, global_base)
+            if scope == "user":
+                _safe_global_path(mcp_config)
+            plan = installation_plan(
+                project, selected, toolset, manifest, mcp_config, scope,
+            )
+            config_changed = False
+            config_backup = None
+            if write_global or scope != "user":
                 mcp_config.parent.mkdir(parents=True, exist_ok=True)
                 with FileLock(str(mcp_config.parent / ".memweave-mcp-setup.lock"), timeout=3):
                     global_plan = _global_plan(mcp_config, server_command(selected), manifest)
                     if global_plan is not None:
                         content, old = global_plan
-                        global_backup = _apply_global(mcp_config, content, old)
-                        global_changed = True
+                        config_backup = _apply_global(mcp_config, content, old)
+                        config_changed = True
             service = Service(selected)
             service.initialize()
             service.project_register(
@@ -229,13 +263,13 @@ def setup_devin(root, home=None, toolset=None, global_base=None, write_global=Tr
                 "setup-" + fingerprint(str(project.root).encode("utf-8")),
             )
             backup = apply_plan(project, plan, backup_prefix="memweave-backups")
-        changed = list(plan) + ([str(mcp_config)] if global_changed else [])
+        changed = list(plan) + ([str(mcp_config)] if config_changed else [])
         return report(
-            project, selected,
+            project, selected, scope,
             state="installed" if changed else "up_to_date",
             mcp_config_path=str(mcp_config),
             changed_files=changed, backup_directory=backup,
-            global_backup_directory=global_backup,
+            mcp_backup_directory=config_backup,
         )
     except Timeout as error:
         raise DiagnosticError("LOCK_BUSY", "Another Devin setup is running; retry after it finishes.") from error
@@ -245,7 +279,8 @@ def check_devin(root, home=None, probe=False, global_base=None):
     project = ProjectFiles(root, directory=".devin")
     checks = []
     selected = selected_home(home, {})
-    mcp_config = devin_config_path(global_base)
+    mcp_config = mcp_config_path(project, DEFAULT_MCP_SCOPE, global_base)
+    scope = DEFAULT_MCP_SCOPE
 
     def check(name, passed, message, fix=None):
         checks.append(dict(
@@ -256,6 +291,11 @@ def check_devin(root, home=None, probe=False, global_base=None):
     try:
         manifest = manifest_data(project)
         selected = selected_home(home, manifest)
+        scope = manifest_scope(manifest) if manifest else DEFAULT_MCP_SCOPE
+        mcp_config = (
+            Path(manifest["mcp_config"]).expanduser().resolve()
+            if manifest else mcp_config_path(project, scope, global_base)
+        )
         desired = server_command(selected)
         check("installation", bool(manifest), "Devin 项目安装清单存在。")
         try:
@@ -263,21 +303,21 @@ def check_devin(root, home=None, probe=False, global_base=None):
             global_server = global_document.get("mcpServers", {}).get("memweave")
         except DiagnosticError:
             global_server = None
-            check("global_config", False, "Devin 全局 MCP 配置无法解析。", "保留自定义内容后重新运行 setup。")
+            check("mcp_config", False, "Devin MCP 配置无法解析。", "保留自定义内容后重新运行 setup。")
         else:
-            check("global_config", mcp_config.is_file(), "Devin 全局 MCP 配置文件存在。")
+            check("mcp_config", mcp_config.is_file(), "Devin MCP 配置文件存在。")
         check(
-            "mcp_global", global_server == desired,
-            "Devin 全局 MCP 条目必须匹配当前解释器、参数和记忆库。",
-            "显式运行 memweave setup --client devin；全局配置不会被 clients doctor --fix 自动改写。",
+            "mcp_entry", global_server == desired,
+            "Devin MCP 条目必须匹配当前解释器、参数和记忆库。",
+            "运行 memweave setup --client devin；user scope 不会被 clients doctor --fix 自动改写。",
         )
         if not manifest:
             status = Diagnostics(selected).status()["data"]
             check("memory_home", status["initialized"] and status["task_memory"] == "available",
                   "记忆库已经初始化且业务存储可用。")
             output = report(
-                project, selected, state="needs_attention", mcp_config_path=str(mcp_config),
-                checks=checks,
+                project, selected, scope, state="needs_attention",
+                mcp_config_path=str(mcp_config), checks=checks,
             )
             return output
         check("version", manifest["version"] == __version__, "接入资源版本与当前安装包一致。")
@@ -288,7 +328,12 @@ def check_devin(root, home=None, probe=False, global_base=None):
             "配置中的 Python 解释器路径存在。",
         )
         check("home", manifest["home"] == str(selected), "当前记忆库与安装清单一致。")
-        check("mcp_path", manifest["mcp_config"] == str(mcp_config), "安装清单指向当前 Devin 全局 MCP 配置。")
+        expected_config = mcp_config_path(project, scope, global_base)
+        check(
+            "mcp_path",
+            mcp_config == expected_config.resolve(),
+            "安装清单指向当前 scope 对应的 Devin MCP 配置。",
+        )
         skill = files("memweave").joinpath(
             "skills", "memweave-continuity", "SKILL.md"
         ).read_bytes()
@@ -302,8 +347,9 @@ def check_devin(root, home=None, probe=False, global_base=None):
             "manifest",
             manifest["version"] == __version__ and manifest["server"] == desired
             and manifest["home"] == str(selected) and manifest["mcp_config"] == str(mcp_config)
+            and manifest.get("mcp_scope", "user") == scope
             and manifest.get("toolset") == "universal" and manifest_resources_match,
-            "安装清单与当前服务、全局 MCP、记忆库和资源一致。",
+            "安装清单与当前服务、MCP 配置、记忆库和资源一致。",
         )
         for relative, expected_content in ((SKILL, skill), (RULE, rule)):
             check(
@@ -332,7 +378,7 @@ def check_devin(root, home=None, probe=False, global_base=None):
         selected = selected_home(home, {})
         global_server = None
     output = report(
-        project, selected,
+        project, selected, scope,
         state="ready" if checks and all(item["state"] == "ok" for item in checks) else "needs_attention",
         mcp_config_path=str(mcp_config), checks=checks,
     )

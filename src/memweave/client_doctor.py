@@ -247,8 +247,8 @@ DEVIN_ISSUES = {
     "server_command": ("server_mismatch", "清单中的服务命令或参数与当前环境不一致。", True),
     "interpreter": ("interpreter_missing", "清单中的 Python 解释器不存在。", True),
     "home": ("stale_home", "安装清单使用的记忆库与活动记忆库不一致。", True),
-    "global_config": ("global_config_invalid", "Devin 全局 MCP 配置不存在或无法解析。", False),
-    "mcp_global": ("mcp_global_mismatch", "Devin 全局 MCP 条目与清单不一致。", False),
+    "mcp_config": ("mcp_config_invalid", "Devin MCP 配置不存在或无法解析。", True),
+    "mcp_entry": ("mcp_entry_mismatch", "Devin MCP 条目与清单不一致。", True),
     "mcp_path": ("manifest_drift", "安装清单指向的 Devin 配置路径已变化。", True),
     "manifest": ("manifest_drift", "安装清单与当前服务或资源不一致。", True),
     "skill": ("skill_drift", "受管 Skill 缺失、落后于当前包或已被人工修改。", True),
@@ -291,7 +291,10 @@ def _inspect_devin_project(root, expected_home, source, global_base, global_serv
         checks.append(dict(name=item["name"], message=item["message"]))
         mapped = DEVIN_ISSUES.get(item["name"])
         if mapped:
-            _add_issue(issues, *mapped)
+            if checked.get("mcp_scope") == "user" and item["name"] in ("mcp_config", "mcp_entry"):
+                _add_issue(issues, mapped[0], mapped[1], False)
+            else:
+                _add_issue(issues, *mapped)
     if manifest_bytes is None:
         _add_issue(issues, "unmanaged_installation", "存在 Devin 项目资源，但没有受管安装清单。", True)
     fixable = any(item["fixable"] for item in issues)
@@ -492,9 +495,7 @@ def doctor_clients(home, roots=None, clients=CLIENTS, fix=False, global_base=Non
 
     targets = []
     for client in clients:
-        global_target = _global_target(
-            client, infos[client], home, required=client == "devin",
-        )
+        global_target = _global_target(client, infos[client], home, required=False)
         if global_target is not None:
             targets.append(global_target)
         for _, (root, source) in sorted(root_sources.items()):

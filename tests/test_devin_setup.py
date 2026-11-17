@@ -25,6 +25,8 @@ class DevinSetupTests(unittest.TestCase):
         self.global_base.mkdir()
         self.devin = self.root / ".devin"
         self.config = devin_config_path(self.global_base)
+        self.local_config = self.devin / "mcp_config.local.json"
+        self.project_config = self.devin / "mcp_config.json"
 
     def write_json(self, path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,24 +52,25 @@ class DevinSetupTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0 if success else 1, completed.stderr)
         return json.loads(completed.stdout or completed.stderr)
 
-    def test_setup_merges_global_config_preserves_services_and_is_idempotent(self):
+    def test_setup_writes_project_local_config_and_is_idempotent(self):
         original = {
             "mcpServers": {"other": {"command": "other.exe", "args": ["--keep"]}},
             "custom": {"keep": True},
         }
         self.write_json(self.config, original)
+        before_global = self.config.read_bytes()
         installed = setup_devin(
             self.root, self.home, global_base=self.global_base,
         )
         self.assertEqual(installed["state"], "installed")
         self.assertEqual(installed["bootstrap_channel"], "always_on_rule")
-        merged = json.loads(self.config.read_text(encoding="utf-8"))
-        self.assertEqual(merged["mcpServers"]["other"], original["mcpServers"]["other"])
-        self.assertEqual(merged["custom"], {"keep": True})
-        self.assertEqual(merged["mcpServers"]["memweave"], server_command(self.home))
+        self.assertEqual(installed["mcp_scope"], "local")
+        self.assertEqual(installed["mcp_config_path"], str(self.local_config))
+        self.assertIsNone(installed["mcp_backup_directory"])
+        self.assertEqual(before_global, self.config.read_bytes())
+        installed_config = json.loads(self.local_config.read_text(encoding="utf-8"))
+        self.assertEqual(installed_config["mcpServers"]["memweave"], server_command(self.home))
         self.assertFalse(installed["hooks_installed"])
-        self.assertTrue(Path(installed["global_backup_directory"]).is_dir())
-        self.assertTrue(list((self.config.parent / "memweave-backups").rglob("mcp_config.json")))
 
         self.assertTrue((self.devin / SKILL).is_file())
         self.assertTrue((self.devin / RULE).is_file())
@@ -80,11 +83,15 @@ class DevinSetupTests(unittest.TestCase):
         self.assertIn("用户纠正、取消旧决定或新证据推翻当前方案", rule)
         self.assertIn("仅出现 memweave_* 工具而没有本 Rule", rule)
         self.assertIn("不要把“裸名未出现”误判为 MCP 未加载", rule)
+        self.assertIn("默认删除，不默认保留", rule)
+        self.assertIn("版本快照", rule)
         ignore = (self.devin / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("/memweave.json", ignore)
+        self.assertIn("/mcp_config.local.json", ignore)
         manifest = json.loads((self.devin / "memweave.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["client"], "devin")
-        self.assertEqual(manifest["mcp_config"], str(self.config))
+        self.assertEqual(manifest["mcp_scope"], "local")
+        self.assertEqual(manifest["mcp_config"], str(self.local_config))
         self.assertNotIn("hooks", manifest)
         self.assertIn(
             str(self.root.resolve()),
@@ -97,9 +104,57 @@ class DevinSetupTests(unittest.TestCase):
         self.assertEqual(snapshot, self.snapshot())
         checked = check_devin(self.root, self.home, probe=True, global_base=self.global_base)
         self.assertEqual(checked["state"], "ready")
+        self.assertEqual(checked["mcp_scope"], "local")
         self.assertEqual(checked["protocol_verification"], "sdk_stdio")
         self.assertEqual(checked["desktop_verification"], "unverified")
         self.assertFalse(checked["hooks_installed"])
+
+    def test_explicit_user_scope_merges_global_and_is_preserved(self):
+        original = {
+            "mcpServers": {"other": {"command": "other.exe", "args": ["--keep"]}},
+            "custom": {"keep": True},
+        }
+        self.write_json(self.config, original)
+        installed = setup_devin(
+            self.root, self.home, global_base=self.global_base, mcp_scope="user",
+        )
+        self.assertEqual(installed["mcp_scope"], "user")
+        self.assertFalse(self.local_config.exists())
+        merged = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual(merged["mcpServers"]["other"], original["mcpServers"]["other"])
+        self.assertEqual(merged["custom"], {"keep": True})
+        self.assertEqual(merged["mcpServers"]["memweave"], server_command(self.home))
+        self.assertTrue(Path(installed["mcp_backup_directory"]).is_dir())
+        self.assertTrue(list((self.config.parent / "memweave-backups").rglob("mcp_config.json")))
+
+        repeated = setup_devin(self.root, self.home, global_base=self.global_base)
+        self.assertEqual(repeated["state"], "up_to_date")
+        self.assertEqual(repeated["mcp_scope"], "user")
+        self.assertEqual(
+            check_devin(self.root, self.home, global_base=self.global_base)["state"],
+            "ready",
+        )
+        manifest_path = self.devin / "memweave.json"
+        legacy = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy.pop("mcp_scope")
+        self.write_json(manifest_path, legacy)
+        self.assertEqual(
+            check_devin(self.root, self.home, global_base=self.global_base)["state"],
+            "ready",
+        )
+
+    def test_explicit_project_scope_uses_project_config(self):
+        installed = setup_devin(
+            self.root, self.home, global_base=self.global_base, mcp_scope="project",
+        )
+        self.assertEqual(installed["mcp_scope"], "project")
+        self.assertEqual(installed["mcp_config_path"], str(self.project_config))
+        self.assertTrue(self.project_config.is_file())
+        self.assertFalse(self.local_config.exists())
+        self.assertEqual(
+            check_devin(self.root, self.home, global_base=self.global_base)["state"],
+            "ready",
+        )
 
     def test_conflicting_global_memweave_is_not_overwritten(self):
         self.write_json(self.config, {
@@ -109,22 +164,35 @@ class DevinSetupTests(unittest.TestCase):
         })
         before = self.config.read_bytes()
         with self.assertRaises(DiagnosticError) as caught:
-            setup_devin(self.root, self.home, global_base=self.global_base)
+            setup_devin(
+                self.root, self.home, global_base=self.global_base, mcp_scope="user",
+            )
         self.assertEqual(caught.exception.code, "SETUP_CONFLICT")
         self.assertEqual(before, self.config.read_bytes())
         self.assertFalse(self.home.exists())
 
-    def test_check_reports_missing_global_config_and_drift(self):
-        setup_devin(
-            self.root, self.home, global_base=self.global_base, write_global=False,
-        )
-        self.assertFalse(self.config.exists())
+    def test_conflicting_local_memweave_is_not_overwritten(self):
+        self.write_json(self.local_config, {
+            "mcpServers": {
+                "memweave": {"command": "custom-memweave.exe", "args": ["--custom"]},
+            },
+        })
+        before = self.local_config.read_bytes()
+        with self.assertRaises(DiagnosticError) as caught:
+            setup_devin(self.root, self.home, global_base=self.global_base)
+        self.assertEqual(caught.exception.code, "SETUP_CONFLICT")
+        self.assertEqual(before, self.local_config.read_bytes())
+
+    def test_check_reports_missing_local_config_and_drift(self):
+        setup_devin(self.root, self.home, global_base=self.global_base)
+        self.local_config.unlink()
+        self.assertFalse(self.local_config.exists())
         checked = check_devin(self.root, self.home, global_base=self.global_base)
         names = {item["name"] for item in checked["checks"] if item["state"] == "error"}
-        self.assertTrue({"global_config", "mcp_global"}.issubset(names))
+        self.assertTrue({"mcp_config", "mcp_entry"}.issubset(names))
         self.assertEqual(checked["state"], "needs_attention")
 
-        self.write_json(self.config, {"mcpServers": {"memweave": server_command(self.home)}})
+        self.write_json(self.local_config, {"mcpServers": {"memweave": server_command(self.home)}})
         self.assertEqual(
             check_devin(self.root, self.home, global_base=self.global_base)["state"],
             "ready",
@@ -152,8 +220,9 @@ class DevinSetupTests(unittest.TestCase):
             self.assertEqual(server["args"][-1], str(self.home))
 
         installed = self.command("setup")["data"]
-        self.assertEqual(installed["mcp_scope"], "global")
+        self.assertEqual(installed["mcp_scope"], "local")
         self.assertFalse(installed["hooks_installed"])
+        self.assertTrue(self.local_config.is_file())
         checked = self.command("check")["data"]
         self.assertEqual(checked["state"], "ready")
         self.assertEqual(checked["tool_count"], 22)
@@ -168,6 +237,15 @@ class DevinSetupTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 1)
         self.assertEqual(json.loads(completed.stderr)["error"]["code"], "RECORD_INVALID")
+
+    def test_cli_setup_accepts_project_mcp_scope(self):
+        installed = self.command("setup", "--mcp-scope", "project")["data"]
+        self.assertEqual(installed["mcp_scope"], "project")
+        self.assertTrue(self.project_config.is_file())
+        self.assertFalse(self.local_config.exists())
+        checked = self.command("check")["data"]
+        self.assertEqual(checked["mcp_scope"], "project")
+        self.assertEqual(checked["state"], "ready")
 
 
 if __name__ == "__main__":

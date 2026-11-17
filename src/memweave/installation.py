@@ -142,7 +142,12 @@ def rule_text(root):
         "直接说明 MCP 尚未加载或仍在重连，等工具出现后再调用。在 prepare/reboot 给出唯一下一步之前，"
         "禁止打开 PLAN.md、全仓搜索、project_scan 或大范围 graph 扫描，也不得用 CLI/Python 绕过 MCP 硬门，"
         "不得创建、编辑或删除文件。必须先 prepare（inspect/new/resume）；未 prepare 前其他项目工具返回 PREPARE_REQUIRED。"
-        "实施任务同样先 prepare；意图或任务归属有歧义时不按最近时间猜测，include_user 默认 false。\n"
+        "实施任务同样先 prepare；意图或任务归属有歧义时不按最近时间猜测。"
+        "active 项目经验、用户偏好和知识索引默认注入，默认上下文预算 32000 字符、上限 64000；"
+        "低预算时知识索引先让位于当前任务和开放 WorkUnit；"
+        "闭环健康用 system_status.knowledge_loop 查看，知识总数不能代替注入和复用证据。"
+        "默认删除，不默认保留：只有跨任务稳定、删掉会明显更容易重复犯错且有证据的约束才晋升；"
+        "保留后必须重写为单一、可执行的不变量；任务进度、版本快照和实现细节留在任务记录，零条结果是正常结果。\n"
         + STARTUP_FALLBACK +
         CORRECTION_CHECKPOINT +
         "- Hook 只负责会话开始、结束与中断清理；原话检索、任务绑定和检查点维护直接使用常驻 MCP，"

@@ -20,9 +20,9 @@ MemWeave 是一个本地 stdio MCP。所有客户端应指向同一个记忆库 
 
 | 客户端 | 需要检查 |
 |---|---|
-| Codex | 项目 `.codex/config.toml`、`.codex/hooks.json`、`.agents/skills/`；全局 `~/.codex/` |
+| Codex | 项目 `.codex/config.toml`、`.codex/hooks.json`、`.agents/skills/`、受管 `AGENTS.md` 块；全局 `~/.codex/` |
 | Cursor | 项目 `.cursor/mcp.json`、`.cursor/hooks.json`、`.cursor/rules/`、`.cursor/skills/` |
-| Devin Desktop | 用户级 `%APPDATA%\Devin\mcp_config.json`；项目 `.devin/skills/`、`.devin/rules/` |
+| Devin Desktop / CLI | 默认项目级 `.devin/mcp_config.local.json`；项目 `.devin/skills/`、`.devin/rules/` |
 | 其他 stdio MCP 客户端 | 用户已有的 MCP 配置位置和 Skill/Rule 目录 |
 
 不要要求用户把 GitHub、模型或客户端访问令牌发到聊天中，也不要关闭证书校验。
@@ -64,9 +64,9 @@ MemWeave 是一个本地 stdio MCP。所有客户端应指向同一个记忆库 
 
 `scripts/bootstrap.py` 会复用或创建克隆内的 `.venv`，安装当前源码，执行 `setup` 和 `check --probe`。它不创建业务任务、不扫描项目、不配置模型密钥、不打开客户端窗口。
 
-- **Codex**：写入项目 `.codex/config.toml`、`.codex/hooks.json` 和 `.agents/skills/memweave-continuity/`。项目必须由宿主信任；Hook 定义变化后需要重新审查。
+- **Codex**：写入项目 `.codex/config.toml`、`.codex/hooks.json`、`.agents/skills/memweave-continuity/`，并在根 `AGENTS.md` 追加受管的首轮指令块。项目必须由宿主信任；Hook 定义变化后需要重新审查。`SessionStart` 可能晚于首个模型回合，不能替代 `AGENTS.md` 的 always-on 启动通道。
 - **Cursor**：写入项目 `.cursor/mcp.json`、`.cursor/hooks.json`、Skill 和 always-on Rule。`sessionStart` 是 best-effort，不能替代 Rule；工具可用但启动块缺失时，Rule 要求首轮调用 `workspace_prepare`。
-- **Devin Desktop**：全局配置默认 `%APPDATA%\Devin\mcp_config.json`；项目内安装 `.devin/skills`、`.devin/rules` 和安装清单。setup 只合并 `mcpServers.memweave` 并备份原文件，不安装 Hook。没有 Hook 意味着没有自动上下文注入或压缩快照，不等于核心能力降级；always-on Rule 仍是必需的启动通道。
+- **Devin Desktop / CLI**：新安装默认把 MemWeave MCP 写入项目级 `.devin/mcp_config.local.json`，避免跨项目覆盖或默认改写用户级 `%APPDATA%\Devin\mcp_config.json`；项目内同时安装 `.devin/skills`、`.devin/rules` 和安装清单。需要显式共享或用户级入口时可用 `--mcp-scope project|user`；user scope 不会被 `clients doctor --fix` 擅自改写。没有 Hook 意味着没有自动上下文注入或压缩快照，不等于核心能力降级；always-on Rule 仍是必需的启动通道。
 - **generic**：只输出标准 `mcpServers.memweave` 配置，不自动安装 Skill/Rule。必须手动补齐启动通道。
 
 遇到冲突、链接逃逸、环境不完整或网络错误时，按实际错误修复；不要删除已有环境、覆盖自定义配置或无限重试。
@@ -81,7 +81,7 @@ MemWeave 是一个本地 stdio MCP。所有客户端应指向同一个记忆库 
 & '<MemWeave 克隆>\.venv\Scripts\python.exe' -m memweave config --client generic --home '<共享记忆库绝对路径>'
 ```
 
-把 `mcpServers.memweave` 合入客户端配置，并把 `src/memweave/skills/memweave-continuity/SKILL.md` 复制到客户端支持的技能目录。还必须安装一条 always-on Rule 或等价首轮宿主指令，要求首个项目动作调用 `workspace_prepare`。
+把 `mcpServers.memweave` 合入客户端配置，并把 `src/memweave/skills/memweave-continuity/SKILL.md` 复制到客户端支持的技能目录。还必须安装一条 always-on Rule、受管 `AGENTS.md` 块或等价首轮宿主指令，要求首个项目动作调用 `workspace_prepare`。
 
 ## 5. 检查与交付
 

@@ -535,9 +535,10 @@ class SQLiteFts:
             if with_text
             else snippet_length_columns("search_index")
         )
+        # Keep the original query for relaxation. Reducing a mixed CJK/Latin
+        # query to ``word_text`` drops the CJK terms, so the later OR fallback
+        # sees only one short Latin token and silently refuses to relax.
         relaxed_search_text = search_text
-        if search_text and "script_text" in params:
-            relaxed_search_text = analyze_script_query(search_text.strip()).word_text
 
         # The id tie-break makes equal-score rows keep one order at every LIMIT, as
         # Postgres does: a page, or a fixed rerank prefix read from a larger window,
@@ -567,11 +568,16 @@ class SQLiteFts:
             # Outcome: one retry with OR-joined prefix terms; bm25 still ranks
             # multi-term matches first.
             relaxed = relaxed_fts_text(relaxed_search_text) if allow_relaxed and not rows else None
-            if relaxed and params.get("text"):
+            # Script queries keep their words in ``script_text`` and deliberately
+            # blank ``text``. Treat either channel as a valid relaxed query,
+            # otherwise CJK/mixed queries never reach this fallback.
+            if relaxed and (params.get("text") or "script_text" in params):
                 relaxed_fallback_used = True
-                params["text"] = (
-                    f"{SQLITE_WORD_COLUMNS}: ({relaxed})" if "script_text" in params else relaxed
-                )
+                if "script_text" in params:
+                    params["text"] = relaxed
+                    params["script_text"] = ""
+                else:
+                    params["text"] = relaxed
                 logger.debug(
                     "Strict SQLite FTS returned 0 results; retrying relaxed FTS query "
                     f"strict='{search_text}' relaxed='{relaxed}'"
@@ -684,8 +690,6 @@ class SQLiteFts:
         sql = f"SELECT COUNT(*) FROM {compiled.from_clause} WHERE {compiled.where_clause}"
         logger.trace(f"Count {sql} params: {params}")
         relaxed_search_text = search_text
-        if search_text and "script_text" in params:
-            relaxed_search_text = analyze_script_query(search_text.strip()).word_text
         try:
             async with db.scoped_session(self._session_maker) as session:
                 result = await session.execute(text(sql), params)
@@ -693,12 +697,12 @@ class SQLiteFts:
                 relaxed = (
                     relaxed_fts_text(relaxed_search_text) if allow_relaxed and total == 0 else None
                 )
-                if relaxed and params.get("text"):
-                    params["text"] = (
-                        f"{SQLITE_WORD_COLUMNS}: ({relaxed})"
-                        if "script_text" in params
-                        else relaxed
-                    )
+                if relaxed and (params.get("text") or "script_text" in params):
+                    if "script_text" in params:
+                        params["text"] = relaxed
+                        params["script_text"] = ""
+                    else:
+                        params["text"] = relaxed
                     with logfire.span(
                         "search.count.relaxed_fts_retry",
                         backend="sqlite",

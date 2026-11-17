@@ -54,44 +54,33 @@ class ClientDoctorTests(unittest.TestCase):
         self.write_codex_global(server=server_command(self.home))
         first = doctor_clients(self.home, global_base=self.global_base)
         self.assertEqual(first["state"], "ready")
-        self.assertEqual(first["summary"]["ready"], 5)
+        self.assertEqual(first["summary"]["ready"], 4)
         self.assertEqual(first["coverage"]["state"], "complete")
         before = self.snapshot()
         second = doctor_clients(self.home, global_base=self.global_base)
         self.assertEqual(second, first)
         self.assertEqual(before, self.snapshot())
 
-    def test_devin_global_gap_is_reported_but_fix_only_touches_project(self):
-        setup_devin(
-            self.root, self.home, global_base=self.global_base, write_global=False,
-        )
+    def test_devin_local_install_does_not_require_global_config(self):
+        setup_devin(self.root, self.home, global_base=self.global_base)
         global_config = devin_config_path(self.global_base)
         self.assertFalse(global_config.exists())
 
         found = doctor_clients(
             self.home, clients=("devin",), global_base=self.global_base,
         )
-        global_target = next(item for item in found["targets"] if item["scope"] == "global")
-        project_target = next(item for item in found["targets"] if item["scope"] == "project")
-        self.assertEqual(global_target["state"], "not_installed")
-        self.assertFalse(global_target["fixable"])
-        self.assertEqual(project_target["state"], "needs_attention")
-        self.assertFalse(project_target["fixable"])
-        self.assertEqual(found["state"], "needs_attention")
-        self.assertEqual(found["coverage"]["state"], "incomplete")
-        self.assertEqual(found["coverage"]["missing_count"], 1)
-        self.assertIsNone(found["coverage"]["missing"][0]["root"])
+        self.assertEqual(found["state"], "ready")
+        self.assertEqual(found["coverage"]["state"], "complete")
+        self.assertEqual(len(found["targets"]), 1)
+        self.assertEqual(found["targets"][0]["scope"], "project")
+        self.assertEqual(found["targets"][0]["state"], "ready")
 
-        repaired = doctor_clients(
-            self.home, clients=("devin",), fix=True, global_base=self.global_base,
-        )
-        self.assertEqual(repaired["state"], "needs_attention")
-        self.assertFalse(global_config.exists())
-
-    def test_devin_project_resources_are_repaired_without_writing_global_config(self):
+    def test_devin_project_resources_are_repaired_without_creating_global_config(self):
         setup_devin(self.root, self.home, global_base=self.global_base)
         global_config = devin_config_path(self.global_base)
-        before_global = global_config.read_bytes()
+        self.assertFalse(global_config.exists())
+        local_config = self.root / ".devin/mcp_config.local.json"
+        before_local = local_config.read_bytes()
         skill = self.root / ".devin/skills/memweave-continuity/SKILL.md"
         skill.unlink()
 
@@ -108,7 +97,19 @@ class ClientDoctorTests(unittest.TestCase):
         target = next(item for item in repaired["targets"] if item["scope"] == "project")
         self.assertEqual(target["state"], "repaired")
         self.assertTrue(skill.is_file())
-        self.assertEqual(before_global, global_config.read_bytes())
+        self.assertEqual(before_local, local_config.read_bytes())
+        self.assertFalse(global_config.exists())
+
+    def test_devin_legacy_user_scope_remains_visible_to_doctor(self):
+        setup_devin(
+            self.root, self.home, global_base=self.global_base, mcp_scope="user",
+        )
+        found = doctor_clients(
+            self.home, clients=("devin",), global_base=self.global_base,
+        )
+        self.assertEqual(found["state"], "ready")
+        scopes = {target["scope"] for target in found["targets"]}
+        self.assertEqual(scopes, {"global", "project"})
 
     def test_fix_continues_when_one_project_root_is_unwritable(self):
         bad = Path(self.temporary.name) / "bad project"

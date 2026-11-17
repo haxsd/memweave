@@ -3,6 +3,8 @@
 > 让任务有连续性，让合作有积累。
 >
 > Local task continuity and reviewed project knowledge for MCP coding agents.
+>
+> 产品与设计导览：[docs/product-guide.html](docs/product-guide.html)
 
 MemWeave 是已有编程 Agent 的本地连续工作层。它把任务目标、约束、失败尝试、验证结果和下一步从聊天上下文中独立出来，并把真正可复用的经验沉淀为有范围、有来源的长期知识。
 
@@ -13,7 +15,9 @@ MemWeave 是已有编程 Agent 的本地连续工作层。它把任务目标、�
 - **长任务不跑偏**：恢复目标、验收、最新进展、已否定方案和唯一下一步，而不是重新读一遍聊天记录。
 - **新会话接着做**：任务状态保存在本机 Markdown，不依赖某个聊天线程。
 - **换客户端可接续**：同一项目文件夹由不同 Agent 打开时，复用同一项目、任务队列和知识。
-- **完成后不重复踩坑**：任务收束时从证据提炼知识，经过显式审查后才进入后续召回。
+- **完成后不重复踩坑**：任务收束时从证据提炼知识，审查完成即进入后续召回；未审候选保持隔离。
+- **闭环可观测**：`system_status.knowledge_loop` 暴露待审债务、孤立候选、来源风险与注入记录；`behavioral_reuse` 评估验证同类任务第二次出现时，旧经验是否真的改变了确定性决策。
+- **默认删除，不默认保留**：项目经验只收跨任务稳定、删掉会明显更容易重复犯错的规则；留下来的还必须重写成单一主题、可直接执行和检索的不变量。任务进度、版本快照、实现位置和一次性步骤都留在任务记录或代码文档里，一次审查不写任何经验是正常结果。
 - **并行但不丢状态**：父任务下可以维护多个 WorkUnit，子代理共享父任务，各自更新独立记录。
 
 ## 安装：优先让 Agent 完成
@@ -38,7 +42,7 @@ Agent 会先做只读盘点，再运行 `scripts/bootstrap.py --dry-run`；只�
 & '<Python 3.12+ 绝对路径>' scripts/bootstrap.py --client codex --root 'D:\my-project' --json
 ```
 
-`--client` 支持 `codex`、`cursor` 和 `devin`。脚本复用或创建仓库内 `.venv`，安装当前源码，执行 `setup` 和 `check --probe`。先加 `--dry-run --json` 可以只看计划。
+`--client` 支持 `codex`、`cursor` 和 `devin`。脚本复用或创建仓库内 `.venv`，安装当前源码，执行 `setup` 和 `check --probe`；Devin 默认写项目级 `.devin/mcp_config.local.json`，不会默认改用户全局配置。先加 `--dry-run --json` 可以只看计划。
 
 其他支持 stdio MCP 的客户端使用通用配置：
 
@@ -47,11 +51,11 @@ Agent 会先做只读盘点，再运行 `scripts/bootstrap.py --dry-run`；只�
 & '<MemWeave 克隆>\.venv\Scripts\python.exe' -m memweave config --client generic --home "$HOME\.memweave"
 ```
 
-把输出中的 `mcpServers.memweave` 合入客户端配置，并把 [接续 Skill](src/memweave/skills/memweave-continuity/SKILL.md) 复制到客户端支持的技能目录。还必须安装一条 always-on Rule 或等价首轮指令，要求首个项目动作调用 `workspace_prepare`；只连接 MCP 不算完整接入。
+把输出中的 `mcpServers.memweave` 合入客户端配置，并把 [接续 Skill](src/memweave/skills/memweave-continuity/SKILL.md) 复制到客户端支持的技能目录。还必须安装一条 always-on Rule、受管 `AGENTS.md` 块或等价首轮指令，要求首个项目动作调用 `workspace_prepare`；只连接 MCP 不算完整接入。Codex 由 `setup --client codex` 自动维护 `AGENTS.md` 中的受管块。
 
 ## 它如何工作
 
-MemWeave 只有两层产品语义：任务工作记忆（目标、验收、检查点、失败、验证、下一步和并行 WorkUnit），以及长期知识（按项目、项目组或用户明确偏好划分范围，带来源、状态和修订历史）。数据以本机 Markdown 为权威记录，默认保存在 `~/.memweave`（Windows 为 `%USERPROFILE%\.memweave`），不需要额外的模型 API Key。只连接 MCP 不等于完整可用。
+MemWeave 只有两层产品语义：任务工作记忆（目标、验收、检查点、失败、验证、下一步和并行 WorkUnit），以及长期知识（按项目、项目组或用户明确偏好划分范围，带来源、状态和修订历史）。默认上下文中会注入 active 项目经验、用户偏好和有界知识索引；候选与退役知识不进入默认召回。数据以本机 Markdown 为权威记录，默认保存在 `~/.memweave`（Windows 为 `%USERPROFILE%\.memweave`），不需要额外的模型 API Key。只连接 MCP 不等于完整可用。
 
 文件夹身份、worktree、组知识、三层接入契约、会话工作循环和架构边界，见 [产品与设计导览](docs/product-guide.html)。
 
