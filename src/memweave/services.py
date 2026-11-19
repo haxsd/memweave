@@ -566,25 +566,45 @@ def _knowledge_needs_rewrite(title, body, threshold):
     return any(marker.casefold() in folded for marker in _REWRITE_TITLE_MARKERS)
 
 
-def _knowledge_index_line(record, limits):
-    """Render one knowledge record as a bounded ``id | ...`` line.
+def _relative_age(value):
+    """Render an ISO timestamp as a compact age such as ``4d``, ``3h`` or ``12m``."""
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delta = max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
+    except ValueError:
+        return ""
+    if delta < 3600:
+        return f"{delta // 60}m"
+    if delta < 86400:
+        return f"{delta // 3600}h"
+    return f"{delta // 86400}d"
 
-    Values are whitespace-collapsed, ``" | "`` inside title/summary is neutralized to
-    keep exactly eight columns, and pathological legacy ids fall back to dropping the
-    title/summary columns so the evidence/updated tail always survives.
+
+def _knowledge_index_line(record, limits):
+    """Render one knowledge record as a compact navigation line.
+
+    Default ``active``/``project`` values are omitted, evidence uses ``ev=`` and
+    the update time becomes a relative age, so the same character budget carries
+    more semantic text. The full id stays readable for ``memory_read``.
     """
     identifier = _single_line(record.get("id"), 100)
     kind = _single_line(record.get("kind") or "unknown", 24)
     status = _single_line(record.get("status") or "unknown", 16)
     scope = _single_line(record.get("scope") or "unknown", 16)
     evidence_count = len(record_evidence(record))
-    updated_at = _single_line(record.get("updated_at"), 32)
+    age = _relative_age(record.get("updated_at"))
+
+    label = kind
+    tags = [value for value in (status, scope) if value not in ("active", "project")]
+    if tags:
+        label = "/".join(tags) + " " + kind
 
     def render(name, title, summary):
-        return (
-            f"{name} | {kind} | {status} | {scope} | {title} | {summary}"
-            f" | evidence={evidence_count} | updated={updated_at}"
-        )
+        return f"{name} | {label} | {title} | {summary} | ev={evidence_count} | {age or '-'}"
 
     fixed = len(render("", "", ""))
     middle_budget = max(0, limits["line_chars"] - fixed - len(identifier))
@@ -2438,7 +2458,8 @@ class Service:
             self._project(project_id)
 
     def memory_write(self, title, body, sources, operation_id, scope="project", project_id=None,
-                     kind="fact", status="active", evidence=None):
+                     kind="fact", status="active", evidence=None,
+                     trigger=None, invariant=None, counterexample=None):
         self._scope(scope, project_id)
         title, body = text(title, "title", 200), text(body, "body", 60000)
         if kind not in ("fact", "decision", "preference", "lesson", "constraint", "procedure"):
@@ -2454,6 +2475,14 @@ class Service:
             text(source.get("reference"), "source.reference", 2000)
         if len(str(sources)) > 20000:
             raise DiagnosticError("RECORD_INVALID", "Sources exceed the limit.")
+        structured = {}
+        for name, value, limit in (
+            ("trigger", trigger, 500),
+            ("invariant", invariant, 1000),
+            ("counterexample", counterexample, 1000),
+        ):
+            if value is not None:
+                structured[name] = text(value, name, limit)
         if scope == "user":
             if not any(source["type"] == "user" for source in sources):
                 raise DiagnosticError(
@@ -2476,7 +2505,8 @@ class Service:
                        evidence=normalized_evidence)
         return self._create(operation_id, request, "memory", scope, project_id, title, body,
                             sources=sources, kind=kind, confidence="host_reported",
-                            evidence=normalized_evidence, record_status=status)
+                            evidence=normalized_evidence, record_status=status,
+                            **structured)
 
     def memory_read(self, memory_id):
         record = self._record(memory_id, "memory")

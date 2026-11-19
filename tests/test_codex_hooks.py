@@ -163,12 +163,12 @@ class CodexHookTests(unittest.TestCase):
         compact = self.hook("UserPromptSubmit", prompt="continue after compaction")
         text = compact["hookSpecificOutput"]["additionalContext"]
         self.assertIn("NEXT_ACTION_PRESERVED", text)
-        self.assertIn("PRECOMPACT_USER_DETAIL", text)
-        self.assertIn("PRECOMPACT_ASSISTANT_DETAIL", text)
+        self.assertNotIn("PRECOMPACT_USER_DETAIL", text)
+        self.assertNotIn("PRECOMPACT_ASSISTANT_DETAIL", text)
         self.assertLessEqual(len(text), 5000)
-        self.assertIn("exec_command", text)
+        self.assertNotIn("exec_command", text)
         self.assertNotIn("Bearer_SYNTHETIC_SECRET", text)
-        self.assertIn(
+        self.assertNotIn(
             "PRECOMPACT_USER_DETAIL",
             self.service.task_read(task["id"])["findings"],
         )
@@ -232,8 +232,8 @@ class CodexHookTests(unittest.TestCase):
         with patch.object(self.service, "start", side_effect=AssertionError("index must stay stopped")):
             restored = handler.handle("UserPromptSubmit", {**payload, "prompt": "continue"})
         text = restored["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("NEW_CORRECTION", text)
         self.assertIn("COMPARE_CURRENT_REQUESTS", text)
+        self.assertNotIn("NEW_CORRECTION", text)
         self.assertNotIn("OBSOLETE_BUILD_CAUSE", text)
         self.assertNotIn("OBSOLETE_ROLLBACK", text)
         self.assertNotIn("OBSOLETE_ASSISTANT_ADVICE", text)
@@ -257,8 +257,8 @@ class CodexHookTests(unittest.TestCase):
         restored = handler.handle("UserPromptSubmit", {**payload, "prompt": "continue new task"})
         text = restored["hookSpecificOutput"]["additionalContext"]
         self.assertIn(second["id"], text)
-        self.assertIn("NEW_GOAL", text)
-        self.assertNotIn(f"Task [{first['id']}]", text)
+        self.assertNotIn("NEW_GOAL", text)
+        self.assertNotIn(f"Task: {first['id']} @", text)
 
     def test_compaction_read_failure_does_not_replay_unverified_old_task(self):
         task = self.task()
@@ -419,6 +419,21 @@ class CodexHookTests(unittest.TestCase):
         self.assertEqual(self.hook("UserPromptSubmit", prompt="continue"), {})
         self.assertEqual(self.service.vault.diagnostics.hook_state("codex:codex-session"), {})
 
+    def test_precompact_snapshot_keeps_pointers_without_task_content(self):
+        task = self.task()
+        handler = CodexHooks(self.service.vault.diagnostics, self.root, service=self.service)
+        read = self.service.task_read(task["id"])
+        snapshot = handler.compaction_snapshot(
+            read, {}, {"session_id": "pointer-snapshot", "trigger": "auto"},
+        )
+        self.assertIn(f"Task: {task['id']} @ revision {read['revision']}", snapshot)
+        self.assertIn("Next:", snapshot)
+        self.assertIn("Fingerprint:", snapshot)
+        self.assertNotIn("Goal:", snapshot)
+        self.assertNotIn("Acceptance", snapshot)
+        self.assertNotIn("Findings:", snapshot)
+        self.assertLessEqual(len(snapshot), 800)
+
     def test_precompact_checkpoint_is_recorded_under_a_live_foreign_claim(self):
         task = self.task()
         self.service.start()
@@ -443,7 +458,9 @@ class CodexHookTests(unittest.TestCase):
         latest = self.service.task_read(task["id"])
         self.assertEqual(latest["revision"], task["revision"] + 1)
         self.assertIn("[Pre-compaction snapshot]", latest["findings"])
-        self.assertIn("PRECOMPACT_UNDER_LIVE_CLAIM", latest["findings"])
+        self.assertIn(f"Task: {task['id']}", latest["findings"])
+        self.assertIn("Fingerprint:", latest["findings"])
+        self.assertNotIn("PRECOMPACT_UNDER_LIVE_CLAIM", latest["findings"])
         self.assertEqual(latest["checkpoint_total"], 1)
 
         # Recording the snapshot must not acquire, release or steal the claim.

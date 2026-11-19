@@ -541,9 +541,14 @@ def create_server(
                              scope: str = "project", project_id: str | None = None,
                              kind: str = "fact",
                              status: str = "active",
-                             evidence: list[str] | None = None) -> dict[str, Any]:
+                             evidence: list[str] | None = None,
+                             trigger: str | None = None,
+                             invariant: str | None = None,
+                             counterexample: str | None = None) -> dict[str, Any]:
         """Save evidence-backed project knowledge as active by default; candidate is for uncertain claims.
 
+        Optional trigger/invariant/counterexample make constraint and procedure knowledge directly
+        actionable for the next agent without re-reading the source record.
         Apply the delete-first promotion gate: only durable cross-task rules, constraints, decisions or
         procedures whose loss would make a future task materially more likely to fail belong here.
         Task progress, version snapshots, one-off fixes, function/schema/test names, re-derivable

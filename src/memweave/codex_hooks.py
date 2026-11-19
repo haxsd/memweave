@@ -329,30 +329,27 @@ class CodexHooks(CursorHooks):
         return re.sub(r"[^A-Za-z0-9_-]", "-", value)[:180]
 
     def compaction_snapshot(self, task, details, payload):
-        lines = ["Pre-compaction snapshot captured before Codex compacted its context."]
+        """Record recovery pointers only.
+
+        Task fields are re-read from Markdown after compaction, so copying Goal,
+        Acceptance, Findings or conversation excerpts here would preserve stale
+        values and inflate the handoff. The snapshot keeps identity, revision and
+        the reload instruction; content always comes from the current record.
+        """
+        lines = [
+            "MemWeave compaction pointer. Task content is re-read from Markdown; "
+            "this text is not a summary and cannot override newer evidence."
+        ]
         if task is not None:
-            findings = task.get("findings", "").split("\n\n[Pre-compaction snapshot]")[0]
             lines.extend([
-                f"Task [{task['id']}] {_clip(task.get('title'), 140)} (revision {task.get('revision')})",
-                f"Goal: {_clip(task.get('goal'), 250)}",
-                "Acceptance (not yet reported): " + _clip(task.get("acceptance", []), 350),
-                f"Next: {_clip(task.get('next_step'), 300)}",
-                f"Findings: {_clip(findings, 400)}",
-                f"Progress: {_clip(task.get('progress'), 250)}",
-                f"Failures: {_clip(task.get('failures'), 250)}",
-                f"Verification: {_clip(task.get('verification'), 250)}",
+                f"Task: {task['id']} @ revision {task.get('revision')}",
+                f"Next: {_clip(task.get('next_step'), 300) or 'not recorded'}",
+                f"Fingerprint: {_task_fingerprint(task)}",
             ])
-        if details.get("user"):
-            lines.append("Last user: " + _clip(details["user"], 650))
-        if details.get("assistant"):
-            lines.append("Last assistant: " + _clip(details["assistant"], 650))
-        if details.get("tools"):
-            lines.append("Recent tools:")
-            lines.extend("- " + _clip(tool, 90) for tool in details["tools"])
-        if len(lines) == 1:
-            lines.append("No task or transcript details available.")
-        lines.append(f"Trigger: {payload.get('trigger', 'unknown')}")
-        return "\n".join(lines)[:4000]
+        else:
+            lines.append("Task: none")
+        lines.append(f"Trigger: {_clip(payload.get('trigger', 'unknown'), 90)}")
+        return "\n".join(lines)[:800]
 
     def take_compaction_snapshot(self, state, prompt):
         snapshot = state.get("compaction_snapshot", "")
@@ -382,11 +379,7 @@ class CodexHooks(CursorHooks):
         else:
             if fingerprint != _task_fingerprint(task) or not isinstance(details, dict):
                 details = {}
-            snapshot = self.compaction_snapshot(task, details, {"trigger": trigger}).replace(
-                "Pre-compaction snapshot captured before Codex compacted its context.",
-                "Current task state verified at recovery.",
-                1,
-            )
+            snapshot = self.compaction_snapshot(task, details, {"trigger": trigger})
             if task is not None:
                 state.update(task_id=task["id"], revision=task["revision"])
         if isinstance(checkpoint, dict) and checkpoint.get("state") == "failed":

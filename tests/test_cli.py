@@ -84,7 +84,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(data["truncated"])
         line = data["active"]["items"][0]
         self.assertTrue(line.startswith(memory_id + " | "))
-        self.assertIn("| active | project |", line)
+        self.assertIn("| fact |", line)
         self.assertIn("CLI 可见", line)
         self.assertLessEqual(len(line), 240)
         self.assertEqual(data["candidate"]["total"], 0)

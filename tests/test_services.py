@@ -818,6 +818,28 @@ class ServiceTests(unittest.TestCase):
         }
         self.assertIn("source_hash_changed", after[memory["id"]])
 
+    def test_memory_write_accepts_structured_constraint_fields(self):
+        memory = self.call(
+            "memory_write", project_id=self.project, title="长连接必须复用令牌",
+            body="避免重复登录和令牌泄漏。",
+            sources=[{"type": "user", "reference": "明确要求"}],
+            kind="constraint", trigger="接入新的长连接客户端时",
+            invariant="必须复用同一 refresh token",
+            counterexample="为每个连接单独登录",
+            operation_id="structured-memory",
+        )
+        stored = self.call("memory_read", memory_id=memory["id"])
+        self.assertEqual(stored["trigger"], "接入新的长连接客户端时")
+        self.assertEqual(stored["invariant"], "必须复用同一 refresh token")
+        self.assertEqual(stored["counterexample"], "为每个连接单独登录")
+
+        plain = self.call(
+            "memory_write", project_id=self.project, title="普通知识",
+            body="没有结构字段。", sources=[{"type": "user", "reference": "输入"}],
+            operation_id="plain-memory",
+        )
+        self.assertNotIn("trigger", self.call("memory_read", memory_id=plain["id"]))
+
     def test_workspace_prepare_reports_readiness(self):
         unregistered_root = self.root.parent / "readiness-unregistered"
         unregistered_root.mkdir()
@@ -1614,19 +1636,17 @@ class ServiceTests(unittest.TestCase):
             self.assertNotIn("\n", line)
             self.assertLessEqual(len(line), 240)
             fields = line.split(" | ")
-            self.assertEqual(len(fields), 8)
+            self.assertEqual(len(fields), 6)
             by_id[fields[0]] = fields
         cued_fields = by_id[cued["id"]]
         self.assertEqual(cued_fields[1], "fact")
-        self.assertEqual(cued_fields[2], "active")
-        self.assertEqual(cued_fields[3], "project")
-        self.assertEqual(cued_fields[4], "Token refresh constraint")
-        self.assertEqual(cued_fields[5], "Apply only when refresh tokens are opaque.")
-        self.assertEqual(cued_fields[6], "evidence=3")
-        self.assertTrue(cued_fields[7].startswith("updated="))
-        self.assertEqual(by_id[cues_only["id"]][5], "刷新令牌 refresh token")
-        self.assertEqual(by_id[plain["id"]][5], "First line is the summary.")
-        self.assertEqual(by_id[plain["id"]][6], "evidence=0")
+        self.assertEqual(cued_fields[2], "Token refresh constraint")
+        self.assertEqual(cued_fields[3], "Apply only when refresh tokens are opaque.")
+        self.assertEqual(cued_fields[4], "ev=3")
+        self.assertRegex(cued_fields[5], r"^(\d+[mhd]|-)$")
+        self.assertEqual(by_id[cues_only["id"]][3], "刷新令牌 refresh token")
+        self.assertEqual(by_id[plain["id"]][3], "First line is the summary.")
+        self.assertEqual(by_id[plain["id"]][4], "ev=0")
         candidate_section = index["candidate"]
         self.assertEqual(candidate_section["total"], 1)
         self.assertEqual(candidate_section["returned"], 1)
@@ -1634,7 +1654,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(candidate_section["char_limit"], 12000)
         self.assertEqual(len(candidate_section["items"]), 1)
         self.assertTrue(candidate_section["items"][0].startswith(candidate["id"] + " | "))
-        self.assertIn("| candidate | project |", candidate_section["items"][0])
+        self.assertIn("| candidate fact |", candidate_section["items"][0])
         retired_section = index["retired"]
         self.assertEqual(retired_section["total"], 1)
         self.assertEqual(retired_section["ids"], [retired["id"]])
@@ -1694,15 +1714,19 @@ class ServiceTests(unittest.TestCase):
     def test_knowledge_index_enforces_char_budgets_and_clamps_long_lines(self):
         long_title = "T" * 250
         long_summary = "S" * 300
+        # Compact index lines fit 120 rows under the character budget, so this
+        # test uses near-maximum ids to keep the char-limit path covered.
+        long_prefix = "memory_" + "z" * 90
         active = [
             self._memory_record(
-                f"memory_l{position:031d}", "active", title=long_title, body=long_summary,
+                f"{long_prefix[:96]}{position:04d}", "active", title=long_title, body=long_summary,
             )
             for position in range(120)
         ]
         candidate = [
             self._memory_record(
-                f"memory_m{position:031d}", "candidate", title=long_title, body=long_summary,
+                f"{long_prefix[:96]}{position + 120:04d}", "candidate",
+                title=long_title, body=long_summary,
             )
             for position in range(60)
         ]
@@ -1722,7 +1746,7 @@ class ServiceTests(unittest.TestCase):
         for line in active_section["items"] + candidate_section["items"]:
             self.assertLessEqual(len(line), 240)
 
-    def test_knowledge_index_keeps_eight_columns_for_pipes_and_long_ids(self):
+    def test_knowledge_index_keeps_fixed_columns_for_pipes_and_long_ids(self):
         piped = self._memory_record(
             "memory_" + "p" * 92, "active", title="left | right | title",
             body="summary | with | pipes",
@@ -1737,12 +1761,12 @@ class ServiceTests(unittest.TestCase):
         for line in index["active"]["items"]:
             self.assertLessEqual(len(line), 240)
             fields = line.split(" | ")
-            self.assertEqual(len(fields), 8)
-            self.assertTrue(fields[7].startswith("updated="))
+            self.assertEqual(len(fields), 6)
+            self.assertRegex(fields[5], r"^(\d+[mhd]|-)$")
         by_id = {line.split(" | ")[0]: line.split(" | ") for line in index["active"]["items"]}
-        self.assertEqual(by_id[piped["id"]][6], "evidence=1")
-        self.assertNotIn("left | right", by_id[piped["id"]][4])
-        self.assertEqual(by_id[long_id["id"]][6], "evidence=1")
+        self.assertEqual(by_id[piped["id"]][4], "ev=1")
+        self.assertNotIn("left | right", by_id[piped["id"]][2])
+        self.assertEqual(by_id[long_id["id"]][4], "ev=1")
         self.assertLessEqual(len(by_id[long_id["id"]][0]), 100)
 
     def test_knowledge_index_is_rebuilt_from_markdown_and_ignores_search_index(self):

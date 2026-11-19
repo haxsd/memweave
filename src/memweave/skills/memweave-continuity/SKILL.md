@@ -209,6 +209,20 @@ Do not run this every turn; do not delete history; do not treat candidate or ret
 - Architecture nodes expose revision, etag and stale reasons. Correct or forget stale records through the dedicated tools after reviewing live evidence; never hand-edit the Markdown to silence `graph_stale`.
 - `system_status.knowledge_loop`, `system_status.knowledge` and `system_status.architecture` are observable debt/count views; they do not replace search, source checks, behavioral evaluation or task acceptance.
 
+## Handoff pointers
+
+For cross-session, cross-agent or cross-machine handoff, write pointers instead of summaries. The next agent re-reads task state from Markdown; a copied summary can be stale and would silently outrank newer evidence.
+
+```text
+task: <task_id> @ revision <n>
+next: <one next step>
+blocked: <none or reason>
+do-not: <steps that must not be replayed>
+reload: memweave_workspace_prepare(root=<absolute root>, intent=resume)
+```
+
+Keep Goal, Acceptance, Findings and conversation excerpts out of the handoff; they are re-read from the current task record, which is the single source of truth.
+
 ## Recovery and hooks
 
 After compaction or host switching, if Codex provides a bounded pre-compaction snapshot, treat it as a hint only: first call `memweave_workspace_prepare` for the absolute execution root and matching intent, then read the current task and relevant diffs and files. If the tool is absent, report that memory is disconnected; do not claim recovery. Cursor startup injection remains best effort. Hooks and receipts do not prove that a write or model delivery succeeded.
