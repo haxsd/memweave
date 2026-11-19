@@ -468,7 +468,7 @@
     <p class="chapter-no">01 / 项目</p>
     <h2>项目就是你打开的那个文件夹</h2>
     <p class="lead">
-      多个客户端能接上同一个项目，前提是它们认的是同一个项目身份。项目身份不是客户端账号，也不是聊天会话，而是你打开的那个绝对文件夹。子目录可以再登记成独立项目；登记后它只读自己，不需要知道父项目。父项目本来就能看到全部代码，也可以直接当一个项目推进；需要快速了解已登记的子项目时，再读它们的摘要。
+      多个客户端能接上同一个项目，前提是它们认的是同一个项目身份。项目身份不是客户端账号，也不是聊天会话，而是你打开的那个绝对文件夹。同一个文件夹，不管从哪个工具打开，都是同一个项目；在该文件夹下打开任意子目录，也归到同一个项目。
     </p>
 
     <div class="frame">
@@ -500,41 +500,16 @@
 
     <div class="frame">
       <div class="frame-head">
-        <h3>同一个文件夹，可以只登记 A，也可以登记子目录</h3>
-        <p>登记 B/C 后，它们是独立项目，A 不接管；A 本来就能看到全部代码，也可以直接推进。</p>
-      </div>
-      <div class="project-shell">
-        <div class="project-head">
-          <div>
-            <strong>A 项目（已登记）</strong>
-            <span class="path">C:\code\A</span>
-          </div>
-          <span class="muted">current = A-1</span>
-        </div>
-        <div class="project-children">
-          <span class="muted">services\</span>
-          <div class="project-grid">
-            <div class="project-card">
-              <strong>B 独立项目（可选登记）</strong>
-              <span>current = B-1</span>
-              <span>只读自己</span>
-            </div>
-            <div class="project-card">
-              <strong>C 独立项目（可选登记）</strong>
-              <span>current = C-1</span>
-              <span>只读自己</span>
-            </div>
-          </div>
-          <span class="muted" style="display:block;margin-top:6px">docs\（未登记，属于 A）</span>
-        </div>
+        <h3>项目之间的边界</h3>
+        <p>项目之间默认互不读取；worktree 是同一个项目的执行别名，不同 clone 是另一个项目。</p>
       </div>
       <p class="lead" style="margin-top:16px">
-        B、C 登记后就是独立项目：任务、检查点、知识都只属于自己，恢复时不需要读 A。A 能看到全部代码，不登记 B/C 也能直接当一个大项目推进；读 B/C 摘要只是可选的加速。worktree 是 A 的执行别名，不同 clone 是另一个项目。父项目上的组知识由子项目显式检索，默认不注入。
+        MemWeave 不按目录层级推导项目之间的关系。每个已登记项目只读自己的任务和知识；需要跨项目复用经验时由用户显式操作，默认不注入。项目移动到新路径后，通过一次重登记或路径映射把它接回同一项目身份。
       </p>
     </div>
 
     <p class="takeaway">
-      <strong>一句话：</strong>同一个文件夹是同一个项目；登记子目录只是让它成为独立项目，不会让它依赖父项目。父项目可以直接当一个大项目推进，需要时再读子项目摘要。
+      <strong>一句话：</strong>一个文件夹就是一个项目，子目录属于它；项目之间没有隐式层级，也不默认共享记忆。
     </p>
   </section>
 

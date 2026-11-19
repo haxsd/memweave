@@ -249,11 +249,11 @@ def task_brief(task):
     ))
 
 
-def memory_selection(service, project_id, query, scope, query_source="request", include_group=False):
+def memory_selection(service, project_id, query, scope, query_source="request"):
     if not query.strip():
         return []
     items = service.memory_search(
-        project_id, query=query, scope=scope, limit=100, include_group=include_group,
+        project_id, query=query, scope=scope, limit=100,
     )["items"]
     reason = "matched" if query_source == "request" else "task_query"
     return [(item, reason) for item in items[:8]]
@@ -331,18 +331,16 @@ def knowledge_index_block(service, project_id, char_budget, omitted_reason="budg
 def build_context(
     service, project_id, task_id=None, query="", include_user=True,
     budget=CONTEXT_BUDGET_DEFAULT,
-    execution_root=None, include_group_knowledge=False, include_knowledge_index=True,
+    execution_root=None, include_knowledge_index=True,
 ):
     if (
         type(budget) is not int or not 500 <= budget <= CONTEXT_BUDGET_MAX
         or type(include_user) is not bool
-        or type(include_group_knowledge) is not bool
         or type(include_knowledge_index) is not bool
     ):
         raise DiagnosticError(
             "RECORD_INVALID",
-            f"budget must be 500–{CONTEXT_BUDGET_MAX} characters; include_user, "
-            "include_group_knowledge and "
+            f"budget must be 500–{CONTEXT_BUDGET_MAX} characters; include_user and "
             "include_knowledge_index must be boolean.",
         )
     if not isinstance(query, str) or len(query) > 1000:
@@ -454,7 +452,7 @@ def build_context(
     try:
         memory_items = memory_selection(
             service, project_id, knowledge_query, "project",
-            query_source=knowledge_query_source, include_group=include_group_knowledge,
+            query_source=knowledge_query_source,
         )
     except DiagnosticError as error:
         if error.code != "INDEX_UNAVAILABLE":

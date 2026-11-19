@@ -55,9 +55,9 @@ Agent 会先做只读盘点，再运行 `scripts/bootstrap.py --dry-run`；只�
 
 ## 它如何工作
 
-MemWeave 只有两层产品语义：任务工作记忆（目标、验收、检查点、失败、验证、下一步和并行 WorkUnit），以及长期知识（按项目、项目组或用户明确偏好划分范围，带来源、状态和修订历史）。默认上下文中会注入 active 项目经验、用户偏好和有界知识索引；候选与退役知识不进入默认召回。数据以本机 Markdown 为权威记录，默认保存在 `~/.memweave`（Windows 为 `%USERPROFILE%\.memweave`），不需要额外的模型 API Key。只连接 MCP 不等于完整可用。
+MemWeave 只有两层产品语义：任务工作记忆（目标、验收、检查点、失败、验证、下一步和并行 WorkUnit），以及长期知识（按项目或用户明确偏好划分范围，带来源、状态和修订历史）。默认上下文中会注入 active 项目经验、用户偏好和有界知识索引；候选与退役知识不进入默认召回。数据以本机 Markdown 为权威记录，默认保存在 `~/.memweave`（Windows 为 `%USERPROFILE%\.memweave`），不需要额外的模型 API Key。只连接 MCP 不等于完整可用。
 
-文件夹身份、worktree、组知识、三层接入契约、会话工作循环和架构边界，见 [产品与设计导览](docs/product-guide.html)。
+文件夹身份、worktree、三层接入契约、会话工作循环和架构边界，见 [产品与设计导览](docs/product-guide.html)。
 
 ## 项目状态
 

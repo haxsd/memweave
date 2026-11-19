@@ -307,7 +307,6 @@ def create_server(
     def memweave_workspace_prepare(
         root: str | None = None, intent: str = "inspect", task_id: str | None = None,
         query: str = "", include_user: bool = True,
-        include_group_knowledge: bool = False,
         include_knowledge_index: bool = True,
         budget: int = CONTEXT_BUDGET_DEFAULT,
         execution_claim: str | None = None,
@@ -321,7 +320,7 @@ def create_server(
         """Prepare project context and acquire an ephemeral execution claim for resume.
 
         The absolute folder is the project identity. Another client opening the same folder
-        reuses the same project; an explicitly registered nested folder is a separate project;
+        reuses the same project; an explicit nested registration is a separate project;
         an unregistered subfolder resolves to the nearest registered ancestor.
         A linked worktree of a registered repository uses the same project and task queue.
         Resume selects the one current task; another live claim is returned as task_claimed.
@@ -329,8 +328,6 @@ def create_server(
         No project/task/checkpoint is created here; only runtime ownership metadata is written.
         Active user preferences and the project knowledge index are included by default.
         Context contains bounded knowledge and source-checked local structure.
-        include_group_knowledge is opt-in and defaults off; when true it adds group-scope knowledge
-        for the project's parent/group, never member task context or member knowledge bodies.
         include_knowledge_index defaults on; the context adds a bounded
         active-only navigation head, never candidate/retired rows and never new evidence.
         MCP accepts execution_root/cwd/project_root as root aliases and mode as an intent
@@ -358,7 +355,6 @@ def create_server(
             "task_id": task_id,
             "query": query,
             "include_user": include_user,
-            "include_group_knowledge": include_group_knowledge,
             "include_knowledge_index": include_knowledge_index,
             "budget": budget,
             "execution_claim": execution_claim,
@@ -577,13 +573,8 @@ def create_server(
 
     @server.tool(annotations=read_only, structured_output=True)
     def memweave_memory_search(project_id: str | None = None, query: str = "", scope: str = "project",
-                              limit: int = 20, status: str = "active",
-                              include_group: bool = False, include_members: bool = False) -> dict[str, Any]:
-        """Search Basic Memory FTS; results include current revision, etag and retrieval metadata.
-
-        include_group adds parent/group knowledge only when explicitly true; include_members
-        adds direct member project knowledge only when explicitly true. Both default off.
-        """
+                              limit: int = 20, status: str = "active") -> dict[str, Any]:
+        """Search Basic Memory FTS; results include current revision, etag and retrieval metadata."""
         return call("memory_search", locals())
 
     @server.tool(annotations=write, structured_output=True)

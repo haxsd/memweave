@@ -146,13 +146,12 @@ class ServiceTests(unittest.TestCase):
         )
         status = self.call("status")
         self.assertEqual(status["knowledge"]["total"], 2)
-        self.assertEqual(status["knowledge"]["by_scope"], {"project": 1, "group": 0, "user": 1})
+        self.assertEqual(status["knowledge"]["by_scope"], {"project": 1, "user": 1})
         self.assertEqual(status["knowledge"]["by_status"], {"active": 2, "candidate": 0, "retired": 0})
         self.assertEqual(
             status["knowledge"]["by_scope_status"],
             {
                 "project": {"active": 1, "candidate": 0, "retired": 0},
-                "group": {"active": 0, "candidate": 0, "retired": 0},
                 "user": {"active": 1, "candidate": 0, "retired": 0},
             },
         )
@@ -179,7 +178,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(project_status["project"]["knowledge"]["total"], 1)
         self.assertEqual(
             project_status["project"]["knowledge"]["by_scope"],
-            {"project": 1, "group": 0, "user": 0},
+            {"project": 1, "user": 0},
         )
         self.assertEqual(
             project_status["project"]["knowledge"]["by_status"],
@@ -306,7 +305,7 @@ class ServiceTests(unittest.TestCase):
                         "memory_read", {"memory_id": "memory_legacy_task_scope"},
                     )
                 status = restarted.dispatch("status", {})["data"]
-                self.assertEqual(status["knowledge"]["by_scope"], {"project": 0, "group": 0, "user": 0})
+                self.assertEqual(status["knowledge"]["by_scope"], {"project": 0, "user": 0})
                 with restarted.vault.diagnostics._connect() as connection:
                     self.assertIsNotNone(
                         connection.execute(
@@ -748,130 +747,102 @@ class ServiceTests(unittest.TestCase):
             with self.subTest(task_id=invalid), self.assertRaises(DiagnosticError):
                 self.call("workspace_prepare", root=str(unregistered), intent="resume", task_id=invalid)
 
-    def test_project_members_are_derived_and_not_injected_into_children(self):
-        b_root = self.root / "apps" / "b"
-        c_root = self.root / "apps" / "c"
-        d_root = b_root / "libs" / "d"
-        for root in (b_root, c_root, d_root):
-            root.mkdir(parents=True)
-        b = self.call("project_register", root=str(b_root), name="B", operation_id="pb")["id"]
-        c = self.call("project_register", root=str(c_root), name="C", operation_id="pc")["id"]
-        d = self.call("project_register", root=str(d_root), name="D", operation_id="pd")["id"]
-
+    def test_registered_projects_do_not_inherit_parent_state(self):
+        child_root = self.root / "apps" / "child"
+        child_root.mkdir(parents=True)
+        child = self.call("project_register", root=str(child_root), name="child",
+                          operation_id="child")["id"]
         listed = {item["id"]: item for item in self.call("project_list")["items"]}
-        self.assertIsNone(listed[self.project]["parent_id"])
-        self.assertEqual(listed[b]["parent_id"], self.project)
-        self.assertEqual(listed[c]["parent_id"], self.project)
-        self.assertEqual(listed[d]["parent_id"], b)
+        self.assertNotIn("parent_id", listed[self.project])
+        self.assertNotIn("parent_id", listed[child])
 
-        task_a = self.call("task_open", project_id=self.project, title="A 任务", goal="A",
-                           acceptance=["A"], operation_id="ta")
-        task_b = self.call("task_open", project_id=b, title="B 任务", goal="B",
-                           acceptance=["B"], operation_id="tb")
-        task_c = self.call("task_open", project_id=c, title="C 任务", goal="C",
-                           acceptance=["C"], operation_id="tc")
-        task_d = self.call("task_open", project_id=d, title="D 任务", goal="D",
-                           acceptance=["D"], operation_id="td")
-
-        before_b = self.call("task_read", task_id=task_b["id"])
-        prepared_a = self.call("workspace_prepare", root=str(self.root), intent="inspect")
-        after_b = self.call("task_read", task_id=task_b["id"])
-        self.assertEqual(
-            (before_b["revision"], before_b["etag"]),
-            (after_b["revision"], after_b["etag"]),
-        )
-        self.assertEqual([item["id"] for item in prepared_a["tasks"]], [task_a["id"]])
-        members_a = {item["id"]: item for item in prepared_a["members"]}
-        self.assertEqual(set(members_a), {b, c})
-        self.assertNotIn(d, members_a)
-        self.assertEqual(members_a[b]["current"]["id"], task_b["id"])
-        self.assertEqual(members_a[b]["task_counts"]["current"], 1)
-        self.assertEqual(members_a[c]["current"]["id"], task_c["id"])
-        self.assertFalse(prepared_a["members_truncated"])
-
-        prepared_b = self.call("workspace_prepare", root=str(b_root), intent="inspect")
-        self.assertEqual(prepared_b["project"]["id"], b)
-        self.assertEqual([item["id"] for item in prepared_b["tasks"]], [task_b["id"]])
-        self.assertEqual([item["id"] for item in prepared_b["members"]], [d])
-        self.assertEqual(prepared_b["members"][0]["current"]["id"], task_d["id"])
-        self.assertNotIn(task_a["id"], [item["id"] for item in prepared_b["tasks"]])
-        self.assertNotIn(self.project, [item["id"] for item in prepared_b["members"]])
-
-    def test_group_knowledge_is_opt_in_for_children_and_members(self):
-        b_root = self.root / "services" / "b"
-        c_root = self.root / "services" / "c"
-        for root in (b_root, c_root):
-            root.mkdir(parents=True)
-        b = self.call("project_register", root=str(b_root), name="B", operation_id="p2-b")["id"]
-        c = self.call("project_register", root=str(c_root), name="C", operation_id="p2-c")["id"]
-        source = [{"type": "user", "reference": "P17 组知识测试"}]
-        group = self.call(
-            "memory_write", project_id=self.project, scope="group", title="共享组知识",
-            body="quasar shared conclusion", sources=source, status="active",
-            operation_id="p2-group",
-        )
-        member_b = self.call(
-            "memory_write", project_id=b, scope="project", title="B 成员知识",
-            body="bravo member note", sources=source, status="active", operation_id="p2-member-b",
-        )
-        member_c = self.call(
-            "memory_write", project_id=c, scope="project", title="C 成员知识",
-            body="charlie member note", sources=source, status="active", operation_id="p2-member-c",
-        )
-        project_a = self.call(
-            "memory_write", project_id=self.project, scope="project", title="A 项目知识",
-            body="delta project note", sources=source, status="active", operation_id="p2-project-a",
-        )
-
-        self.assertEqual(
-            self.call("memory_search", project_id=b, query="quasar")["items"], []
-        )
-        group_hits = self.call(
-            "memory_search", project_id=b, query="quasar", include_group=True
-        )["items"]
-        self.assertEqual([item["id"] for item in group_hits], [group["id"]])
-        self.assertEqual(
-            self.call("memory_search", project_id=self.project, query="bravo")["items"], []
-        )
-        member_hits = self.call(
-            "memory_search", project_id=self.project, query="bravo", include_members=True
-        )["items"]
-        self.assertEqual([item["id"] for item in member_hits], [member_b["id"]])
-
-        self.assertNotIn("共享组知识", self.call(
-            "context_get", project_id=b, query="quasar"
-        )["text"])
-        self.assertIn("共享组知识", self.call(
-            "context_get", project_id=b, query="quasar", include_group_knowledge=True
-        )["text"])
-        default_prepare = self.call(
-            "workspace_prepare", root=str(b_root), intent="new", query="quasar"
-        )
-        self.assertNotIn("共享组知识", default_prepare["context"]["text"])
-        group_prepare = self.call(
-            "workspace_prepare", root=str(b_root), intent="new",
-            query="quasar", include_group_knowledge=True,
-        )
-        self.assertIn("共享组知识", group_prepare["context"]["text"])
-
-        prepared_a = self.call("workspace_prepare", root=str(self.root), intent="inspect")
-        members_a = {item["id"]: item for item in prepared_a["members"]}
-        self.assertEqual(members_a[b]["knowledge_counts"]["active"], 1)
-        self.assertEqual(members_a[b]["recent_knowledge"][0]["id"], member_b["id"])
-        self.assertEqual(self.call("status")["knowledge"]["by_scope"]["group"], 1)
-        self.assertEqual(
-            self.call("memory_read", memory_id=project_a["id"])["scope"], "project"
+        source = [{"type": "user", "reference": "项目隔离测试"}]
+        self.call(
+            "memory_write", project_id=self.project, scope="project", title="父目录知识",
+            body="alpha parent note", sources=source, status="active", operation_id="iso-parent",
         )
         self.assertEqual(
-            self.call("memory_read", memory_id=member_c["id"])["scope"], "project"
+            self.call("memory_search", project_id=child, query="alpha")["items"], []
         )
+        prepared = self.call("workspace_prepare", root=str(child_root), intent="inspect")
+        self.assertEqual(prepared["project"]["id"], child)
+        self.assertNotIn("parent_id", prepared["project"])
+        self.assertNotIn("members", prepared)
+        self.assertNotIn("alpha parent note", prepared["context"]["text"])
 
-        with self.assertRaises(DiagnosticError) as leaf_group:
+        with self.assertRaises(DiagnosticError) as group_scope:
             self.call(
-                "memory_write", project_id=b, scope="group", title="leaf group",
-                body="not shared", sources=source, status="active", operation_id="p2-leaf-group",
+                "memory_write", project_id=self.project, scope="group", title="组知识",
+                body="not supported", sources=source, status="active", operation_id="iso-group",
             )
-        self.assertEqual(leaf_group.exception.code, "SCOPE_DENIED")
+        self.assertEqual(group_scope.exception.code, "SCOPE_DENIED")
+
+    def test_knowledge_source_hash_change_is_reported(self):
+        source_file = self.root / "guide.md"
+        source_file.write_text("第一版约束\n", encoding="utf-8")
+        memory = self.call(
+            "memory_write", project_id=self.project, title="来源哈希知识",
+            body="来源内容变化后应提示复核。",
+            sources=[
+                {"type": "file", "reference": "guide.md"},
+                {"type": "user", "reference": "输入"},
+            ],
+            operation_id="hash-source-memory",
+        )
+        stored = self.call("memory_read", memory_id=memory["id"])
+        file_source = next(item for item in stored["sources"] if item["type"] == "file")
+        self.assertIsInstance(file_source.get("hash"), str)
+
+        legacy = self.call(
+            "memory_write", project_id=self.project, title="缺失来源知识",
+            body="缺失文件只报告缺失，不误报内容变化。",
+            sources=[
+                {"type": "file", "reference": "missing.md"},
+                {"type": "user", "reference": "输入"},
+            ],
+            operation_id="missing-source-memory",
+        )
+
+        before = {
+            item["id"]: item["risks"]
+            for item in self.call("status", project_id=self.project)["knowledge_loop"]["debt"]["source_risk"]
+        }
+        self.assertNotIn("source_hash_changed", before.get(memory["id"], []))
+        self.assertIn("missing_file_source", before[legacy["id"]])
+        self.assertNotIn("source_hash_changed", before[legacy["id"]])
+
+        source_file.write_text("第二版约束已修改\n", encoding="utf-8")
+        after = {
+            item["id"]: item["risks"]
+            for item in self.call("status", project_id=self.project)["knowledge_loop"]["debt"]["source_risk"]
+        }
+        self.assertIn("source_hash_changed", after[memory["id"]])
+
+    def test_workspace_prepare_reports_readiness(self):
+        unregistered_root = self.root.parent / "readiness-unregistered"
+        unregistered_root.mkdir()
+        prepared = self.call("workspace_prepare", root=str(unregistered_root), intent="inspect")
+        self.assertEqual(prepared["readiness"]["state"], "unregistered")
+
+        prepared = self.call("workspace_prepare", root=str(self.root), intent="inspect")
+        self.assertEqual(prepared["readiness"]["state"], "no_task")
+
+        task = self.call(
+            "task_open", project_id=self.project, title="接续任务", goal="验证 readiness",
+            acceptance=["可接续"], operation_id="readiness-task",
+        )
+        prepared = self.call("workspace_prepare", root=str(self.root), intent="resume")
+        self.assertEqual(prepared["readiness"]["state"], "needs_attention")
+        self.assertIn("next_step_missing", prepared["readiness"]["reasons"])
+
+        self.call(
+            "task_checkpoint", task_id=task["id"], expected_revision=task["revision"],
+            expected_etag=task["etag"], progress="已开始", next_step="继续验证",
+            operation_id="readiness-checkpoint",
+        )
+        prepared = self.call("workspace_prepare", root=str(self.root), intent="resume")
+        self.assertEqual(prepared["readiness"]["state"], "ready")
+        self.assertEqual(prepared["readiness"]["reasons"], [])
 
     def test_workspace_prepare_resumes_current_and_does_not_resume_queued(self):
         tasks = [

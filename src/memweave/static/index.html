@@ -676,7 +676,7 @@
       const globalBody = node("div","global-body");
       globalBody.append(
         node("div","","已启用 " + (globalStatusCounts.active ?? 0) + " · 候选 " + (globalStatusCounts.candidate ?? 0)),
-        node("div","","项目 / 任务 / 用户 " + [scopeCounts.project ?? 0,scopeCounts.task ?? 0,scopeCounts.user ?? 0].join(" / ")),
+        node("div","","项目 / 用户 " + [scopeCounts.project ?? 0,scopeCounts.user ?? 0].join(" / ")),
         node("div","","架构 " + (architecture.total ?? 0) + " 条 · " + (architecture.stale ? "待核对 " + architecture.stale : "架构已核对"))
       );
       global.append(globalBody);

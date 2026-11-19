@@ -414,6 +414,38 @@ def _file_source_exists(root, reference):
         return False
 
 
+MAX_KNOWLEDGE_SOURCE_BYTES = 1024 * 1024
+
+
+def _file_source_digest(root, reference):
+    """Return the SHA-256 of a project file source, or None when it is not readable safely."""
+    if not isinstance(root, str) or not root or not isinstance(reference, str):
+        return None
+    try:
+        cleaned = re.sub(r":\d+(?:-\d+)?$", "", reference.strip())
+        base = Path(root).expanduser().resolve()
+        path = Path(cleaned)
+        resolved = path.resolve() if path.is_absolute() else (base / path).resolve()
+        if not resolved.is_relative_to(base) or not resolved.is_file():
+            return None
+        if resolved.stat().st_size > MAX_KNOWLEDGE_SOURCE_BYTES:
+            return None
+        return hashlib.sha256(resolved.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
+def _file_source_hash_changed(root, source):
+    """True only when the record carries a baseline hash and the source content differs."""
+    expected = source.get("hash")
+    if not isinstance(expected, str) or not expected:
+        return False
+    actual = _file_source_digest(root, source.get("reference"))
+    if actual is None:
+        return False
+    return actual != expected
+
+
 def _knowledge_source_risks(memory, project_root, task_ids):
     risks = set()
     sources = memory.get("sources") or []
@@ -429,6 +461,8 @@ def _knowledge_source_risks(memory, project_root, task_ids):
             exists = _file_source_exists(project_root, reference)
             if exists is False:
                 risks.add("missing_file_source")
+            elif _file_source_hash_changed(project_root, source):
+                risks.add("source_hash_changed")
     evidence = record_evidence(memory)
     if not evidence:
         risks.add("no_evidence")
@@ -437,6 +471,29 @@ def _knowledge_source_risks(memory, project_root, task_ids):
     if memory.get("activation_source") == "reviewed_migration" and not evidence:
         risks.add("migration_unverified")
     return sorted(risks)
+
+
+def _readiness(prepared):
+    """Summarize whether the prepared workspace can be resumed without open gaps."""
+    if prepared.get("project") is None or prepared.get("state") == "registration_required":
+        return {"state": "unregistered", "reasons": ["project_not_registered"]}
+    if prepared.get("state") == "task_claimed":
+        return {"state": "needs_attention", "reasons": ["task_claimed_elsewhere"]}
+    tasks = prepared.get("tasks") or []
+    current = next((item for item in tasks if item.get("status") == "current"), None)
+    if current is None:
+        reasons = ["no_active_task"] if not tasks else ["no_current_task"]
+        if prepared.get("pending_consolidation"):
+            reasons.append("pending_consolidation")
+        return {"state": "no_task", "reasons": reasons}
+    reasons = []
+    if not str(current.get("next_step") or "").strip():
+        reasons.append("next_step_missing")
+    if prepared.get("work_units"):
+        reasons.append("open_work_units")
+    if prepared.get("pending_consolidation"):
+        reasons.append("pending_consolidation")
+    return {"state": "needs_attention" if reasons else "ready", "reasons": reasons}
 
 
 _TASK_LOG_MARKERS = (
@@ -688,6 +745,7 @@ class Service:
             self._index_error = str(error)
 
     def _mark_workspace_prepared(self, prepared: dict) -> None:
+        prepared.setdefault("readiness", _readiness(prepared))
         project = prepared.get("project")
         if not isinstance(project, dict):
             return
@@ -843,7 +901,7 @@ class Service:
 
     @staticmethod
     def _knowledge_counts(memories):
-        scopes = ("project", "group", "user")
+        scopes = ("project", "user")
         by_scope = {scope: 0 for scope in scopes}
         by_status = {status: 0 for status in ("active", "candidate", "retired")}
         by_scope_status = {
@@ -1096,35 +1154,6 @@ class Service:
             return same_repository_projects[0]
         return None
 
-    def _project_parent_id(self, project, projects):
-        root = Path(project["root"]).expanduser().resolve()
-        ancestors = []
-        for candidate in projects:
-            if candidate["id"] == project["id"]:
-                continue
-            candidate_root = Path(candidate["root"]).expanduser().resolve()
-            if root != candidate_root and root.is_relative_to(candidate_root):
-                ancestors.append(candidate)
-        if not ancestors:
-            return None
-        return max(
-            ancestors,
-            key=lambda item: len(Path(item["root"]).resolve().parts),
-        )["id"]
-
-    def _project_children(self, project, projects):
-        return [
-            item for item in projects
-            if item["id"] != project["id"]
-            and self._project_parent_id(item, projects) == project["id"]
-        ]
-
-    def _project_group(self, project, projects):
-        parent_id = self._project_parent_id(project, projects)
-        if parent_id is not None:
-            return next(item for item in projects if item["id"] == parent_id)
-        return project if self._project_children(project, projects) else None
-
     def _task_items(self, project_id):
         return sorted(
             self.vault.list_records("task", project_id=project_id),
@@ -1150,51 +1179,6 @@ class Service:
             "completed": sum(item["status"] == "completed" for item in tasks),
             "cancelled": sum(item["status"] == "cancelled" for item in tasks),
             "archived": sum(task_lifecycle_status(item) == "archived" for item in tasks),
-        }
-
-    def _member_summary(self, project):
-        tasks = self._task_metadata(project["id"])
-        counts = self._task_counts(tasks)
-        current = next((item for item in tasks if item["status"] == "current"), None)
-        memories = self.vault.list_records("memory", project_id=project["id"])
-        knowledge_counts = {
-            status: sum(item.get("status") == status for item in memories)
-            for status in ("active", "candidate", "retired")
-        }
-        recent_knowledge = [
-            {"id": item["id"], "title": item["title"]}
-            for item in sorted(
-                (item for item in memories if item.get("status") == "active"),
-                key=lambda item: (item.get("updated_at") or "", item["id"]),
-                reverse=True,
-            )[:3]
-        ]
-        attention = []
-        if current is not None and not current.get("next_step"):
-            attention.append({"code": "next_step_missing", "severity": "warning"})
-        if counts["pending_review"]:
-            attention.append({
-                "code": "pending_consolidation",
-                "severity": "info",
-                "count": counts["pending_review"],
-            })
-        return {
-            "id": project["id"],
-            "title": project["title"],
-            "root": project["root"],
-            "current": (
-                {
-                    "id": current["id"],
-                    "title": current["title"],
-                    "next_step": current.get("next_step", ""),
-                }
-                if current is not None
-                else None
-            ),
-            "task_counts": counts,
-            "knowledge_counts": knowledge_counts,
-            "recent_knowledge": recent_knowledge,
-            "attention": attention,
         }
 
     def _work_unit_items(self, task_id):
@@ -1505,13 +1489,7 @@ class Service:
         return response
 
     def project_list(self):
-        projects = self.vault.list_records("project")
-        return {
-            "items": [
-                {**project, "parent_id": self._project_parent_id(project, projects)}
-                for project in projects
-            ]
-        }
+        return {"items": self.vault.list_records("project")}
 
     def _next_task_id(self):
         base = "task_" + _task_timestamp()
@@ -1526,7 +1504,7 @@ class Service:
 
     def workspace_prepare(
         self, root, intent="inspect", task_id=None, query="", include_user=True,
-        include_group_knowledge=False, include_knowledge_index=True,
+        include_knowledge_index=True,
         budget=CONTEXT_BUDGET_DEFAULT,
         execution_claim=None,
     ):
@@ -1542,15 +1520,13 @@ class Service:
             if intent != "resume":
                 raise DiagnosticError("RECORD_INVALID", "execution_claim requires resume intent.")
         if not isinstance(query, str) or len(query) > 1000 or type(include_user) is not bool or (
-            type(include_group_knowledge) is not bool
-        ) or (
             type(include_knowledge_index) is not bool
         ) or (
             type(budget) is not int or not 500 <= budget <= CONTEXT_BUDGET_MAX
         ):
             raise DiagnosticError(
                 "RECORD_INVALID",
-                "Invalid query, include_user, include_group_knowledge, include_knowledge_index or context budget.",
+                "Invalid query, include_user, include_knowledge_index or context budget.",
             )
         path = path.resolve()
         project = self._project_for_root(path)
@@ -1558,7 +1534,6 @@ class Service:
             state="registration_required", project=None, tasks=[], pending_consolidation=[],
             pending_phases=[], work_units=[], context=None, task_id=None, tasks_truncated=False,
             pending_truncated=False, phases_truncated=False, work_units_truncated=False,
-            members=[], members_truncated=False,
             attention=[], completion=None, execution_root=str(path), registered_root=None,
             is_worktree=False, is_subfolder=False, background_task=None, execution=None,
         )
@@ -1575,13 +1550,6 @@ class Service:
             "execution_root": str(path), "is_worktree": prepared["is_worktree"],
             "is_subfolder": is_subfolder,
         }
-        projects = self.vault.list_records("project")
-        member_projects = self._project_children(project, projects)
-        member_projects.sort(key=lambda item: Path(item["root"]).as_posix().casefold())
-        prepared["members"] = [
-            self._member_summary(item) for item in member_projects[:20]
-        ]
-        prepared["members_truncated"] = len(member_projects) > 20
         tasks = self._task_metadata(project["id"])
         opened = [item for item in tasks if item["status"] in TASK_OPEN_STATUSES]
         current = [item for item in opened if item["status"] == "current"]
@@ -1619,6 +1587,7 @@ class Service:
                 "lifecycle": task_lifecycle_status(item),
                 "task_kind": item.get("task_kind", "main"),
                 "parent_task_id": item.get("parent_task_id"),
+                "next_step": item.get("next_step", ""),
             }
             for item in opened[:20]
         ]
@@ -1757,7 +1726,6 @@ class Service:
         prepared["context"] = context = self.context_get(
             project["id"], context_task_id, query, include_user, budget,
             execution_root=str(path),
-            include_group_knowledge=include_group_knowledge,
             include_knowledge_index=include_knowledge_index,
         )
         prepared["attention"] = context.get("attention", prepared_attention)
@@ -2461,10 +2429,10 @@ class Service:
         return result
 
     def _scope(self, scope, project_id):
-        if scope not in ("project", "group", "user"):
+        if scope not in ("project", "user"):
             raise DiagnosticError(
                 "SCOPE_DENIED",
-                "Choose project, group or user scope explicitly; task scope is no longer supported.",
+                "Choose project or user scope explicitly; task scope is no longer supported.",
             )
         if scope != "user":
             self._project(project_id)
@@ -2492,13 +2460,16 @@ class Service:
                     "SCOPE_DENIED",
                     "User-scope knowledge requires an explicit user source; use project scope for project facts.",
                 )
-        if scope == "group":
-            project = self._project(project_id)
-            if not self._project_children(project, self.vault.list_records("project")):
-                raise DiagnosticError(
-                    "SCOPE_DENIED",
-                    "Group scope requires at least one registered direct child project.",
-                )
+        else:
+            project_root = self._project(project_id).get("root")
+            hashed = []
+            for source in sources:
+                if source.get("type") == "file":
+                    value = _file_source_digest(project_root, source.get("reference"))
+                    if value is not None:
+                        source = {**source, "hash": value}
+                hashed.append(source)
+            sources = hashed
         project_id = None if scope == "user" else project_id
         request = dict(action="memory_write", title=title, body=body, sources=sources, scope=scope,
                        project_id=project_id, kind=kind, status=status,
@@ -2573,16 +2544,8 @@ class Service:
             items.append(record)
         return items
 
-    def memory_search(self, project_id=None, query="", scope="project", limit=20, status="active",
-                      include_group=False, include_members=False):
+    def memory_search(self, project_id=None, query="", scope="project", limit=20, status="active"):
         self._scope(scope, project_id)
-        if type(include_group) is not bool or type(include_members) is not bool:
-            raise DiagnosticError("RECORD_INVALID", "include_group and include_members must be boolean.")
-        if scope != "project" and (include_group or include_members):
-            raise DiagnosticError(
-                "RECORD_INVALID",
-                "include_group and include_members require project scope.",
-            )
         if status not in ("active", "candidate", "retired"):
             raise DiagnosticError("RECORD_INVALID", "Search status must be active, candidate or retired.")
         if not isinstance(query, str) or len(query) > 1000 or type(limit) is not int or not 1 <= limit <= 100:
@@ -2595,16 +2558,6 @@ class Service:
                 "MemWeave search index is not running; start the service before searching.",
             )
         searches = [(scope, None if scope == "user" else project_id)]
-        if scope == "project" and (include_group or include_members):
-            projects = self.vault.list_records("project")
-            project = self._project(project_id)
-            if include_group:
-                group = self._project_group(project, projects)
-                if group is not None:
-                    searches.append(("group", group["id"]))
-            if include_members:
-                for member in self._project_children(project, projects)[:20]:
-                    searches.append(("project", member["id"]))
         rows = []
         for search_scope, search_project in searches:
             rows.extend(index.search(
@@ -3375,13 +3328,12 @@ class Service:
     def context_get(
         self, project_id, task_id=None, query="", include_user=True,
         budget=CONTEXT_BUDGET_DEFAULT,
-        execution_root=None, include_group_knowledge=False, include_knowledge_index=True,
+        execution_root=None, include_knowledge_index=True,
     ):
         from memweave.context import build_context
         return build_context(
             self, project_id, task_id, query, include_user, budget,
             execution_root=execution_root,
-            include_group_knowledge=include_group_knowledge,
             include_knowledge_index=include_knowledge_index,
         )
 
