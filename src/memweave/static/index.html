@@ -395,7 +395,7 @@
       const labels = {active:"进行中",current:"当前",queued:"排队中",open:"进行中",pending:"待开始",running:"运行中",blocked:"阻塞",in_progress:"进行中",completed:"已完成",cancelled:"已取消",stale:"待核对",deleted:"已遗忘",valid:"已启用",candidate:"候选 · 待确认",archived:"已归档",draft:"草稿"};
       return node("span","badge " + (status === "completed" || status === "valid" ? "done" : status === "cancelled" || status === "archived" ? "grey" : ""),labels[status] || status || "已记录");
     }
-    function scopeLabel(scope) { return {project:"项目范围",task:"当前任务范围",user:"用户范围 · 跨项目"}[scope] || scope || "项目范围"; }
+    function scopeLabel(scope) { return {project:"项目范围",user:"用户范围 · 跨项目"}[scope] || scope || "项目范围"; }
     function staleReasonLabel(reason) {
       const labels={source_hash_changed:"来源文件已变化",source_not_scanned:"来源尚未扫描",source_unavailable:"来源不可读取",missing_sources:"没有有效来源",invalid_source:"来源格式无效"};
       return labels[reason] || reason;
@@ -502,10 +502,9 @@
           const currentTask = state.tasks.find(task=>task.status === "current");
           state.currentTaskId = currentTask ? currentTask.id : "";
           const filter = {...state.memoryFilter};
-          if (filter.scope === "task" && !currentTask) filter.scope = "project";
+          if (!["project","user"].includes(filter.scope)) filter.scope = "project";
           state.memoryFilter = filter;
           const payload = {project_id:projectId,...filter,limit:20};
-          if (filter.scope === "task" && currentTask) payload.task_id = currentTask.id;
           const data = await api("memory_search",payload);
           if (generation !== state.generation) return;
           state.memories=data.items || [];renderKnowledge();
@@ -561,8 +560,6 @@
       const projectStatus = state.status?.project || {}, projectKnowledge = projectStatus.knowledge || knowledge;
       const projectArchitecture = projectStatus.architecture || architecture, projectTasks = projectStatus.tasks || {};
       const projectStatusCounts = projectKnowledge.by_status || {};
-      const projectScopeStatus = projectKnowledge.by_scope_status || {};
-      const taskScope = projectScopeStatus.task || {};
 
       const focus = node("section","focus-card"), focusHead = node("div","focus-head");
       focusHead.append(node("div","focus-kicker",current ? "CURRENT TASK / 当前任务" : "PROJECT READY / 等待新任务"));
@@ -661,14 +658,14 @@
       [
         [projectStatusCounts.active ?? 0,"已启用"],
         [projectStatusCounts.candidate ?? 0,"候选待确认"],
-        [taskScope.active ?? 0,"任务范围"]
+        [projectStatusCounts.retired ?? 0,"已停用"]
       ].forEach(([value,label])=>{
         const metric = node("div","memory-metric");
         metric.append(node("strong","",value),node("span","",label));
         metrics.append(metric);
       });
       projectBody.append(metrics,node("div","section-label","项目长期知识"),overviewMemoryList());
-      projectBody.append(node("p","scope-note","这里只显示当前项目范围与当前任务范围的知识，不混入跨项目用户知识。候选知识需显式启用；Markdown 存放在 %USERPROFILE%\\.memweave\\knowledge\\。"));
+      projectBody.append(node("p","scope-note","这里只显示当前项目范围的知识，不混入跨项目用户知识。候选知识需显式启用；Markdown 存放在 %USERPROFILE%\\.memweave\\knowledge\\。"));
 
       const scopeCounts = knowledge.by_scope || {}, globalStatusCounts = knowledge.by_status || {};
       const global = node("details","global-summary");
@@ -721,18 +718,17 @@
       const form=node("form","search-form"),query=node("input",""),scope=node("select",""),status=node("select",""),results=node("div","");
       query.type="search";query.placeholder="搜索知识、决策或经验…";query.setAttribute("aria-label","知识搜索关键词");
       scope.setAttribute("aria-label","知识范围");scope.append(new Option("当前项目","project"));
-      if(state.currentTaskId)scope.append(new Option("当前任务 · 仅本任务","task"));
       scope.append(new Option("用户知识 · 跨项目","user"));
       status.setAttribute("aria-label","知识状态");status.append(new Option("已启用知识","active"),new Option("候选 · 待确认","candidate"));
       query.value=state.memoryFilter.query;scope.value=state.memoryFilter.scope;status.value=state.memoryFilter.status;
       const search=button("搜索",()=>{},"btn primary");search.type="submit";form.append(query,scope,status,search);
-      const scopeNote=node("p","scope-note","项目范围只在本项目使用；当前任务范围只绑定当前任务；用户知识只保存明确偏好/规则并需显式选择。候选知识启用后才进入默认检索与上下文。Markdown 存放在 %USERPROFILE%\\.memweave\\knowledge\\。");
+      const scopeNote=node("p","scope-note","项目范围只在本项目使用；用户知识只保存明确偏好/规则并需显式选择。候选知识启用后才进入默认检索与上下文。Markdown 存放在 %USERPROFILE%\\.memweave\\knowledge\\。");
       const projectId=state.projectId;
       form.addEventListener("submit",async event=>{
         event.preventDefault();search.disabled=true;results.setAttribute("aria-busy","true");
         const filter={query:query.value.trim(),scope:scope.value,status:status.value};
         state.memoryFilter=filter;
-        try { const payload={project_id:projectId,...filter,limit:20};if(filter.scope === "task" && state.currentTaskId)payload.task_id=state.currentTaskId;const data=await api("memory_search",payload);if(state.projectId!==projectId || state.view!=="knowledge")return;state.memories=data.items || [];results.replaceChildren(panel((filter.status === "candidate" ? "候选知识" : "已启用知识") + " · 最多 20 条",memoryList(state.memories))); }
+        try { const payload={project_id:projectId,...filter,limit:20};const data=await api("memory_search",payload);if(state.projectId!==projectId || state.view!=="knowledge")return;state.memories=data.items || [];results.replaceChildren(panel((filter.status === "candidate" ? "候选知识" : "已启用知识") + " · 最多 20 条",memoryList(state.memories))); }
         catch(error){notify(friendlyError(error),"error");}finally{search.disabled=false;results.setAttribute("aria-busy","false");}
       });
       results.append(panel((state.memoryFilter.status === "candidate" ? "候选知识" : "已启用知识") + " · 最多 20 条",memoryList(state.memories)));
@@ -1022,14 +1018,13 @@
       const projectId=state.projectId;
       operationForm("记录一条长期知识",[
         field("知识标题","title",{required:true}),
-        selectField("适用范围","scope",state.currentTaskId ? [["project","当前项目"],["task","当前任务 · 仅本任务"],["user","用户范围 · 明确偏好/规则"]] : [["project","当前项目"],["user","用户范围 · 明确偏好/规则"]]),
+        selectField("适用范围","scope",[["project","当前项目"],["user","用户范围 · 明确偏好/规则"]]),
         selectField("知识类型","kind",[["fact","事实"],["decision","决策"],["lesson","经验"],["preference","偏好"]]),
         selectField("保存状态","status",[["active","直接启用 · 用于后续检索与上下文"],["candidate","先存为候选 · 核对后再启用"]]),
         field("知识内容","body",{type:"textarea",required:true,hint:"说明内容、适用条件与依据。本次输入会记录为用户明确提供的来源。",rows:7})
       ],"保存知识",async values=>{
         const status=values.get("status"),scope=values.get("scope");
         const payload={project_id:projectId,title:values.get("title").trim(),body:values.get("body").trim(),scope,kind:values.get("kind"),status,sources:[{type:"user",reference:"用户在本地页面明确输入"}]};
-        if(scope === "task" && state.currentTaskId)payload.task_id=state.currentTaskId;
         await mutate("memory_write",payload);
         state.memoryFilter={query:"",scope,status};
         $("#dialog").close();notify(status === "candidate" ? "候选知识已保存，核对并启用后才会用于常规检索与上下文。" : "知识已启用，来源标记为本地页面的明确输入。","success");await renderView();
